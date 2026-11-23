@@ -1,0 +1,44 @@
+[package]
+name = "edittr"
+version = "0.1.0"
+edition = "2024"
+description = "Lightweight code editor with git built in"
+license = "MIT"
+repository = "https://github.com/term-guy/edittr"
+
+[dependencies]
+dirs = "7.0.0"
+eframe = { version = "0.37.0", default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
+egui_extras = { version = "0.37.0", default-features = false, features = ["syntect"] }
+flate2 = "1.1.11"
+regex = "1.13.2"
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+ureq = "3.5.2"
+url = "2.5.9"
+zip = { version = "9.8.2", default-features = false, features = ["deflate"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[build-dependencies]
+winresource = "0.1.34"
+
+[package.metadata.deb]
+name = "edittr"
+section = "editors"
+priority = "optional"
+copyright = "2026 term-guy"
+depends = "$auto, git, libxkbcommon-x11-0, libgl1"
+recommends = "libwayland-client0"
+extended-description = "A small, fast code editor with syntax highlighting, project search, go-to-definition (via language servers) and built-in git: changes, diffs, commits and a commit graph."
+assets = [
+    ["target/release/edittr", "usr/bin/", "755"],
+    ["packaging/linux/edittr.desktop", "usr/share/applications/", "644"],
+    ["assets/icon-256.png", "usr/share/icons/hicolor/256x256/apps/edittr.png", "644"],
+    ["README.md", "usr/share/doc/edittr/README.md", "644"],
+]

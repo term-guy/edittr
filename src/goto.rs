@@ -1,0 +1,360 @@
+//! Go to definition: ask a language server when one is available, otherwise
+//! fall back to a heuristic search for definition-looking lines in the project.
+
+use crate::lsp;
+use regex::Regex;
+use std::ops::Range;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+const LSP_TIMEOUT: Duration = Duration::from_secs(5);
+
+pub struct Request {
+    pub root: PathBuf,
+    pub files: Box<dyn FnOnce() -> Vec<String> + Send>,
+    pub path: PathBuf,
+    pub text: String,
+    pub char_idx: usize,
+    pub client: Option<Arc<lsp::Client>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Target {
+    pub path: PathBuf,
+    pub line: usize,
+    /// Char columns of the symbol within the line.
+    pub cols: Range<usize>,
+}
+
+pub enum Outcome {
+    Found { target: Target, via: String },
+    NotFound(String),
+}
+
+pub fn run(req: Request) -> Outcome {
+    let Some((_, word)) = word_at(&req.text, req.char_idx) else {
+        return Outcome::NotFound("No symbol under the cursor".into());
+    };
+    let mut lsp_note = String::new();
+    if let Some(client) = &req.client {
+        let (line, col16) = line_col16(&req.text, req.char_idx);
+        match client.definition(&req.path, &req.text, line, col16, LSP_TIMEOUT) {
+            Ok(locs) => {
+                if let Some(loc) = locs.into_iter().next() {
+                    let line_text = if loc.path == req.path {
+                        req.text.split('\n').nth(loc.line).map(str::to_string)
+                    } else {
+                        std::fs::read_to_string(&loc.path).ok().and_then(|t| t.split('\n').nth(loc.line).map(str::to_string))
+                    }
+                    .unwrap_or_default();
+                    let cols = col16_to_char(&line_text, loc.col16.start)..col16_to_char(&line_text, loc.col16.end);
+                    return Outcome::Found {
+                        target: Target { path: loc.path, line: loc.line, cols },
+                        via: client.name.to_string(),
+                    };
+                }
+                lsp_note = format!("{} found nothing; ", client.name);
+            }
+            Err(e) => lsp_note = format!("{e}; "),
+        }
+    }
+    let (cursor_line, _) = line_col16(&req.text, req.char_idx);
+    match heuristic(&req.root, (req.files)(), &req.path, &req.text, cursor_line, &word) {
+        Some(target) => Outcome::Found { target, via: format!("{lsp_note}text search") },
+        None => Outcome::NotFound(format!("{lsp_note}no definition found for `{word}`")),
+    }
+}
+
+// ------------------------------------------------------------- positions
+
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || c == '$'
+}
+
+/// Identifier around char index `idx` (also accepts the position right after it).
+pub fn word_at(text: &str, idx: usize) -> Option<(Range<usize>, String)> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = idx.min(chars.len());
+    if i == chars.len() || !is_word_char(chars[i]) {
+        if i > 0 && is_word_char(chars[i - 1]) {
+            i -= 1;
+        } else {
+            return None;
+        }
+    }
+    let mut start = i;
+    while start > 0 && is_word_char(chars[start - 1]) {
+        start -= 1;
+    }
+    let mut end = i;
+    while end < chars.len() && is_word_char(chars[end]) {
+        end += 1;
+    }
+    let word: String = chars[start..end].iter().collect();
+    (!word.chars().next()?.is_numeric()).then_some((start..end, word))
+}
+
+/// 0-based line and UTF-16 column of char index `idx`.
+pub fn line_col16(text: &str, idx: usize) -> (usize, usize) {
+    let (mut line, mut col) = (0, 0);
+    for c in text.chars().take(idx) {
+        if c == '\n' {
+            line += 1;
+            col = 0;
+        } else {
+            col += c.len_utf16();
+        }
+    }
+    (line, col)
+}
+
+fn col16_to_char(line: &str, col16: usize) -> usize {
+    let mut units = 0;
+    for (i, c) in line.chars().enumerate() {
+        if units >= col16 {
+            return i;
+        }
+        units += c.len_utf16();
+    }
+    line.chars().count()
+}
+
+// ------------------------------------------------------------- heuristic
+
+/// Extensions that can define symbols used from a file with extension `ext`.
+fn related_exts(ext: &str) -> Option<&'static [&'static str]> {
+    const GROUPS: &[&[&str]] = &[
+        &["c", "h", "cc", "cpp", "cxx", "hpp", "hh", "hxx", "m", "mm"],
+        &["ts", "tsx", "js", "jsx", "mjs", "cjs", "mts", "cts", "vue", "svelte"],
+        &["py", "pyi"],
+        &["rs"],
+        &["go"],
+        &["java", "kt", "kts", "scala"],
+        &["rb"],
+        &["php"],
+        &["cs"],
+        &["swift"],
+        &["lua"],
+        &["sh", "bash", "zsh"],
+    ];
+    GROUPS.iter().copied().find(|g| g.contains(&ext))
+}
+
+fn patterns(name: &str) -> Vec<(Regex, u8)> {
+    let n = regex::escape(name);
+    let kw = r"fn|function|def|class|struct|enum|trait|type|interface|const|let|var|val|mod|module|namespace|func|union|typedef|macro_rules!|record|object|protocol|static|alias|local";
+    [
+        // `fn name`, `class Name`, `let mut name`, `func (r *T) name`, `function* name`
+        (format!(r"(?:^|[^\w.$])(?:{kw})\s+(?:mut\s+|async\s+|\*\s*)?(?:\([^)]*\)\s*)?({n})\b"), 4),
+        (format!(r"^\s*#\s*define\s+({n})\b"), 4),
+        // C/C++/Java/C# style `Type name(` or `Type name =` at line start
+        (format!(r"^\s*(?:[\w:<>,\[\]\*&]+\s+)+[\*&]*({n})\s*(?:\(|=[^=]|;|\[)"), 2),
+        // `name = ...` / `export name = ...` / `name: function` / `name(...) {` (method)
+        (format!(r"^\s*(?:export\s+)?({n})\s*(?::[^=]*)?=[^=>]"), 1),
+        (format!(r"^\s*({n})\s*:\s*(?:function|\(|async)"), 1),
+        (format!(r"^\s*(?:async\s+|static\s+|get\s+|set\s+)*({n})\s*\([^)]*\)\s*\{{\s*$"), 1),
+    ]
+    .into_iter()
+    .filter_map(|(p, score)| Regex::new(&p).ok().map(|r| (r, score)))
+    .collect()
+}
+
+const NOT_DEFINITIONS: &[&str] = &["return ", "else ", "if ", "while ", "case ", "new ", "await ", "throw ", "yield ", "delete "];
+
+/// Best definition-looking match of `name` in one file's text: (score, line, char cols).
+fn best_in_text(pats: &[(Regex, u8)], text: &str) -> Vec<(u8, usize, Range<usize>)> {
+    let mut out = Vec::new();
+    for (line_no, line) in text.split('\n').enumerate() {
+        let t = line.trim_start();
+        let is_comment = t.starts_with("//") || t.starts_with("/*") || t.starts_with("* ") || t.starts_with("--")
+            || (t.starts_with('#') && !t.trim_start_matches(['#', ' ']).starts_with("define"));
+        if is_comment || NOT_DEFINITIONS.iter().any(|k| t.starts_with(k)) {
+            continue;
+        }
+        for (re, score) in pats {
+            if let Some(m) = re.captures(line).and_then(|c| c.get(1)) {
+                let c0 = line[..m.start()].chars().count();
+                out.push((*score, line_no, c0..c0 + m.as_str().chars().count()));
+                break;
+            }
+        }
+    }
+    out
+}
+
+fn heuristic(root: &Path, files: Vec<String>, current: &Path, text: &str, cursor_line: usize, name: &str) -> Option<Target> {
+    let pats = patterns(name);
+
+    // 1) Current buffer: the highest-scoring definition, preferring the closest one
+    //    above the cursor (so local variables resolve to their nearest `let`).
+    let local = best_in_text(&pats, text);
+    let pick = local.iter().max_by_key(|(score, line, _)| {
+        let above = *line <= cursor_line;
+        let dist = if above { cursor_line - line } else { usize::MAX / 2 + line };
+        (*score, above, std::cmp::Reverse(dist))
+    });
+    if let Some((score, line, cols)) = pick {
+        if *score >= 2 {
+            return Some(Target { path: current.to_path_buf(), line: *line, cols: cols.clone() });
+        }
+    }
+
+    // 2) Other files in the project with a related extension.
+    let ext = current.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+    let related = related_exts(&ext);
+    let mut best: Option<(u8, Target)> = None;
+    for rel in files {
+        let path = root.join(&rel);
+        if path == current {
+            continue;
+        }
+        let fext = Path::new(&rel).extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+        if let Some(group) = related {
+            if !group.contains(&fext.as_str()) {
+                continue;
+            }
+        }
+        if std::fs::metadata(&path).map(|m| m.len() > 2_000_000).unwrap_or(true) {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(&path) else { continue };
+        if !content.contains(name) {
+            continue;
+        }
+        if let Some((score, line, cols)) = best_in_text(&pats, &content).into_iter().max_by_key(|(s, l, _)| (*s, std::cmp::Reverse(*l))) {
+            if best.as_ref().is_none_or(|(s, _)| score > *s) {
+                best = Some((score, Target { path, line, cols }));
+                if score >= 4 {
+                    break;
+                }
+            }
+        }
+    }
+    // 3) A weak match in the current file beats a weak match elsewhere.
+    match (pick, best) {
+        (Some((ls, line, cols)), Some((bs, _))) if *ls >= bs => Some(Target { path: current.to_path_buf(), line: *line, cols: cols.clone() }),
+        (_, Some((_, t))) => Some(t),
+        (Some((_, line, cols)), None) => Some(Target { path: current.to_path_buf(), line: *line, cols: cols.clone() }),
+        (None, None) => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn find_local(src: &str, cursor_line: usize, name: &str) -> Option<(usize, Range<usize>)> {
+        heuristic(Path::new("/nonexistent"), vec![], Path::new("/x/a.rs"), src, cursor_line, name).map(|t| (t.line, t.cols))
+    }
+
+    #[test]
+    fn word_and_positions() {
+        let t = "let héllo_1 = 2;\nfoo(x)";
+        assert_eq!(word_at(t, 5).unwrap().1, "héllo_1");
+        assert_eq!(word_at(t, 11).unwrap().1, "héllo_1"); // right after the word
+        assert!(word_at(t, 12).is_none());
+        assert_eq!(word_at(t, 14), None); // "2" is a number
+        assert_eq!(line_col16("a😀b\ncd", 2), (0, 3)); // emoji is 2 UTF-16 units
+        assert_eq!(line_col16("a😀b\ncd", 5), (1, 1));
+        assert_eq!(col16_to_char("a😀b", 3), 2);
+    }
+
+    #[test]
+    fn finds_definitions_across_languages() {
+        let rust = "struct Foo;\nfn main() {\n    let x = 1;\n    let x = 2;\n    use_it(x);\n}\nfn use_it(v: i32) {}\n";
+        assert_eq!(find_local(rust, 4, "x"), Some((3, 8..9))); // nearest `let` above the cursor
+        assert_eq!(find_local(rust, 4, "use_it"), Some((6, 3..9)));
+        assert_eq!(find_local(rust, 4, "Foo"), Some((0, 7..10)));
+
+        let py = "import os\n\nclass Thing:\n    def run(self):\n        return helper()\n\nhelper = lambda: 1\n";
+        assert_eq!(find_local(py, 4, "run"), Some((3, 8..11)));
+        assert_eq!(find_local(py, 4, "helper"), Some((6, 0..6)));
+
+        let c = "#define MAX 10\nstatic int count(const char *s) {\n  return strlen(s);\n}\nint main() { return count(\"a\"); }\n";
+        assert_eq!(find_local(c, 4, "MAX"), Some((0, 8..11)));
+        assert_eq!(find_local(c, 4, "count"), Some((1, 11..16)));
+
+        let go = "func (s *Server) Start() error {\n\treturn nil\n}\n";
+        assert_eq!(find_local(go, 1, "Start"), Some((0, 17..22)));
+
+        let js = "export const add = (a, b) => a + b;\nclass A {\n  render() {\n    return add(1, 2);\n  }\n}\n";
+        assert_eq!(find_local(js, 3, "add"), Some((0, 13..16)));
+        assert_eq!(find_local(js, 3, "render"), Some((2, 2..8)));
+    }
+
+    #[test]
+    fn searches_other_files_of_related_languages() {
+        let dir = std::env::temp_dir().join(format!("edittr-goto-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/util.rs"), "// fn helper is below\npub fn helper() -> u8 { 1 }\n").unwrap();
+        std::fs::write(dir.join("notes.py"), "def helper(): pass\n").unwrap();
+        let files = vec!["notes.py".to_string(), "src/util.rs".into()];
+        let t = heuristic(&dir, files, &dir.join("src/main.rs"), "fn main() { helper(); }", 0, "helper").unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(t.path, dir.join("src/util.rs")); // skips the .py file and the comment
+        assert_eq!((t.line, t.cols), (1, 7..13));
+    }
+
+    /// Real language server round trip. Needs the server installed; run with
+    /// `cargo test -- --ignored lsp_round_trip_<name>`.
+    fn lsp_round_trip(ext: &str, files: &[(&str, &str)], main: &str, symbol: &str, expect: (&str, usize)) {
+        let dir = std::env::temp_dir().join(format!("edittr-lsp-{ext}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for (name, body) in files {
+            let p = dir.join(name);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, body).unwrap();
+        }
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        let spec = lsp::servers_for(ext).into_iter().find(|s| lsp::resolve(s.command).is_some()).expect("server not installed");
+        let client = lsp::Client::start(&spec, &dir).unwrap();
+        let text = std::fs::read_to_string(dir.join(main)).unwrap();
+        let idx = text.find(symbol).map(|b| text[..b].chars().count()).unwrap() + 1;
+        // Indexing can take a moment: retry until the server answers with a location.
+        let start = std::time::Instant::now();
+        let target = loop {
+            let req = Request { root: dir.clone(), files: Box::new(Vec::new), path: dir.join(main), text: text.clone(), char_idx: idx, client: Some(client.clone()) };
+            match run(req) {
+                Outcome::Found { target, via } if via == spec.name => break target,
+                _ if start.elapsed() < Duration::from_secs(90) => std::thread::sleep(Duration::from_millis(500)),
+                _ => panic!("{} never answered", spec.name),
+            }
+        };
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!((target.path.strip_prefix(&dir).unwrap().to_str().unwrap(), target.line), expect);
+    }
+
+    #[test]
+    #[ignore]
+    fn lsp_round_trip_c() {
+        lsp_round_trip(
+            "c",
+            &[
+                ("util.h", "#pragma once\nint add(int a, int b);\n"),
+                ("util.c", "#include \"util.h\"\n\nint add(int a, int b) { return a + b; }\n"),
+                ("main.c", "#include \"util.h\"\nint main(void) {\n  int total = add(1, 2);\n  return total;\n}\n"),
+                ("compile_flags.txt", "-I.\n"),
+            ],
+            "main.c",
+            "add(1",
+            ("util.h", 1), // clangd: definition lives in another TU, so it reports the declaration
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn lsp_round_trip_rust() {
+        lsp_round_trip(
+            "rs",
+            &[
+                ("Cargo.toml", "[package]\nname = \"t\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+                ("src/util.rs", "pub struct Point { pub x: i32 }\n\npub fn make() -> Point { Point { x: 1 } }\n"),
+                ("src/main.rs", "mod util;\nfn main() {\n    let p = util::make();\n    println!(\"{}\", p.x);\n}\n"),
+            ],
+            "src/main.rs",
+            "make()",
+            ("src/util.rs", 2),
+        );
+    }
+}

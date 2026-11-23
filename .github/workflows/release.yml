@@ -1,0 +1,150 @@
+# Builds edittr for Windows, macOS and Linux and publishes a GitHub release.
+#
+# Trigger: push a version tag, e.g.  git tag v0.2.0 && git push origin v0.2.0
+# Manual runs (Actions tab -> release -> Run workflow) build everything and keep
+# the files as workflow artifacts without publishing a release.
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Version
+        shell: bash
+        run: ./.github/scripts/version.sh
+      - run: rustup update stable --no-self-update
+      - run: cargo build --release --locked
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+      - name: Package (portable exe, portable zip, installer)
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/release/edittr.exe "dist/edittr-${VERSION}-windows-x64-portable.exe"
+          mkdir -p "pkg/edittr-${VERSION}-windows-x64"
+          cp target/release/edittr.exe README.md "pkg/edittr-${VERSION}-windows-x64/"
+          (cd pkg && 7z a -tzip "../dist/edittr-${VERSION}-windows-x64-portable.zip" "edittr-${VERSION}-windows-x64" > /dev/null)
+          "/c/Program Files (x86)/Inno Setup 6/ISCC.exe" \
+            "//DAppVersion=${VERSION}" \
+            "//DSourceExe=$(cygpath -w "$PWD/target/release/edittr.exe")" \
+            "//DOutputDir=$(cygpath -w "$PWD/dist")" \
+            packaging/windows/edittr.iss
+          ls -la dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/*
+
+  macos:
+    runs-on: macos-latest
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Version
+        run: ./.github/scripts/version.sh
+      - run: rustup update stable --no-self-update && rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - run: cargo build --release --locked --target aarch64-apple-darwin
+      - run: cargo build --release --locked --target x86_64-apple-darwin
+      - name: Package (universal .app in .dmg and .zip)
+        run: |
+          APP=pkg/edittr.app
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" dist
+          lipo -create -output "$APP/Contents/MacOS/edittr" \
+            target/aarch64-apple-darwin/release/edittr target/x86_64-apple-darwin/release/edittr
+          sed "s/__VERSION__/${VERSION}/g" packaging/macos/Info.plist > "$APP/Contents/Info.plist"
+          cp packaging/macos/edittr.icns "$APP/Contents/Resources/edittr.icns"
+          # Ad-hoc signature so Apple Silicon will run it (not notarized).
+          codesign --force --deep --sign - "$APP"
+          ln -s /Applications pkg/Applications
+          hdiutil create -volname "edittr ${VERSION}" -srcfolder pkg -ov -format UDZO \
+            "dist/edittr-${VERSION}-macos-universal.dmg"
+          rm pkg/Applications
+          (cd pkg && ditto -c -k --keepParent edittr.app "../dist/edittr-${VERSION}-macos-universal.zip")
+          ls -la dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: dist/*
+
+  linux:
+    strategy:
+      matrix:
+        include:
+          # 22.04 keeps the glibc requirement low so binaries run on older distros.
+          - { runner: ubuntu-22.04, arch: x86_64 }
+          - { runner: ubuntu-22.04-arm, arch: aarch64 }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Version
+        run: ./.github/scripts/version.sh
+      - name: System packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libgl1-mesa-dev libwayland-dev \
+            libx11-dev libxcursor-dev libxrandr-dev libxi-dev
+      - run: rustup update stable --no-self-update
+      - run: cargo build --release --locked
+      - name: Package (.tar.gz and .deb)
+        run: |
+          NAME="edittr-${VERSION}-linux-${{ matrix.arch }}"
+          mkdir -p "pkg/$NAME" dist
+          cp target/release/edittr README.md packaging/linux/edittr.desktop "pkg/$NAME/"
+          cp assets/icon-256.png "pkg/$NAME/edittr.png"
+          cat > "pkg/$NAME/install.sh" <<'SH'
+          #!/bin/sh
+          # Installs edittr for the current user into ~/.local
+          set -e
+          cd "$(dirname "$0")"
+          mkdir -p ~/.local/bin ~/.local/share/applications ~/.local/share/icons/hicolor/256x256/apps
+          cp edittr ~/.local/bin/edittr
+          cp edittr.desktop ~/.local/share/applications/edittr.desktop
+          cp edittr.png ~/.local/share/icons/hicolor/256x256/apps/edittr.png
+          echo "Installed. Make sure ~/.local/bin is on your PATH."
+          SH
+          chmod +x "pkg/$NAME/install.sh" "pkg/$NAME/edittr"
+          tar -C pkg -czf "dist/$NAME.tar.gz" "$NAME"
+          cargo install cargo-deb --locked
+          cargo deb --no-build --no-strip --output "dist/"
+          ls -la dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.arch }}
+          path: dist/*
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows, macos, linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: cd dist && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" \
+              --title "edittr $TAG" --generate-notes
+          fi

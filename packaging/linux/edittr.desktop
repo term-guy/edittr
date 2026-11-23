@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=edittr
+GenericName=Code Editor
+Comment=Lightweight code editor with git built in
+Exec=edittr %F
+Icon=edittr
+Terminal=false
+Categories=Development;TextEditor;IDE;
+MimeType=text/plain;inode/directory;
+StartupWMClass=edittr
+Keywords=editor;code;git;
