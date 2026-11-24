@@ -13,6 +13,10 @@
 set -euo pipefail
 
 PLATFORM=$1
+case $PLATFORM in
+  windows-x64|macos-universal|linux-x86_64|linux-aarch64) ;;
+  *) echo "unknown platform: $PLATFORM (windows-x64 | macos-universal | linux-x86_64 | linux-aarch64)" >&2; exit 2 ;;
+esac
 mkdir -p "$2"
 DEST=$(cd "$2" && pwd)
 TMP=$(mktemp -d)
