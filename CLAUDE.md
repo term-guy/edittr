@@ -38,6 +38,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Gotchas
 
+- Editor text changes must bump `Doc::version` (use `Doc::reload` / `Doc::mark_saved`): highlighting, blame, dirty state and the gutter are cached per version. Syntax highlighting is incremental (`src/highlight.rs`), not egui_extras' whole-buffer highlighter.
+- VCS calls go through `src/vcs.rs` (Git or Subversion) on background workers; refreshes are driven by the file watcher (`src/watch.rs`), not a timer. `svn` is not installed on the dev Mac: svn code is only unit-tested against sample XML.
+- To measure frame times, time `App::ui` temporarily and run the tour against a demo repo containing a ~20k-line file; remove the timer afterwards.
+
 - Every spawned process needs `CREATE_NO_WINDOW` on Windows (see `git::cmd`), or a console window flashes.
 - Downloads use ureq with `RootCerts::PlatformVerifier` (OS trust store). Don't switch back to bundled webpki roots: that broke clangd downloads.
 - `rfd` is pinned to `=0.18.0` because Linux portal-failure detection in `app.rs` hooks its internal log target.
