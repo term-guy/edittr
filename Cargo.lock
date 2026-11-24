@@ -567,6 +567,7 @@ dependencies = [
  "rfd",
  "serde_json",
  "sha2",
+ "syntect",
  "ureq",
  "url",
  "winresource",

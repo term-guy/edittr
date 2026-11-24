@@ -1,13 +1,13 @@
 #[cfg(feature = "tour")]
 mod tour;
 
-use crate::blame;
 use crate::column::{self, ColumnSel};
 use crate::git::{self, FileChange, Status};
 use crate::graph::Graph;
 use crate::icons as ic;
 use crate::search::{self, FileHits};
 use crate::settings::{Settings, SettingsWriter};
+use crate::{blame, highlight};
 use crate::{goto, installer, lsp, workspace};
 use eframe::egui::{self, Color32, Key, KeyboardShortcut, Modifiers, RichText};
 use egui_extras::syntax_highlighting::{self, CodeTheme};
@@ -57,6 +57,8 @@ struct Doc {
     blame: Option<blame::Blame>,
     blame_version: Option<u64>,
     blame_rx: Option<Receiver<(u64, Result<blame::Blame, String>)>>,
+    /// Incremental syntax highlighting + cached layout.
+    hl: highlight::Cache,
 }
 
 impl Doc {
@@ -262,6 +264,7 @@ impl App {
         settings_writer: SettingsWriter,
     ) -> Self {
         ic::install(&cc.egui_ctx);
+        highlight::warm_up();
         cc.egui_ctx.global_style_mut(|s| {
             s.spacing.item_spacing.y = 3.0;
         });
@@ -572,6 +575,7 @@ impl App {
             blame: None,
             blame_version: None,
             blame_rx: None,
+            hl: Default::default(),
         }));
         // Warm up the language server so the first go-to-definition is fast.
         let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
@@ -2181,23 +2185,11 @@ mod folder_picker {
 /// Draws the editor. Returns a char index when the user Ctrl/Cmd+clicked a symbol.
 fn editor(ui: &mut egui::Ui, doc: &mut Doc, settings: Settings, inline: Option<String>) -> Option<usize> {
     let mut goto_request = None;
-    let theme = CodeTheme::from_style(ui.style());
     let highlight = doc.text.len() <= HIGHLIGHT_LIMIT;
     let lang = doc.lang.clone();
-    let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, _wrap: f32| {
-        let mut job = if highlight {
-            syntax_highlighting::highlight(ui.ctx(), ui.style(), &theme, buf.as_str(), &lang)
-        } else {
-            egui::text::LayoutJob::simple(
-                buf.as_str().to_string(),
-                egui::FontId::monospace(13.0),
-                ui.visuals().text_color(),
-                f32::INFINITY,
-            )
-        };
-        job.wrap.max_width = f32::INFINITY;
-        ui.fonts_mut(|f| f.layout_job(job))
-    };
+    // Taken out of `doc` while the editor (which also needs `doc`) is shown; put back below.
+    let mut hl = std::mem::take(&mut doc.hl);
+    let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, _wrap: f32| hl.layout(ui, buf.as_str(), &lang, highlight);
     let lines = doc.text.split('\n').count();
     egui::ScrollArea::both()
         .id_salt(&doc.path)
@@ -2278,6 +2270,7 @@ fn editor(ui: &mut egui::Ui, doc: &mut Doc, settings: Settings, inline: Option<S
                 }
             });
         });
+    doc.hl = hl;
     goto_request
 }
 

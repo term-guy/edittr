@@ -8,6 +8,7 @@ mod diff;
 mod git;
 mod goto;
 mod graph;
+mod highlight;
 mod icons;
 mod installer;
 mod lsp;
