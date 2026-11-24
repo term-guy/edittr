@@ -32,6 +32,7 @@ pub(crate) enum Setting {
     ShowWhitespace,
     InlineBlame,
     ChangesTree,
+    RestoreSession,
 }
 
 impl Setting {
@@ -41,6 +42,7 @@ impl Setting {
             Self::ShowWhitespace => "Show whitespace",
             Self::InlineBlame => "Inline blame (who changed the current line)",
             Self::ChangesTree => "Source Control: view as tree",
+            Self::RestoreSession => "Restore previous session",
         }
     }
 
@@ -50,6 +52,7 @@ impl Setting {
             Self::ShowWhitespace => &mut settings.show_whitespace,
             Self::InlineBlame => &mut settings.inline_blame,
             Self::ChangesTree => &mut settings.changes_tree,
+            Self::RestoreSession => &mut settings.restore_previous_session,
         }
     }
 }
@@ -130,6 +133,7 @@ pub(crate) const COMMANDS: &[Entry] = &[
     Entry::new(ToggleSetting(Setting::ShowWhitespace), "Toggle whitespace", &[]),
     Entry::new(ToggleSetting(Setting::InlineBlame), "Toggle inline blame", &[]),
     Entry::new(ToggleSetting(Setting::ChangesTree), "Toggle source control tree view", &[]),
+    Entry::new(ToggleSetting(Setting::RestoreSession), "Toggle restoring the previous session", &[]),
 ];
 
 pub(crate) fn entry(id: Command) -> &'static Entry {

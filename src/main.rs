@@ -16,6 +16,7 @@ mod installer;
 mod lsp;
 mod replace;
 mod search;
+mod session;
 mod settings;
 mod svn;
 mod symbols;
@@ -33,20 +34,18 @@ fn main() -> eframe::Result {
         import_login_shell_path();
     }
 
-    if std::env::args().any(|a| a == "--list-servers") {
+    if std::env::args_os().any(|a| a == "--list-servers") {
         list_servers();
         return Ok(());
     }
 
     // Old macOS versions pass "-psn_…" when launched from Finder.
-    let arg = std::env::args().skip(1).find(|a| !a.starts_with("-psn")).map(PathBuf::from);
-    // No argument: start with an empty project. A folder argument opens it; a file
-    // argument opens just that file.
-    let (root, file) = match arg {
-        Some(p) if p.is_file() => (None, Some(std::fs::canonicalize(&p).unwrap_or(p))),
-        Some(p) if p.is_dir() => (Some(std::fs::canonicalize(&p).unwrap_or(p)), None),
-        _ => (None, None),
-    };
+    let arg = std::env::args_os()
+        .skip(1)
+        .find(|a| !a.to_string_lossy().starts_with("-psn"))
+        .map(PathBuf::from);
+    let settings = settings::Settings::load();
+    let startup = session::Startup::new(arg, settings.restore_previous_session);
 
     let mut viewport = eframe::egui::ViewportBuilder::default()
         .with_title("edittr")
@@ -57,18 +56,21 @@ fn main() -> eframe::Result {
         viewport = viewport.with_icon(icon);
     }
     let options = eframe::NativeOptions {
-        viewport,
+        viewport: startup.window.geometry.apply(viewport),
         ..Default::default()
     };
-    let settings = settings::Settings::load();
     let (settings_writer, worker) = settings::SettingsWriter::start();
+    let (session_writer, session_worker) = session::Writer::start().unzip();
     let result = eframe::run_native(
         "edittr",
         options,
-        Box::new(move |cc| Ok(Box::new(app::App::new(cc, root, file, settings, settings_writer)))),
+        Box::new(move |cc| Ok(Box::new(app::App::new(cc, startup, settings, settings_writer, session_writer)))),
     );
-    // Finish queued settings writes once the event loop and its app have exited.
+    // Finish queued writes once the event loop and its app have exited.
     let _ = worker.join();
+    if let Some(worker) = session_worker {
+        let _ = worker.join();
+    }
     result
 }
 

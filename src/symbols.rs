@@ -159,7 +159,7 @@ mod tests {
     fn fallback_outline_shares_definition_patterns_and_char_columns() {
         let path = Path::new("fixture.txt");
         let source = "// fn fake() {}\nstruct Model;\nfn café() {}\n  let mut value = 1;\n#define MAX 10\nstatic int count(void) {\n  return count();\nconst MAX_COUNT: usize = 10;\n";
-        let symbols = document(path, source, None);
+        let symbols = document(path, source, (0, 0), None);
         let outline: Vec<_> = symbols.iter().map(|s| (s.name.as_str(), s.kind, s.line)).collect();
         assert_eq!(
             outline,

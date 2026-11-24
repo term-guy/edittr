@@ -2,6 +2,7 @@ mod find;
 mod navigation;
 mod problems;
 mod search_replace;
+mod session;
 #[cfg(feature = "tour")]
 mod tour;
 
@@ -10,6 +11,7 @@ use crate::editor;
 use crate::graph::Graph;
 use crate::icons as ic;
 use crate::search::{self, FileHits};
+use crate::session::{Side, Startup, Writer};
 use crate::settings::{Settings, SettingsWriter};
 use crate::vcs::{self, FileChange, Status, Vcs};
 use crate::watch::{Changes, IGNORED_DIRS, Watcher};
@@ -207,14 +209,6 @@ impl DiffTab {
     }
 }
 
-#[derive(PartialEq, Clone, Copy)]
-enum Side {
-    Explorer,
-    Changes,
-    Search,
-    Problems,
-}
-
 #[derive(Default)]
 struct SearchState {
     opts: search::Options,
@@ -252,6 +246,7 @@ struct QuickOpen {
 
 enum Confirm {
     CloseTabs(Vec<usize>),
+    SwitchWorkspace(PathBuf),
     Discard(FileChange),
 }
 
@@ -342,6 +337,7 @@ pub struct App {
     install_declined: HashSet<&'static str>,
     settings: Settings,
     settings_writer: SettingsWriter,
+    sessions: session::Sessions,
     /// Collapsed folders in the Changes tree, keyed "S:<path>" (staged) or "U:<path>".
     changes_collapsed: HashSet<String>,
     #[cfg(feature = "tour")]
@@ -351,10 +347,10 @@ pub struct App {
 impl App {
     pub fn new(
         cc: &eframe::CreationContext,
-        root: Option<PathBuf>,
-        file: Option<PathBuf>,
+        startup: Startup,
         settings: Settings,
         settings_writer: SettingsWriter,
+        session_writer: Option<Writer>,
     ) -> Self {
         ic::install(&cc.egui_ctx);
         highlight::warm_up();
@@ -415,27 +411,19 @@ impl App {
             install_declined: HashSet::new(),
             settings,
             settings_writer,
+            sessions: session::Sessions::new(session_writer, startup.window.clone()),
             changes_collapsed: HashSet::new(),
             #[cfg(feature = "tour")]
             tour: tour::Tour::from_env(),
         };
-        if let Some(root) = root {
-            app.set_root(root);
-        }
-        if let Some(f) = file {
-            app.open_file(&f);
-        }
+        app.start_session(startup);
         app
     }
 
-    fn set_root(&mut self, root: PathBuf) {
+    fn activate_root(&mut self, root: PathBuf, ignored: Vec<String>) {
         self.clear_project();
         self.watcher = Some(Watcher::start(root.clone(), self.ctx.clone()));
-        self.recent.retain(|r| r != &root);
-        self.recent.insert(0, root.clone());
-        self.recent.truncate(10);
-        save_recent(&self.recent);
-        self.ignored = workspace::load_ignored(&root);
+        self.ignored = ignored;
         self.root = Some(root);
         self.search.cancel.store(true, Ordering::Relaxed);
         let opts = std::mem::take(&mut self.search.opts);
@@ -905,6 +893,12 @@ impl App {
                 return;
             }
         };
+        // The active document's sync starts its language server (see sync_active_document).
+        self.add_file_tab(path, text);
+        self.active = self.tabs.len() - 1;
+    }
+
+    fn add_file_tab(&mut self, path: &Path, text: String) {
         let lang = path
             .extension()
             .or_else(|| path.file_name())
@@ -934,7 +928,6 @@ impl App {
             line_col_cache: std::cell::Cell::new((u64::MAX, 0, (0, 0))),
         }));
         self.next_doc_id += 1;
-        self.active = self.tabs.len() - 1;
     }
 
     fn show_tab(&mut self, tab: Tab) {
@@ -2419,6 +2412,7 @@ impl App {
                         ),
                     }
                 }
+                Confirm::SwitchWorkspace(_) => "Discard unsaved changes and open the folder?".into(),
                 Confirm::Discard(f) => format!("Discard all changes to {}?\nThis cannot be undone.", f.path),
             };
             let mut answer = None;
@@ -2438,6 +2432,7 @@ impl App {
                 if yes {
                     match c {
                         Confirm::CloseTabs(idx) => self.close_tabs(idx, true),
+                        Confirm::SwitchWorkspace(root) => self.restore_workspace(Some(root), None),
                         Confirm::Discard(f) => {
                             if let Some(repo) = &self.repo {
                                 let path = repo.join(&f.path);
@@ -2454,6 +2449,12 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        if self.poll_session_restore() {
+            egui::CentralPanel::default().show(ui, |ui| {
+                ui.centered_and_justified(|ui| ui.weak("Restoring session…"));
+            });
+            return;
+        }
         self.poll_background(&ctx);
         self.shortcuts(&ctx);
         self.picker_dialog(&ctx);
@@ -2472,28 +2473,22 @@ impl eframe::App for App {
             .resizable(false)
             .exact_size(44.0)
             .show(ui, |ui| self.activity_bar(ui));
-        if self.side_open {
-            egui::Panel::left("side")
-                .resizable(true)
-                .default_size(260.0)
-                .min_size(160.0)
-                .show(ui, |ui| match self.side {
-                    Side::Explorer => self.explorer(ui),
-                    Side::Changes => self.changes(ui),
-                    Side::Search => self.search_panel(ui),
-                    Side::Problems => self.problems_panel(ui),
-                });
-        }
+        self.show_session_sidebar(ui);
         egui::CentralPanel::default().show(ui, |ui| self.central(ui));
         self.open_requested_folder(frame);
         self.dialogs(&ctx);
         self.sync_active_document();
         self.project_replace_modal(&ctx);
+        self.record_session(false);
         #[cfg(feature = "tour")]
         if let Some(mut t) = self.tour.take() {
             t.tick(self, &ctx);
             self.tour = Some(t);
         }
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.record_session(true);
     }
 
     #[cfg(feature = "tour")]

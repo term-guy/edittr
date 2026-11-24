@@ -16,6 +16,7 @@ pub(crate) struct Settings {
     pub(crate) show_whitespace: bool,
     /// Dimmed "who changed this line" after the cursor's line.
     pub(crate) inline_blame: bool,
+    pub(crate) restore_previous_session: bool,
 }
 
 impl Default for Settings {
@@ -25,6 +26,7 @@ impl Default for Settings {
             highlight_line: true,
             show_whitespace: false,
             inline_blame: true,
+            restore_previous_session: true,
         }
     }
 }
@@ -80,6 +82,7 @@ impl Settings {
                     "highlight_line" => settings.highlight_line = value,
                     "show_whitespace" => settings.show_whitespace = value,
                     "inline_blame" => settings.inline_blame = value,
+                    "restore_previous_session" => settings.restore_previous_session = value,
                     _ => {}
                 }
             }
@@ -92,7 +95,10 @@ impl Settings {
         for line in previous.lines() {
             if !matches!(
                 entry(line),
-                Some(("changes_tree" | "highlight_line" | "show_whitespace" | "inline_blame", _))
+                Some((
+                    "changes_tree" | "highlight_line" | "show_whitespace" | "inline_blame" | "restore_previous_session",
+                    _
+                ))
             ) {
                 text.push_str(line);
                 text.push('\n');
@@ -102,6 +108,7 @@ impl Settings {
         text.push_str(&format!("highlight_line={}\n", self.highlight_line));
         text.push_str(&format!("show_whitespace={}\n", self.show_whitespace));
         text.push_str(&format!("inline_blame={}\n", self.inline_blame));
+        text.push_str(&format!("restore_previous_session={}\n", self.restore_previous_session));
         text
     }
 }
@@ -177,7 +184,7 @@ mod tests {
         let text = settings.format(previous);
         assert_eq!(
             text,
-            "future_key=one=two\nfuture_key = three\n# A comment\nchanges_tree=false\nhighlight_line=false\nshow_whitespace=false\ninline_blame=true\n"
+            "future_key=one=two\nfuture_key = three\n# A comment\nchanges_tree=false\nhighlight_line=false\nshow_whitespace=false\ninline_blame=true\nrestore_previous_session=true\n"
         );
         assert!(!Settings::parse(&text).changes_tree);
     }
@@ -202,5 +209,20 @@ mod tests {
     fn missing_or_invalid_value_enables_line_highlight() {
         assert!(Settings::parse("changes_tree=true").highlight_line);
         assert!(Settings::parse("highlight_line=maybe").highlight_line);
+    }
+
+    #[test]
+    fn restore_previous_session_round_trip_and_default_on() {
+        assert!(Settings::parse("").restore_previous_session);
+        assert!(Settings::parse("restore_previous_session=maybe").restore_previous_session);
+        for restore_previous_session in [false, true] {
+            let settings = Settings {
+                restore_previous_session,
+                ..Settings::default()
+            };
+            let text = settings.format("restore_previous_session=false");
+            assert_eq!(text.matches("restore_previous_session=").count(), 1);
+            assert_eq!(Settings::parse(&text).restore_previous_session, restore_previous_session);
+        }
     }
 }

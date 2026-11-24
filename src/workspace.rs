@@ -37,7 +37,7 @@ pub fn save_ignored(root: &Path, list: &[String]) {
     let _ = write_config(&path, &format_config(&root, list, &config.unknown));
 }
 
-fn write_config(path: &Path, text: &str) -> io::Result<()> {
+pub(crate) fn write_config(path: &Path, text: &str) -> io::Result<()> {
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
     std::fs::create_dir_all(path.parent().unwrap())?;
     let temp = path.with_extension(format!("{}.{}.tmp", std::process::id(), NEXT_TEMP.fetch_add(1, Ordering::Relaxed)));
