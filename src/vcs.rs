@@ -117,6 +117,15 @@ impl Vcs {
         }
     }
 
+    /// The committed version of `rel` (git: HEAD, svn: the local pristine BASE copy),
+    /// or None when the file isn't versioned. Both are local operations.
+    pub fn base_text(self, root: &Path, rel: &str) -> Option<String> {
+        match self {
+            Self::Git => git::run(root, &["show", &format!("HEAD:{rel}")]).ok(),
+            Self::Svn => svn::cat_base(root, rel).ok(),
+        }
+    }
+
     pub fn show_commit(self, root: &Path, rev: &str) -> String {
         match self {
             Self::Git => git::show_commit(root, rev),

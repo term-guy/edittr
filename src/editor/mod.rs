@@ -106,8 +106,9 @@ pub struct Extras<'a> {
     pub squiggles: &'a [(Range<usize>, Color32)],
     /// Background marks (byte ranges), e.g. find matches.
     pub marks: &'a [Range<usize>],
-    /// Gutter markers per line (e.g. added / modified lines vs. git).
-    pub gutter: &'a [(usize, Color32)],
+    /// Gutter markers per line (e.g. added / modified lines vs. git); `true` draws a
+    /// "lines deleted above" triangle instead of a bar.
+    pub gutter: &'a [(usize, Color32, bool)],
 }
 
 #[derive(Default)]
@@ -421,14 +422,17 @@ pub fn show(
                     color,
                 );
             }
-            for &(l, color) in extras.gutter {
-                if visible.contains(&l) {
-                    let y = lay.line_y(l);
-                    gp.rect_filled(
-                        Rect::from_min_size(Pos2::new(gx + gutter_w - 0.9 * char_w, y), Vec2::new(3.0, row_h)),
-                        0.0,
-                        color,
-                    );
+            for &(l, color, deleted) in extras.gutter {
+                if !visible.contains(&l) && !(deleted && visible.contains(&l.saturating_sub(1))) {
+                    continue;
+                }
+                let x = gx + gutter_w - 0.9 * char_w;
+                let y = lay.line_y(l);
+                if deleted {
+                    let tri = vec![Pos2::new(x, y - 4.0), Pos2::new(x + 5.0, y), Pos2::new(x, y + 4.0)];
+                    gp.add(egui::Shape::convex_polygon(tri, color, Stroke::NONE));
+                } else {
+                    gp.rect_filled(Rect::from_min_size(Pos2::new(x, y), Vec2::new(3.0, row_h)), 0.0, color);
                 }
             }
 

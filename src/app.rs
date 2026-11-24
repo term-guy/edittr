@@ -1,5 +1,6 @@
 mod document_save;
 mod find;
+mod gutter;
 mod navigation;
 mod problems;
 mod search_replace;
@@ -61,6 +62,8 @@ struct Doc {
     blame_rx: Option<Receiver<(u64, Result<blame::Blame, String>)>>,
     /// Incremental syntax highlighting + cached layout.
     hl: highlight::Cache,
+    /// Gutter change markers vs. the committed file.
+    markers: gutter::Markers,
     /// Per-frame values cached by `version` (they are O(file size) to compute).
     dirty_cache: std::cell::Cell<(u64, bool)>,
     line_col_cache: std::cell::Cell<(u64, usize, (usize, usize))>,
@@ -727,6 +730,7 @@ impl App {
         self.poll_document_saves();
         self.poll_vcs(ctx);
         self.poll_blame(ctx);
+        self.poll_markers();
         self.start_refresh();
         if let Some(entries) = receive(&mut self.tree_rx) {
             self.tree
@@ -878,6 +882,10 @@ impl App {
         if changes.rescan || !changes.dirs.is_empty() {
             self.invalidate_tree(|dir| changes.rescan || changes.dirs.contains(dir) || changes.affects(dir));
         }
+        if changes.vcs || changes.rescan || changes.rediscover {
+            // A commit, checkout or revert changes the committed text the markers diff against.
+            self.reset_markers();
+        }
         if changes.rescan || changes.rediscover || changes.vcs || !changes.paths.is_empty() {
             self.pending_changes.merge(changes);
             self.refresh_pending = true;
@@ -938,6 +946,7 @@ impl App {
             blame_version: None,
             blame_rx: None,
             hl: Default::default(),
+            markers: Default::default(),
             dirty_cache: Default::default(),
             line_col_cache: std::cell::Cell::new((u64::MAX, 0, (0, 0))),
         }));
@@ -2649,11 +2658,18 @@ fn editor(
             .map(|r| ix.char_to_byte(&doc.text, r.start)..ix.char_to_byte(&doc.text, r.end))
             .collect()
     };
+    let dark = ui.visuals().dark_mode;
+    let gutter_marks: Vec<(usize, Color32, bool)> = doc
+        .markers
+        .lines
+        .iter()
+        .map(|&(l, c)| (l, gutter::color(c, dark), c == gutter::Change::Deleted))
+        .collect();
     let extras = editor::Extras {
         inline: inline.as_deref(),
         squiggles: &squiggles,
         marks: &marks,
-        ..Default::default()
+        gutter: &gutter_marks,
     };
     let before = doc.version;
     let out = editor::show(ui, id, &mut doc.ed, &mut doc.text, &mut doc.version, &mut doc.hl, &opts, &extras);

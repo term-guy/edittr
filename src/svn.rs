@@ -38,6 +38,11 @@ fn target(path: &str) -> String {
     if path.contains('@') { format!("{path}@") } else { path.into() }
 }
 
+/// The pristine (BASE) text of a file: read from the working copy, no server access.
+pub fn cat_base(root: &Path, rel: &str) -> Result<String, String> {
+    run(root, &["cat", "-r", "BASE", "--", &target(rel)])
+}
+
 pub fn repo_root(dir: &Path) -> Option<PathBuf> {
     // Since svn 1.7 a working copy has a single `.svn` at its root: no process needed.
     dir.ancestors().find(|p| p.join(".svn").is_dir()).map(Path::to_path_buf)
