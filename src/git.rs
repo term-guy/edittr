@@ -384,6 +384,7 @@ pub enum HistoryAction {
     Merge { branch: String, source: String },
     CreateTag { name: String, hash: String },
     DeleteBranch { name: String, force: bool },
+    DeleteTag(String),
 }
 
 impl HistoryAction {
@@ -397,6 +398,7 @@ impl HistoryAction {
             Self::Merge { .. } => "Merge",
             Self::CreateTag { .. } => "Create tag",
             Self::DeleteBranch { .. } => "Delete branch",
+            Self::DeleteTag(_) => "Delete tag",
         }
     }
 
@@ -428,6 +430,7 @@ impl HistoryAction {
             Self::Merge { source, .. } => vec!["merge", "--no-edit", "--", source],
             Self::CreateTag { name, hash } => vec!["tag", "--no-sign", "--", name, hash],
             Self::DeleteBranch { name, force } => vec!["branch", if *force { "-D" } else { "-d" }, "--", name],
+            Self::DeleteTag(name) => vec!["tag", "-d", "--", name],
         }
     }
 

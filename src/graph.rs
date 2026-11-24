@@ -125,7 +125,12 @@ impl Graph {
     }
 
     /// Show the whole graph as a virtualised list. Returns the clicked row.
-    pub fn ui(&self, ui: &mut egui::Ui, selected: Option<usize>, mut menu: impl FnMut(&mut egui::Ui, &Commit)) -> Option<usize> {
+    pub fn ui(
+        &self,
+        ui: &mut egui::Ui,
+        selected: Option<usize>,
+        mut menu: impl FnMut(&mut egui::Ui, &Commit, Option<&CommitRef>),
+    ) -> Option<usize> {
         let row_h = 22.0;
         let lane_w = 14.0;
         let graph_w = lane_w * self.lanes.min(24) as f32 + 6.0;
@@ -135,7 +140,17 @@ impl Graph {
             .show_rows(ui, row_h, self.commits.len(), |ui, range| {
                 for r in range {
                     let c = &self.commits[r];
-                    let width = ui.available_width().max(600.0);
+                    let mono = egui::FontId::monospace(12.0);
+                    let refs: Vec<_> = c
+                        .refs
+                        .iter()
+                        .map(|reference| {
+                            let (label, color) = ref_style(reference);
+                            (reference, ui.painter().layout_no_wrap(label, mono.clone(), Color32::WHITE), color)
+                        })
+                        .collect();
+                    let refs_width: f32 = refs.iter().map(|(_, galley, _)| galley.size().x + 12.0).sum();
+                    let width = ui.available_width().max(graph_w + refs_width + 506.0);
                     let (_, rect) = ui.allocate_space(Vec2::new(width, row_h));
                     let resp = ui.interact(rect, ui.make_persistent_id(&c.hash), Sense::click());
                     let painter = ui.painter_at(rect);
@@ -149,17 +164,21 @@ impl Graph {
                     self.paint_row(&painter, graph_rect, r, lane_w);
 
                     let font = egui::FontId::proportional(13.0);
-                    let mono = egui::FontId::monospace(12.0);
                     let text_col = vis.text_color();
                     let weak = vis.weak_text_color();
                     let mut px = rect.left() + graph_w + 4.0;
                     let cy = rect.center().y;
-                    for rf in &c.refs {
-                        let (label, color) = ref_style(rf);
-                        let galley = painter.layout_no_wrap(label, mono.clone(), Color32::WHITE);
+                    for (i, (reference, galley, color)) in refs.into_iter().enumerate() {
                         let bg = Rect::from_min_size(Pos2::new(px, cy - galley.size().y / 2.0 - 1.0), galley.size() + Vec2::new(8.0, 2.0));
                         painter.rect_filled(bg, 3.0, color);
                         painter.galley(bg.min + Vec2::new(4.0, 1.0), galley, Color32::WHITE);
+                        if matches!(reference, CommitRef::Local { .. } | CommitRef::Remote(_) | CommitRef::Tag(_)) {
+                            let badge = ui.interact(bg, resp.id.with(i), Sense::click());
+                            if badge.clicked() {
+                                clicked = Some(r);
+                            }
+                            badge.context_menu(|ui| menu(ui, c, Some(reference)));
+                        }
                         px = bg.right() + 4.0;
                     }
                     let right = rect.right();
@@ -185,7 +204,7 @@ impl Graph {
                     if resp.clicked() {
                         clicked = Some(r);
                     }
-                    resp.context_menu(|ui| menu(ui, c));
+                    resp.context_menu(|ui| menu(ui, c, None));
                 }
             });
         clicked

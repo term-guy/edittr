@@ -54,7 +54,10 @@ impl RowAction {
 }
 
 impl GraphMenu<'_> {
-    pub fn show(&self, ui: &mut egui::Ui, commit: &Commit) -> Option<RowAction> {
+    pub fn show(&self, ui: &mut egui::Ui, commit: &Commit, reference: Option<&CommitRef>) -> Option<RowAction> {
+        if let Some(reference) = reference {
+            return self.ref_menu(ui, commit, reference);
+        }
         let revision = commit.hash.strip_prefix('r').filter(|_| self.vcs == Vcs::Svn);
         let action = ui
             .add_enabled_ui(!self.busy, |ui| match self.vcs {
@@ -95,27 +98,111 @@ impl GraphMenu<'_> {
         action
     }
 
+    fn current_branch(&self) -> Option<&str> {
+        self.branches.iter().find(|name| **name == self.status.branch).map(String::as_str)
+    }
+
+    fn checkout(&self, ui: &mut egui::Ui, commit: &Commit, reference: &CommitRef, badge: bool) -> Option<RowAction> {
+        match reference {
+            CommitRef::Local { name, head } => {
+                let current = *head || self.status.branch == *name;
+                let suffix = if current { " (current)" } else { "" };
+                button(ui, !current, format!("Checkout {name}{suffix}")).then(|| RowAction::git(GitAction::Checkout(name.clone())))
+            }
+            CommitRef::Remote(remote) => {
+                let (_, name) = remote.split_once('/')?;
+                let has_local = self.branches.iter().any(|local| local == name)
+                    || commit
+                        .refs
+                        .iter()
+                        .any(|reference| matches!(reference, CommitRef::Local { name: local, .. } if local == name));
+                if has_local {
+                    return (badge && button(ui, true, format!("Checkout {remote} (detached HEAD)"))).then(|| {
+                        RowAction::confirm(
+                            GitAction::Detach(format!("refs/remotes/{remote}")),
+                            format!("Check out {remote} with a detached HEAD?"),
+                        )
+                    });
+                }
+                button(ui, true, format!("Checkout {name} (new local branch tracking {remote})")).then(|| {
+                    RowAction::git(GitAction::Track {
+                        local: name.into(),
+                        remote: format!("refs/remotes/{remote}"),
+                    })
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn merge(&self, ui: &mut egui::Ui, reference: &CommitRef) -> Option<RowAction> {
+        let branch = self.current_branch()?;
+        let (name, prefix) = match reference {
+            CommitRef::Local { name, head: false } if name != branch => (name, "refs/heads/"),
+            CommitRef::Remote(name) => (name, "refs/remotes/"),
+            _ => return None,
+        };
+        let label = format!("Merge {name} into {branch}");
+        button(ui, true, &label).then(|| {
+            RowAction::confirm(
+                GitAction::Merge {
+                    branch: branch.into(),
+                    source: format!("{prefix}{name}"),
+                },
+                format!("{label}?"),
+            )
+        })
+    }
+
+    fn delete_branch(&self, ui: &mut egui::Ui, reference: &CommitRef) -> Option<RowAction> {
+        let CommitRef::Local { name, head: false } = reference else {
+            return None;
+        };
+        (self.status.branch != *name && button(ui, true, format!("Delete branch {name}"))).then(|| {
+            RowAction::confirm(
+                GitAction::DeleteBranch {
+                    name: name.clone(),
+                    force: false,
+                },
+                format!("Delete the local branch {name}?"),
+            )
+        })
+    }
+
+    fn ref_menu(&self, ui: &mut egui::Ui, commit: &Commit, reference: &CommitRef) -> Option<RowAction> {
+        let action = ui
+            .add_enabled_ui(!self.busy, |ui| match reference {
+                CommitRef::Local { .. } | CommitRef::Remote(_) => self
+                    .checkout(ui, commit, reference, true)
+                    .or_else(|| self.merge(ui, reference))
+                    .or_else(|| self.delete_branch(ui, reference)),
+                CommitRef::Tag(name) => {
+                    if button(ui, true, format!("Checkout tag {name} (detached HEAD)")) {
+                        return Some(RowAction::confirm(
+                            GitAction::Detach(format!("refs/tags/{name}")),
+                            format!("Check out tag {name} with a detached HEAD?"),
+                        ));
+                    }
+                    button(ui, true, format!("Delete tag {name}"))
+                        .then(|| RowAction::confirm(GitAction::DeleteTag(name.clone()), format!("Delete the local tag {name}?")))
+                }
+                _ => None,
+            })
+            .inner;
+        ui.separator();
+        match reference {
+            CommitRef::Local { name, .. } | CommitRef::Remote(name) => copy(ui, "Copy branch name", name),
+            CommitRef::Tag(name) => copy(ui, "Copy tag name", name),
+            _ => {}
+        }
+        action
+    }
+
     fn git_commands(&self, ui: &mut egui::Ui, commit: &Commit) -> Option<RowAction> {
-        let current = self.branches.iter().find(|name| **name == self.status.branch).map(String::as_str);
+        let current = self.current_branch();
         for reference in &commit.refs {
-            match reference {
-                CommitRef::Local { name, .. } => {
-                    if button(ui, current != Some(name), format!("Checkout {name}")) {
-                        return Some(RowAction::git(GitAction::Checkout(name.clone())));
-                    }
-                }
-                CommitRef::Remote(remote) => {
-                    let (_, name) = remote.split_once('/').expect("remote-tracking ref has a remote prefix");
-                    if !self.branches.iter().any(|local| local == name)
-                        && button(ui, true, format!("Checkout {name} (new local branch tracking {remote})"))
-                    {
-                        return Some(RowAction::git(GitAction::Track {
-                            local: name.into(),
-                            remote: format!("refs/remotes/{remote}"),
-                        }));
-                    }
-                }
-                CommitRef::Tag(_) | CommitRef::Head | CommitRef::Other(_) => {}
+            if let Some(action) = self.checkout(ui, commit, reference, false) {
+                return Some(action);
             }
         }
         let short = &commit.short_hash;
@@ -200,40 +287,17 @@ impl GraphMenu<'_> {
             ));
         }
 
-        if let Some(branch) = current {
-            for reference in &commit.refs {
-                let (name, prefix) = match reference {
-                    CommitRef::Local { name, .. } if name != branch => (name, "refs/heads/"),
-                    CommitRef::Remote(name) => (name, "refs/remotes/"),
-                    _ => continue,
-                };
-                let label = format!("Merge {name} into {branch}");
-                if button(ui, true, &label) {
-                    return Some(RowAction::confirm(
-                        GitAction::Merge {
-                            branch: branch.into(),
-                            source: format!("{prefix}{name}"),
-                        },
-                        format!("{label}?"),
-                    ));
-                }
+        for reference in &commit.refs {
+            if let Some(action) = self.merge(ui, reference) {
+                return Some(action);
             }
         }
         if button(ui, true, "Create tag here…") {
             return Some(RowAction::name_ref(commit, false));
         }
         for reference in &commit.refs {
-            if let CommitRef::Local { name, .. } = reference
-                && current != Some(name)
-                && button(ui, true, format!("Delete branch {name}"))
-            {
-                return Some(RowAction::confirm(
-                    GitAction::DeleteBranch {
-                        name: name.clone(),
-                        force: false,
-                    },
-                    format!("Delete the local branch {name}?"),
-                ));
+            if let Some(action) = self.delete_branch(ui, reference) {
+                return Some(action);
             }
         }
         None
@@ -383,7 +447,7 @@ mod tests {
             },
             |ui| {
                 assert_eq!(
-                    graph.ui(ui, None, |ui, commit| action = menu.show(ui, commit)),
+                    graph.ui(ui, None, |ui, commit, reference| action = menu.show(ui, commit, reference)),
                     None,
                     "menu interactions should not select a history row"
                 );
@@ -483,6 +547,126 @@ mod tests {
                 .commands
                 .contains(&egui::OutputCommand::CopyText(graph.commits[0].message.clone()))
         );
+    }
+
+    #[test]
+    fn badge_menus_only_show_actions_for_the_clicked_ref() {
+        let graph = graph(Vcs::Git);
+        let status = Status {
+            branch: "main".into(),
+            ..Default::default()
+        };
+        let menu = GraphMenu {
+            vcs: Vcs::Git,
+            status: &status,
+            branches: &["main".into(), "topic/work".into()],
+            busy: false,
+        };
+
+        for (badge, item, absent) in [
+            ("topic/work", "Checkout topic/work", "Copy tag name"),
+            ("v1", "Delete tag v1", "Checkout topic/work"),
+        ] {
+            let ctx = egui::Context::default();
+            let (output, _) = render(&ctx, &graph, &menu, vec![]);
+            let badge = label(&output, badge).unwrap();
+            render(&ctx, &graph, &menu, click(badge, PointerButton::Secondary));
+            let (output, _) = render(&ctx, &graph, &menu, vec![]);
+            let item = label(&output, item).unwrap();
+            assert!(label(&output, absent).is_none());
+            assert!(label(&output, "Copy commit hash").is_none());
+            let (_, action) = render(&ctx, &graph, &menu, click(item, PointerButton::Primary));
+            match action {
+                Some(RowAction::Run(HistoryAction::Git(GitAction::Checkout(name)))) => assert_eq!(name, "topic/work"),
+                Some(RowAction::Prompt(GraphDialog::Confirm {
+                    action: HistoryAction::Git(GitAction::DeleteTag(name)),
+                    ..
+                })) => {
+                    assert_eq!(name, "v1");
+                }
+                _ => panic!("Unexpected ref action"),
+            }
+        }
+    }
+
+    #[test]
+    fn row_offers_each_eligible_checkout_from_real_git_decorations() {
+        use crate::app::commit_view::tests::TestDir;
+        use crate::git;
+
+        let dir = TestDir::new();
+        let origin = dir.0.join("origin");
+        let local = dir.0.join("local");
+        std::fs::create_dir(&origin).unwrap();
+        let upstream = |args: &[&str]| git::run(&origin, args).unwrap();
+        upstream(&["init", "-b", "main"]);
+        upstream(&["config", "user.name", "Test Author"]);
+        upstream(&["config", "user.email", "author@example.invalid"]);
+        upstream(&["config", "commit.gpgsign", "false"]);
+        upstream(&["config", "core.hooksPath", ".git/test-hooks"]);
+        upstream(&["commit", "--allow-empty", "-m", "History subject"]);
+        upstream(&["branch", "remote/topic"]);
+        upstream(&["branch", "local-one"]);
+        upstream(&["tag", "--no-sign", "v1"]);
+        upstream(&["tag", "--no-sign", "release/1,2"]);
+        git::run(&dir.0, &["clone", "--local", "origin", "local"]).unwrap();
+        let run = |args: &[&str]| git::run(&local, args).unwrap();
+        run(&["branch", "local-one"]);
+        run(&["branch", "local/two"]);
+
+        let graph = Graph::build(git::log(&local, 10).unwrap());
+        let commit = &graph.commits[0];
+        for name in ["origin/main", "origin/local-one", "origin/remote/topic"] {
+            assert!(commit.refs.contains(&CommitRef::Remote(name.into())));
+        }
+        for name in ["v1", "release/1,2"] {
+            assert!(commit.refs.contains(&CommitRef::Tag(name.into())));
+        }
+
+        for (item, expected) in [
+            ("Checkout main (current)", None),
+            ("Checkout local-one", Some("local-one")),
+            ("Checkout local/two", Some("local/two")),
+            (
+                "Checkout remote/topic (new local branch tracking origin/remote/topic)",
+                Some("remote/topic"),
+            ),
+        ] {
+            run(&["switch", "main"]);
+            let status = git::status(&local).unwrap();
+            let branches = git::branches(&local);
+            let menu = GraphMenu {
+                vcs: Vcs::Git,
+                status: &status,
+                branches: &branches,
+                busy: false,
+            };
+            let ctx = egui::Context::default();
+            let (output, _) = render(&ctx, &graph, &menu, vec![]);
+            let row = label(&output, "History subject").unwrap();
+            render(&ctx, &graph, &menu, click(row, PointerButton::Secondary));
+            let (output, _) = render(&ctx, &graph, &menu, vec![]);
+            assert!(label(&output, "Checkout local-one (new local branch tracking").is_none());
+            let item = label(&output, item).unwrap();
+            let (_, action) = render(&ctx, &graph, &menu, click(item, PointerButton::Primary));
+            if let Some(expected) = expected {
+                let Some(RowAction::Run(action)) = action else {
+                    panic!("Expected a checkout action")
+                };
+                action.run(Vcs::Git, &local).unwrap();
+                assert_eq!(run(&["branch", "--show-current"]).trim(), expected);
+            } else {
+                assert!(action.is_none());
+            }
+        }
+        assert_eq!(
+            run(&["rev-parse", "--symbolic-full-name", "@{upstream}"]).trim(),
+            "refs/remotes/origin/remote/topic"
+        );
+        GitAction::Detach("refs/tags/v1".into()).run(&local).unwrap();
+        assert!(run(&["branch", "--show-current"]).trim().is_empty());
+        GitAction::DeleteTag("v1".into()).run(&local).unwrap();
+        assert_eq!(run(&["tag", "--list"]).trim(), "release/1,2");
     }
 
     #[test]

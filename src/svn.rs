@@ -12,7 +12,7 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-fn command(root: &Path, program: &str) -> Command {
+pub(crate) fn command(root: &Path, program: &str) -> Command {
     let mut cmd = Command::new(program);
     cmd.current_dir(root);
     #[cfg(windows)]
@@ -48,7 +48,7 @@ fn run_bytes(root: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     }
 }
 
-fn run(root: &Path, args: &[&str]) -> Result<String, String> {
+pub(crate) fn run(root: &Path, args: &[&str]) -> Result<String, String> {
     run_bytes(root, args).map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
 }
 

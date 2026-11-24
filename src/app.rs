@@ -1,6 +1,7 @@
 mod assist;
 mod c_flags;
 mod code_navigation;
+mod commit_view;
 mod diff_edit;
 mod document_save;
 mod find;
@@ -211,6 +212,8 @@ enum DiffSource {
         editor: Arc<str>,
         editor_crlf: bool,
     },
+    /// A file's change in a commit (history view): shown as recorded, never reloaded.
+    Commit,
 }
 
 impl DiffTab {
@@ -369,9 +372,8 @@ pub struct App {
 
     graph: Option<Graph>,
     graph_sel: Option<usize>,
-    graph_detail: Vec<String>,
+    graph_detail: commit_view::CommitView,
     graph_rx: Option<Receiver<Result<Graph, String>>>,
-    graph_detail_rx: Option<Receiver<Vec<String>>>,
     graph_dialog: Option<graph_menu::GraphDialog>,
     diff_rx: Option<Receiver<(DiffTab, bool)>>,
 
@@ -467,9 +469,8 @@ impl App {
             amend: false,
             graph: None,
             graph_sel: None,
-            graph_detail: Vec::new(),
+            graph_detail: commit_view::CommitView::default(),
             graph_rx: None,
-            graph_detail_rx: None,
             graph_dialog: None,
             diff_rx: None,
             bg_task: None,
@@ -690,9 +691,8 @@ impl App {
         self.branches.clear();
         self.graph = None;
         self.graph_sel = None;
-        self.graph_detail.clear();
+        self.graph_detail = commit_view::CommitView::default();
         self.graph_rx = None;
-        self.graph_detail_rx = None;
         self.graph_dialog = None;
         self.diff_rx = None;
         for tab in &mut self.tabs {
@@ -728,19 +728,6 @@ impl App {
             ctx.request_repaint();
         });
         self.graph_rx = Some(rx);
-    }
-
-    fn load_graph_detail(&mut self, row: usize) {
-        let Some((repo, vcs)) = self.repository() else { return };
-        let Some(commit) = self.graph.as_ref().and_then(|g| g.commits.get(row)) else {
-            return;
-        };
-        let hash = commit.hash.clone();
-        self.graph_sel = Some(row);
-        self.graph_detail.clear();
-        self.graph_detail_rx = Some(background(&self.ctx, move || {
-            vcs.show_commit(&repo, &hash).lines().map(str::to_string).collect()
-        }));
     }
 
     fn spawn_vcs(&mut self, operation: VcsOperation, work: impl FnOnce(Vcs, &Path) -> Result<String, String> + Send + 'static) {
@@ -949,8 +936,7 @@ impl App {
                             graph.commits.iter().position(|c| &c.hash == selected)
                         });
                         if self.graph_sel.is_none() {
-                            self.graph_detail.clear();
-                            self.graph_detail_rx = None;
+                            self.graph_detail.clear_selection();
                         }
                         self.graph = Some(graph);
                     }
@@ -963,9 +949,7 @@ impl App {
                 }
             }
         }
-        if let Some(detail) = receive(&mut self.graph_detail_rx) {
-            self.graph_detail = detail;
-        }
+        self.graph_detail.poll();
         if let Some((mut tab, refresh)) = receive(&mut self.diff_rx) {
             let current = self.tabs.iter_mut().find_map(|t| match t {
                 Tab::Diff(d) => Some(d),
@@ -1225,7 +1209,13 @@ impl App {
             return;
         }
         if let Some(d) = self.tabs.iter().find_map(|tab| match tab {
-            Tab::Diff(d) if (d.inline || d.live.is_none()) && d.ignore_eol != self.settings.diff_ignore_eol => Some(d),
+            Tab::Diff(d)
+                if (d.inline || d.live.is_none())
+                    && d.ignore_eol != self.settings.diff_ignore_eol
+                    && !matches!(d.source, DiffSource::Commit) =>
+            {
+                Some(d)
+            }
             _ => None,
         }) {
             self.load_diff(d.title.clone(), d.path.clone(), d.source.clone(), true);
@@ -1258,6 +1248,7 @@ impl App {
                     let editor = crate::diff::with_editor_eol(editor, *editor_crlf);
                     disk_vs_editor(&path, disk, &editor, ignore_eol)
                 }
+                DiffSource::Commit => (String::new(), false),
             };
             let mut tab = DiffTab::new(title, path, &text, source, ignore_eol, only_line_endings);
             tab.live = live;
@@ -2644,25 +2635,24 @@ impl App {
                         .resizable(true)
                         .default_size(260.0)
                         .show(ui, |ui| {
-                            if self.graph_detail_rx.is_some() {
-                                ui.weak("Loading commit details…");
-                            } else if self.graph_detail.is_empty() {
-                                ui.weak("Select a commit to see its details.");
+                            if let (Some(row), Some(repo), Some(vcs)) = (self.graph_sel, &self.repo, self.vcs) {
+                                self.graph_detail.show(ui, &graph.commits[row], repo, vcs);
                             } else {
-                                diff_view(ui, &self.graph_detail, "detail");
+                                ui.weak("Select a commit to see its details.");
                             }
                         });
                     egui::CentralPanel::default().show(ui, |ui| {
-                        clicked = graph.ui(ui, self.graph_sel, |ui, commit| {
+                        clicked = graph.ui(ui, self.graph_sel, |ui, commit, reference| {
                             if let Some(menu) = &menu
-                                && let Some(chosen) = menu.show(ui, commit)
+                                && let Some(chosen) = menu.show(ui, commit, reference)
                             {
                                 action = Some(chosen);
                             }
                         });
                     });
-                    if let Some(r) = clicked {
-                        self.load_graph_detail(r);
+                    if clicked.is_some() && clicked != self.graph_sel {
+                        self.graph_sel = clicked;
+                        ui.ctx().request_repaint();
                     }
                     if let Some(action) = action {
                         self.handle_graph_action(action);
