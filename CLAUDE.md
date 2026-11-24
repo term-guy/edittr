@@ -35,6 +35,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 - Lookup order (`lsp::resolve`): PATH, then a bundle (`src/bundled.rs`: `servers/servers.json` next to the exe, in `Contents/Resources`, or `../lib/edittr`), then on-demand installs (`src/installer.rs`). `edittr --list-servers` prints what each language resolves to.
 - Full downloads are assembled by `.github/scripts/bundle-servers.sh <platform> <dest>` (runs on macOS locally too). To test a bundle against the real servers: symlink it to `target/release/deps/servers` and run `cargo test --release -- --ignored lsp_round_trip`.
+- clangd flags are resolved in `clangd::CompilationDatabase::prepare` (project database → generated one in the cache → clangd's own compile_flags.txt/nested discovery → inferred from Makefiles by `makeflags.rs`). Commands of compilers clangd can't use (IAR, TI, Keil, ...) are rewritten by `ccompilers::translate`; "Generate compile database" is `compdb.rs`. Real-clangd tests: `cargo test --release -- --ignored lsp_round_trip_clangd`.
 - `typescript` must stay pinned to `@6` (installer + bundle script): TypeScript 7 dropped the `tsserver.js` that typescript-language-server needs.
 
 ## Gotchas

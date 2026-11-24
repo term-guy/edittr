@@ -20,7 +20,7 @@ struct Started {
 
 #[derive(Default)]
 pub(super) struct LanguageServers {
-    database: clangd::CompilationDatabase,
+    pub(super) database: clangd::CompilationDatabase,
     launches: HashMap<&'static str, Arc<lsp::Launch>>,
     starting: HashMap<&'static str, Option<Receiver<Started>>>,
     failed: HashSet<&'static str>,
@@ -77,13 +77,39 @@ impl App {
             return;
         }
         let root = self.root.as_deref();
+        let events: Vec<&PathBuf> = root
+            .map(|root| changes.paths.iter().filter(|path| clangd::database_event(root, path)).collect())
+            .unwrap_or_default();
+        // Makefile edits only matter when the flags were inferred from them; a
+        // database (generated or not) stays valid until it is rebuilt.
+        let (build_files, others): (Vec<&PathBuf>, Vec<&PathBuf>) = events.into_iter().partition(|path| clangd::is_build_file(path));
+        let from_database = matches!(
+            self.lsp.database.flags,
+            clangd::FlagSource::Database(_) | clangd::FlagSource::Generated { .. }
+        );
         let changed = rescan
             || self.lsp.database.paths().any(|path| changes.affects(path))
-            || root.is_some_and(|root| changes.paths.iter().any(|path| clangd::database_event(root, path)));
+            || !others.is_empty()
+            || !build_files.is_empty() && !from_database;
         if !changed {
+            if !build_files.is_empty()
+                && let clangd::FlagSource::Generated { stale } = &mut self.lsp.database.flags
+            {
+                *stale = true;
+            }
             return;
         }
-        let launch = self.lsp.launches.remove("clangd").unwrap();
+        // Keep the previous watch until the next launch publishes its database.
+        self.restart_clangd();
+    }
+
+    pub(super) fn lsp_has_launch(&self, key: &str) -> bool {
+        self.lsp.launches.contains_key(key)
+    }
+
+    /// Forget a server's launch so the next request starts a new one.
+    pub(super) fn lsp_remove_launch(&mut self, key: &'static str) -> Option<Arc<lsp::Launch>> {
+        let launch = self.lsp.launches.remove(key)?;
         if self
             .lsp
             .install_check
@@ -92,13 +118,10 @@ impl App {
         {
             self.lsp.install_check = None;
         }
-        launch.cancel();
-        std::thread::spawn(move || launch.retire_if_cancelled());
-        self.lsp.starting.remove("clangd");
-        self.lsp.failed.remove("clangd");
+        self.lsp.starting.remove(key);
+        self.lsp.failed.remove(key);
         self.lsp.synced = None;
-        // Keep the previous watch until the next launch publishes its database.
-        self.launch_server("cpp", false);
+        Some(launch)
     }
 
     pub(super) fn launch_server(&mut self, ext: &str, retry_missing: bool) -> Option<Arc<lsp::Launch>> {
@@ -138,6 +161,7 @@ impl App {
             }
         }
         let failed = self.lsp.failed.clone();
+        let vcs = self.vcs;
         let launch = Arc::new(lsp::Launch::default());
         let shared = launch.clone();
         let ctx = self.ctx.clone();
@@ -156,14 +180,22 @@ impl App {
                 let mut command = lsp::resolve(spec.command)?;
                 started.resolved = true;
                 if spec.name == "clangd" {
-                    let database = clangd::CompilationDatabase::find(&root);
-                    let prepared = database.prepare(&root, &ignored, || shared.is_cancelled());
+                    let mut database = clangd::CompilationDatabase::find(&root);
+                    let settings = workspace::load_c_settings(&root);
+                    let files = || super::project_files(&root, vcs, &ignored);
+                    let prepared = database.prepare(&root, &ignored, &settings, files, || shared.is_cancelled());
                     started.database = Some(database);
                     match prepared {
-                        Ok(Some(dir)) => command.args.push(format!("--compile-commands-dir={}", dir.display())),
-                        Ok(None) => {}
+                        Ok(prepared) => {
+                            if let Some(dir) = prepared.dir {
+                                command.args.push(format!("--compile-commands-dir={}", dir.display()));
+                            }
+                            if let Some(driver) = prepared.query_driver {
+                                command.args.push(format!("--query-driver={driver}"));
+                            }
+                        }
                         Err(error) => {
-                            started.error = Some(format!("Could not prepare clangd compilation database: {error}"));
+                            started.error = Some(format!("Could not prepare clangd compile flags: {error}"));
                             return None;
                         }
                     }

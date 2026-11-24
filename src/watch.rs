@@ -422,6 +422,16 @@ mod tests {
         fs::write(&first, "modified after creation").unwrap();
         assert!(receive().0.affects(&first));
 
+        let make_inputs = ["Makefile", "src/config.mk", "src/compile_flags.txt"].map(|name| root.join(name));
+        for path in &make_inputs {
+            fs::write(path, "changed").unwrap();
+        }
+        let (changes, _) = receive();
+        for path in &make_inputs {
+            assert!(changes.paths.contains(path));
+            assert!(clangd::database_event(&root, path));
+        }
+
         let index = fs::OpenOptions::new().write(true).open(admin.join("index")).unwrap();
         let touched = Instant::now();
         index.set_modified(SystemTime::now() + Duration::from_secs(60)).unwrap();

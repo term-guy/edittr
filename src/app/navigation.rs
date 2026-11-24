@@ -285,6 +285,8 @@ impl App {
             }
             Command::Save => self.save_active(),
             Command::FormatDocument => self.format_document(self.active),
+            Command::CSettings => self.open_c_settings(),
+            Command::GenerateCompileDatabase => self.plan_compile_database(),
             Command::SplitEditor => {
                 self.split = match self.split {
                     Some(_) => None,

@@ -3,8 +3,10 @@
 mod app;
 mod blame;
 mod bundled;
+mod ccompilers;
 mod clangd;
 mod commands;
+mod compdb;
 mod diagnostics;
 mod diff;
 mod editor;
@@ -18,6 +20,7 @@ mod icons;
 mod installer;
 mod large;
 mod lsp;
+mod makeflags;
 mod outline;
 mod replace;
 mod search;

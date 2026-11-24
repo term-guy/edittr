@@ -1,4 +1,5 @@
 mod assist;
+mod c_flags;
 mod code_navigation;
 mod document_save;
 mod find;
@@ -349,6 +350,7 @@ pub struct App {
     search: SearchState,
     find: find::Find,
     search_replace: search_replace::SearchReplace,
+    c_flags: c_flags::CFlags,
 
     lsp: problems::LanguageServers,
     problems: problems::Problems,
@@ -434,6 +436,7 @@ impl App {
             problems: problems::Problems::default(),
             find: find::Find::default(),
             search_replace: search_replace::SearchReplace::default(),
+            c_flags: c_flags::CFlags::default(),
             goto_rx: None,
             nav_back: Vec::new(),
             install: None,
@@ -518,6 +521,7 @@ impl App {
             || self.install_prompt.is_some()
             || self.open_folder.is_some()
             || self.search_replace.confirming()
+            || self.c_flags.is_open()
         {
             return;
         }
@@ -739,6 +743,7 @@ impl App {
     fn poll_background(&mut self, ctx: &egui::Context) {
         self.poll_goto();
         self.poll_problems();
+        self.poll_c_flags();
         self.poll_picker();
         self.poll_outline();
         self.poll_search(ctx);
@@ -2152,7 +2157,8 @@ impl App {
                     || self.confirm.is_some()
                     || self.install_prompt.is_some()
                     || self.open_folder.is_some()
-                    || self.search_replace.confirming();
+                    || self.search_replace.confirming()
+                    || self.c_flags.is_open();
                 self.find.bar(ui, doc, dialog_open);
                 let fresh = match self.vcs {
                     Some(Vcs::Svn) => doc.blame_version.is_some() && !doc.dirty(),
@@ -2263,6 +2269,9 @@ impl App {
         if self.goto_rx.is_some() {
             activity.push(("Finding definition…".into(), None));
         }
+        if self.c_flags.running() {
+            activity.push(("Generating compile database…".into(), None));
+        }
         if self.search.rx.is_some() {
             let suffix = if self.search.total == 1 { "result" } else { "results" };
             activity.push((format!("Searching… {} {suffix}", self.search.total), None));
@@ -2314,6 +2323,7 @@ impl App {
         });
         let activity = self.background_activity(server);
         let mut open_problems = false;
+        let mut open_c_settings = false;
         ui.horizontal(|ui| {
             if self.repo.is_some() {
                 let branch = format!("{} {} {}", ic::GIT_BRANCH, self.status.branch, self.status.ahead_behind);
@@ -2338,6 +2348,29 @@ impl App {
                             .show_tooltip_when_elided(false),
                     )
                     .on_hover_text(hint);
+                    if server.is_some_and(|client| client.name == "clangd")
+                        && let Some(root) = &self.root
+                    {
+                        let flags = &self.lsp.database.flags;
+                        let text = RichText::new(self.lsp.database.label(root)).weak();
+                        let text = if matches!(
+                            flags,
+                            crate::clangd::FlagSource::None | crate::clangd::FlagSource::Generated { stale: true }
+                        ) {
+                            text.color(ui.visuals().warn_fg_color)
+                        } else {
+                            text
+                        };
+                        let hint = "Where clangd's compile flags come from. Click for C/C++ settings \
+                                    and \"Generate compile database\".";
+                        if ui
+                            .add(egui::Label::new(text).truncate().sense(egui::Sense::click()))
+                            .on_hover_text(hint)
+                            .clicked()
+                        {
+                            open_c_settings = true;
+                        }
+                    }
                     let (line, col) = doc.line_col();
                     ui.add(egui::Label::new(RichText::new(format!("Ln {}, Col {}", line + 1, col + 1)).weak()).truncate());
                 }
@@ -2373,9 +2406,13 @@ impl App {
         if open_problems {
             self.open_problems();
         }
+        if open_c_settings {
+            self.open_c_settings();
+        }
     }
 
     fn dialogs(&mut self, ctx: &egui::Context) {
+        self.c_flags_dialogs(ctx);
         // Quick open
         if let Some(q) = &mut self.quick_open {
             let mut chosen = None;

@@ -134,7 +134,7 @@ struct Synced {
 }
 
 #[derive(Clone, Copy)]
-enum SyncKind {
+pub(crate) enum SyncKind {
     None,
     Full,
     Incremental,
@@ -488,7 +488,7 @@ impl Client {
         Ok(msg["result"].clone())
     }
 
-    fn wait_ready(&self, timeout: Duration) -> Result<SyncKind, String> {
+    pub(crate) fn wait_ready(&self, timeout: Duration) -> Result<SyncKind, String> {
         let start = std::time::Instant::now();
         loop {
             if let Some(r) = self.ready.get() {

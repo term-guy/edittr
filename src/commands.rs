@@ -27,6 +27,8 @@ pub(crate) enum Command {
     ToggleTheme,
     SplitEditor,
     FormatDocument,
+    CSettings,
+    GenerateCompileDatabase,
     ToggleSetting(Setting),
 }
 
@@ -186,6 +188,8 @@ pub(crate) const COMMANDS: &[Entry] = &[
     Entry::new(ToggleSetting(Setting::Minimap), "Toggle minimap", &[]),
     Entry::new(ToggleSetting(Setting::BracketColors), "Toggle bracket pair colors", &[]),
     Entry::new(ToggleSetting(Setting::ShowOutline), "Show outline", &[]),
+    Entry::new(CSettings, "C/C++: Compile flags and build settings", &[]),
+    Entry::new(GenerateCompileDatabase, "C/C++: Generate compile database", &[]),
     Entry::new(
         FormatDocument,
         "Format document",
