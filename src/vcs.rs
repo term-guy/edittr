@@ -117,7 +117,14 @@ impl Vcs {
     pub fn log(self, root: &Path, limit: usize, cached: impl FnOnce(Vec<Commit>)) -> Result<Vec<Commit>, String> {
         match self {
             Self::Git => git::log(root, limit),
-            Self::Svn => svn::log(root, limit, cached),
+            Self::Svn => svn::log(root, limit, false, cached),
+        }
+    }
+
+    pub fn refresh_log(self, root: &Path, limit: usize, cached: impl FnOnce(Vec<Commit>)) -> Result<Vec<Commit>, String> {
+        match self {
+            Self::Git => self.log(root, limit, cached),
+            Self::Svn => svn::log(root, limit, true, cached),
         }
     }
 
@@ -141,7 +148,8 @@ impl Vcs {
 pub fn list_files(dir: &Path, vcs: Option<Vcs>) -> Option<Vec<String>> {
     match vcs {
         Some(Vcs::Git) => git::list_files(dir),
-        _ => None,
+        Some(Vcs::Svn) => svn::list_files(dir),
+        None => None,
     }
 }
 
@@ -149,7 +157,7 @@ pub fn list_files(dir: &Path, vcs: Option<Vcs>) -> Option<Vec<String>> {
 pub struct BlameLine {
     pub rev: String,
     pub author: String,
-    /// Date in YYYY-MM-DD format.
+    /// UTC timestamp. Older cached blame entries contain only YYYY-MM-DD.
     pub date: String,
     pub summary: String,
 }

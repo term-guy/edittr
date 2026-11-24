@@ -107,7 +107,7 @@ pub fn git(repo: &Path, rel: &str, text: &str) -> Result<Blame, String> {
     Ok(parse_porcelain(&String::from_utf8_lossy(&out.stdout)))
 }
 
-/// From `svn blame` lines (one per line; dates as YYYY-MM-DD).
+/// From `svn blame` lines (one per line).
 pub fn from_svn(lines: &[crate::vcs::BlameLine]) -> Blame {
     let mut blame = Blame::default();
     let mut index: std::collections::HashMap<&str, u32> = std::collections::HashMap::new();
@@ -126,7 +126,7 @@ pub fn from_svn(lines: &[crate::vcs::BlameLine]) -> Blame {
     blame
 }
 
-/// "YYYY-MM-DD" (anything after is ignored) to seconds since the epoch, UTC midnight.
+/// An SVN UTC timestamp or a cached YYYY-MM-DD date to seconds since the epoch.
 fn date_to_epoch(date: &str) -> Option<i64> {
     let y: i64 = date.get(0..4)?.parse().ok()?;
     let m: i64 = date.get(5..7)?.parse().ok()?;
@@ -137,7 +137,16 @@ fn date_to_epoch(date: &str) -> Option<i64> {
     let yoe = y - era * 400;
     let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + d - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    Some((era * 146_097 + doe - 719_468) * 86_400)
+    let days = era * 146_097 + doe - 719_468;
+    let time = if date.len() == 10 {
+        0
+    } else {
+        let hours: i64 = date.get(11..13)?.parse().ok()?;
+        let minutes: i64 = date.get(14..16)?.parse().ok()?;
+        let seconds: i64 = date.get(17..19)?.parse().ok()?;
+        hours * 3600 + minutes * 60 + seconds
+    };
+    Some(days * 86_400 + time)
 }
 
 /// Parse `git blame --porcelain`.
@@ -242,7 +251,7 @@ filename a.rs
     #[test]
     fn svn_lines_and_dates() {
         assert_eq!(date_to_epoch("1970-01-01"), Some(0));
-        assert_eq!(date_to_epoch("2023-11-14T22:13:20.000000Z"), Some(1_699_920_000));
+        assert_eq!(date_to_epoch("2023-11-14T22:13:20.000000Z"), Some(1_700_000_000));
         let l = |rev: &str| crate::vcs::BlameLine {
             rev: rev.into(),
             author: "bob".into(),

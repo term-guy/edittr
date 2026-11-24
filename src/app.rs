@@ -648,19 +648,24 @@ impl App {
 
     fn refresh_history(&mut self) {
         if self.tabs.iter().any(|t| matches!(t, Tab::Graph)) {
-            self.load_graph();
+            self.load_graph(true);
         }
     }
 
-    fn load_graph(&mut self) {
+    fn load_graph(&mut self, refresh: bool) {
         let Some((repo, vcs)) = self.repository() else { return };
         let (tx, rx) = channel();
         let ctx = self.ctx.clone();
         std::thread::spawn(move || {
-            let result = vcs.log(&repo, 2000, |cached| {
+            let publish_cached = |cached| {
                 let _ = tx.send(Ok(Graph::build(cached)));
                 ctx.request_repaint();
-            });
+            };
+            let result = if refresh {
+                vcs.refresh_log(&repo, 2000, publish_cached)
+            } else {
+                vcs.log(&repo, 2000, publish_cached)
+            };
             let _ = tx.send(result.map(Graph::build));
             drop(tx);
             ctx.request_repaint();
@@ -1096,7 +1101,7 @@ impl App {
 
     fn open_graph(&mut self) {
         if self.graph_rx.is_none() {
-            self.load_graph();
+            self.load_graph(false);
         }
         self.show_tab(Tab::Graph);
     }
@@ -3512,8 +3517,8 @@ fn receive<T>(rx: &mut Option<Receiver<T>>) -> Option<T> {
     }
 }
 
-/// Files under `root` as root-relative paths: git's view (tracked + untracked, minus
-/// ignored) inside a repo, otherwise a directory walk that skips common build dirs.
+/// Root-relative files from version control (tracked and untracked, excluding ignored
+/// paths) or a directory walk that skips common build dirs.
 fn project_files(root: &Path, vcs: Option<Vcs>, ignored: &[String]) -> Vec<String> {
     if let Some(mut files) = vcs::list_files(root, vcs) {
         files.retain(|rel| !workspace::is_ignored(rel, ignored) && !crate::clangd::is_index_path(Path::new(rel)));

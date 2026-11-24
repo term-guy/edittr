@@ -5,32 +5,77 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::fs::{self, File, OpenOptions};
-use std::io::{BufReader, BufWriter, Write};
+use std::fs::{self, DirBuilder, File, OpenOptions};
+use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
-fn run(root: &Path, args: &[&str]) -> Result<String, String> {
-    let mut cmd = Command::new("svn");
-    cmd.current_dir(root).arg("--non-interactive").args(args);
+fn command(root: &Path, program: &str) -> Command {
+    let mut cmd = Command::new(program);
+    cmd.current_dir(root);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
-    let output = cmd.output().map_err(|e| format!("failed to run svn: {e}"))?;
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    cmd
+}
+
+fn svn(root: &Path, args: &[&str]) -> Command {
+    let mut cmd = command(root, "svn");
+    cmd.arg("--non-interactive").args(args);
+    cmd
+}
+
+fn failed(command: &str, status: ExitStatus, stderr: &[u8]) -> String {
+    let err = String::from_utf8_lossy(stderr);
+    if err.trim().is_empty() {
+        format!("svn {command} exited with {status}")
     } else {
-        let err = String::from_utf8_lossy(&output.stderr);
-        Err(if err.trim().is_empty() {
-            format!("svn {} exited with {}", args[0], output.status)
-        } else {
-            err.trim().into()
-        })
+        err.trim().into()
     }
+}
+
+fn run_bytes(root: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
+    let output = svn(root, args).output().map_err(|e| format!("failed to run svn: {e}"))?;
+    if output.status.success() {
+        Ok(output.stdout)
+    } else {
+        Err(failed(args[0], output.status, &output.stderr))
+    }
+}
+
+fn run(root: &Path, args: &[&str]) -> Result<String, String> {
+    run_bytes(root, args).map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn run_xml<T: DeserializeOwned>(root: &Path, args: &[&str]) -> Result<T, String> {
+    let mut child = svn(root, args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("failed to run svn: {err}"))?;
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stderr = child.stderr.take().unwrap();
+    std::thread::scope(|scope| {
+        let errors = scope.spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = stderr.read_to_end(&mut bytes);
+            bytes
+        });
+        let result = quick_xml::de::from_reader(&mut stdout).map_err(|err| format!("Invalid svn XML: {err}"));
+        // Even on a parse error, drain the pipe so SVN can exit and report diagnostics.
+        let _ = io::copy(&mut stdout, &mut io::sink());
+        let status = child.wait().map_err(|err| err.to_string())?;
+        if status.success() {
+            result
+        } else {
+            Err(failed(args[0], status, &errors.join().unwrap()))
+        }
+    })
 }
 
 /// Escape a literal @ in an SVN target (otherwise the suffix is a peg revision).
@@ -48,6 +93,7 @@ pub fn repo_root(dir: &Path) -> Option<PathBuf> {
     dir.ancestors().find(|p| p.join(".svn").is_dir()).map(Path::to_path_buf)
 }
 
+#[cfg(test)]
 fn xml<T: DeserializeOwned>(output: &str) -> Result<T, String> {
     quick_xml::de::from_str(output).map_err(|e| format!("Invalid svn XML: {e}"))
 }
@@ -86,7 +132,7 @@ impl InfoEntry {
     fn cache_dir(&self) -> Option<PathBuf> {
         let repo = &self.repository;
         let identity = if repo.uuid.is_empty() { &repo.root } else { &repo.uuid };
-        Some(dirs::cache_dir()?.join("edittr").join("svn").join(cache_key(identity)))
+        Some(cache_root()?.join(cache_key(identity)))
     }
 
     fn history_file(&self) -> Option<PathBuf> {
@@ -95,7 +141,7 @@ impl InfoEntry {
 }
 
 fn info(root: &Path, rel: &str) -> Result<InfoEntry, String> {
-    Ok(xml::<Info>(&run(root, &["info", "--xml", "--", &target(rel)])?)?.entry)
+    Ok(run_xml::<Info>(root, &["info", "--xml", "--", &target(rel)])?.entry)
 }
 
 #[derive(Deserialize)]
@@ -128,10 +174,19 @@ struct WcStatus {
     props: String,
     #[serde(rename = "@tree-conflicted", default)]
     tree_conflicted: bool,
+    #[serde(rename = "@moved-from", default)]
+    moved_from: Option<String>,
+    #[serde(rename = "@moved-to", default)]
+    moved_to: Option<String>,
+    #[serde(rename = "@file-external", default)]
+    file_external: bool,
 }
 
 impl WcStatus {
     fn code(&self) -> Option<char> {
+        if self.file_external {
+            return None;
+        }
         if self.tree_conflicted || self.item == "conflicted" || self.props == "conflicted" {
             return Some('U');
         }
@@ -148,34 +203,76 @@ impl WcStatus {
     }
 }
 
-fn parse_status(output: &str) -> Result<Vec<StatusEntry>, String> {
-    let status = xml::<StatusXml>(output)?;
-    let entries: Vec<_> = status
-        .target
-        .into_iter()
-        .chain(status.changelist)
-        .flat_map(|group| group.entries)
-        .collect();
-    #[cfg(windows)]
-    let entries = entries
-        .into_iter()
-        .map(|mut entry| {
-            entry.path = entry.path.replace('\\', "/");
-            entry
-        })
-        .collect();
-    Ok(entries)
+impl StatusXml {
+    fn entries(self) -> impl Iterator<Item = StatusEntry> {
+        self.target
+            .into_iter()
+            .chain(self.changelist)
+            .flat_map(|group| group.entries)
+            .map(|mut entry| {
+                if cfg!(windows) {
+                    entry.path = entry.path.replace('\\', "/");
+                    for path in [&mut entry.status.moved_from, &mut entry.status.moved_to].into_iter().flatten() {
+                        *path = path.replace('\\', "/");
+                    }
+                }
+                entry
+            })
+    }
 }
 
-fn changes(root: &Path, rel: &str) -> Result<Vec<StatusEntry>, String> {
-    parse_status(&run(root, &["status", "--xml", "--ignore-externals", "--", &target(rel)])?)
+fn changes(root: &Path, rel: &str, depth: &str) -> Result<StatusXml, String> {
+    run_xml(
+        root,
+        &["status", "--xml", "--ignore-externals", "--depth", depth, "--", &target(rel)],
+    )
+}
+
+pub fn list_files(root: &Path) -> Option<Vec<String>> {
+    let status: StatusXml = run_xml(root, &["status", "--xml", "--verbose", "--ignore-externals", "--depth", "infinity"]).ok()?;
+    let mut files = Vec::new();
+    let mut unversioned_dirs = Vec::new();
+    for entry in status.entries() {
+        if matches!(entry.status.item.as_str(), "deleted" | "missing" | "external") {
+            continue;
+        }
+        let path = root.join(&entry.path);
+        let Ok(meta) = path.symlink_metadata() else { continue };
+        if !meta.is_dir() {
+            files.push(entry.path);
+        } else if entry.status.item == "unversioned" {
+            unversioned_dirs.push(path);
+        }
+    }
+    // SVN summarizes an unversioned directory with one entry. Visit its files locally.
+    while let Some(dir) = unversioned_dirs.pop() {
+        if dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| crate::watch::IGNORED_DIRS.contains(&name))
+        {
+            continue;
+        }
+        let Ok(entries) = fs::read_dir(dir) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                unversioned_dirs.push(path);
+            } else if let Some(rel) = crate::workspace::relative_path(root, &path) {
+                files.push(rel);
+            }
+        }
+    }
+    files.sort_unstable();
+    files.dedup();
+    Some(files)
 }
 
 pub fn status(root: &Path) -> Result<Status, String> {
     Ok(Status {
         branch: info(root, ".")?.branch().into(),
-        unstaged: changes(root, ".")?
-            .into_iter()
+        unstaged: changes(root, ".", "infinity")?
+            .entries()
             .filter_map(|e| {
                 Some(FileChange {
                     code: e.status.code()?,
@@ -192,17 +289,17 @@ pub fn diff(root: &Path, change: &FileChange) -> String {
     if change.code == '?' {
         return new_file_diff(root, path).unwrap_or_else(|e| e.to_string());
     }
-    let target = target(path);
+    // Working-copy diff uses literal paths and does not strip a peg suffix.
     let diff = run(
         root,
-        &["diff", "--internal-diff", "--show-copies-as-adds", "-x", "-U1000000", "--", &target],
+        &["diff", "--internal-diff", "--show-copies-as-adds", "-x", "-U1000000", "--", path],
     );
     // SVN omits files removed outside of `svn delete` from its working-copy diff.
     if change.code == 'D'
-        && diff.as_ref().is_ok_and(String::is_empty)
-        && let Ok(base) = run(root, &["cat", "-r", "BASE", "--", &target])
+        && diff.as_ref().map_or(true, String::is_empty)
+        && let Ok(base) = run_bytes(root, &["cat", "-r", "BASE", "--", &target(path)])
     {
-        return one_sided_diff(path, base.as_bytes(), false);
+        return one_sided_diff(path, &base, false);
     }
     diff.unwrap_or_else(|e| e)
 }
@@ -227,10 +324,10 @@ fn one_sided_diff(path: &str, bytes: &[u8], added: bool) -> String {
     } else {
         (path, "/dev/null", '-')
     };
-    if bytes.contains(&0) {
-        return format!("Binary files {old} and {new} differ");
-    }
-    let text = String::from_utf8_lossy(bytes);
+    let text = match std::str::from_utf8(bytes) {
+        Ok(text) if !text.contains('\0') => text,
+        _ => return format!("Binary files {old} and {new} differ"),
+    };
     let mut diff = format!("--- {old}\n+++ {new}\n");
     if !text.is_empty() {
         let count = text.lines().count();
@@ -253,37 +350,147 @@ fn one_sided_diff(path: &str, bytes: &[u8], added: bool) -> String {
 
 pub fn discard(root: &Path, change: &FileChange) -> Result<String, String> {
     if change.code == '?' {
-        let path = root.join(&change.path);
+        let rel = Path::new(&change.path);
+        if rel.as_os_str().is_empty() || !rel.components().all(|part| matches!(part, std::path::Component::Normal(_))) {
+            return Err(format!("Invalid working-copy path: {}", change.path));
+        }
+        let path = root.join(rel);
+        let canonical_root = root.canonicalize().map_err(|err| err.to_string())?;
+        let parent = path.parent().unwrap().canonicalize().map_err(|err| err.to_string())?;
+        if !parent.starts_with(&canonical_root) {
+            return Err(format!("Path is outside the working copy: {}", change.path));
+        }
+        if !changes(root, &change.path, "empty")?
+            .entries()
+            .any(|entry| entry.status.item == "unversioned")
+        {
+            return Err(format!("Path is no longer unversioned: {}", change.path));
+        }
         let result = if path.symlink_metadata().is_ok_and(|m| m.is_dir()) {
-            fs::remove_dir(path)
+            fs::remove_dir_all(path)
         } else {
             fs::remove_file(path)
         };
         result.map(|()| String::new()).map_err(|e| e.to_string())
     } else {
-        run(root, &["revert", "--", &target(&change.path)])
+        let mut args = vec!["revert"];
+        if matches!(change.code, 'A' | 'D' | 'R') {
+            args.extend(["--depth", "infinity"]);
+        }
+        let other = if matches!(change.code, 'A' | 'D') {
+            changes(root, &change.path, "empty")?
+                .entries()
+                .find_map(|entry| entry.status.moved_from.or(entry.status.moved_to))
+                .map(|path| {
+                    // Status reports moves relative to the status target itself, even for a file.
+                    let joined = Path::new(&change.path).join(path);
+                    let mut path = PathBuf::new();
+                    for part in joined.components() {
+                        if part == std::path::Component::ParentDir {
+                            path.pop();
+                        } else {
+                            path.push(part);
+                        }
+                    }
+                    target(&path.to_string_lossy())
+                })
+        } else {
+            None
+        };
+        let path = target(&change.path);
+        args.extend(["--", &path]);
+        if let Some(other) = &other {
+            args.push(other);
+        }
+        run(root, &args)
+    }
+}
+
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn new() -> io::Result<Self> {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let builder = DirBuilder::new();
+        #[cfg(unix)]
+        let builder = {
+            use std::os::unix::fs::DirBuilderExt;
+            let mut builder = builder;
+            builder.mode(0o700);
+            builder
+        };
+        loop {
+            let unique = NEXT.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!("edittr-svn-{}-{unique}", std::process::id()));
+            match builder.create(&path) {
+                Ok(()) => return Ok(Self(path)),
+                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    fn targets<'a>(&self, name: &str, paths: impl IntoIterator<Item = &'a str>) -> Result<PathBuf, String> {
+        let file = self.0.join(name);
+        let mut out = BufWriter::new(File::create(&file).map_err(|err| err.to_string())?);
+        for path in paths {
+            if path.contains(['\r', '\n']) {
+                return Err(format!("Subversion target contains a line break: {path:?}"));
+            }
+            // SVN trims each line. Protect leading whitespace with ./ and trailing
+            // whitespace with an empty peg revision, which add/delete/commit strip.
+            writeln!(out, "./{path}@").map_err(|err| err.to_string())?;
+        }
+        out.flush().map_err(|err| err.to_string())?;
+        Ok(file)
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
     }
 }
 
 pub fn commit(root: &Path, msg: &str) -> Result<String, String> {
-    let entries = changes(root, ".")?;
+    let entries: Vec<_> = changes(root, ".", "infinity")?
+        .entries()
+        .filter(|entry| entry.status.code().is_some())
+        .collect();
     if entries.iter().any(|e| e.status.code() == Some('U')) {
         return Err("Resolve Subversion conflicts before committing".into());
     }
-    // SVN only commits versioned changes, so schedule new and missing paths first.
-    for entry in entries {
-        let path = target(&entry.path);
-        match entry.status.item.as_str() {
-            "unversioned" => {
-                run(root, &["add", "--", &path])?;
-            }
-            "missing" => {
-                run(root, &["delete", "--", &path])?;
-            }
-            _ => {}
+    if entries.is_empty() {
+        return Ok(String::new());
+    }
+    let scratch = Scratch::new().map_err(|err| err.to_string())?;
+    let message = scratch.0.join("message");
+    fs::write(&message, msg).map_err(|err| err.to_string())?;
+    let targets = scratch.targets("commit", entries.iter().map(|entry| entry.path.as_str()))?;
+    for (item, operation) in [("unversioned", "add"), ("missing", "delete")] {
+        let mut paths = entries
+            .iter()
+            .filter(|entry| entry.status.item == item)
+            .map(|entry| entry.path.as_str())
+            .peekable();
+        if paths.peek().is_some() {
+            let file = scratch.targets(operation, paths)?;
+            run(root, &[operation, "--quiet", "--targets", &file.to_string_lossy()])?;
         }
     }
-    run(root, &["commit", "--force-log", "-m", msg, "--", "."])
+    run(
+        root,
+        &[
+            "commit",
+            "--force-log",
+            "--encoding",
+            "UTF-8",
+            "-F",
+            &message.to_string_lossy(),
+            "--targets",
+            &targets.to_string_lossy(),
+        ],
+    )
 }
 
 #[derive(Clone, Default, Deserialize, Serialize)]
@@ -349,18 +556,21 @@ impl History {
     }
 }
 
-pub fn log(root: &Path, limit: usize, cached: impl FnOnce(Vec<Commit>)) -> Result<Vec<Commit>, String> {
+pub fn log(root: &Path, limit: usize, refresh: bool, cached: impl FnOnce(Vec<Commit>)) -> Result<Vec<Commit>, String> {
     if limit == 0 {
         return Ok(Vec::new());
     }
     let info = info(root, ".")?;
     let file = info.history_file();
     let mut history: History = file.as_deref().and_then(read_cache).unwrap_or_default();
+    if !refresh && history.backfill >= limit && file.as_deref().is_some_and(|file| history_is_recent(root, file)) {
+        return Ok(history.commits(limit));
+    }
     if !history.entries.is_empty() {
         cached(history.commits(limit));
     }
 
-    let mut args = vec!["log", "--xml", "-v", "-r"];
+    let mut args = vec!["log", "--xml", "-r"];
     let width = limit.to_string();
     let incremental = history.backfill >= limit && !history.entries.is_empty();
     let range = if incremental {
@@ -374,7 +584,7 @@ pub fn log(root: &Path, limit: usize, cached: impl FnOnce(Vec<Commit>)) -> Resul
         args.extend(["-l", &width]);
     }
     args.extend(["--", &info.url]);
-    let mut entries = xml::<LogXml>(&run(root, &args)?)?.entries;
+    let mut entries = run_xml::<LogXml>(root, &args)?.entries;
     if incremental {
         let newest = *history.entries.last_key_value().unwrap().0;
         entries.retain(|r| r.number > newest);
@@ -385,6 +595,18 @@ pub fn log(root: &Path, limit: usize, cached: impl FnOnce(Vec<Commit>)) -> Resul
     }
     history.merge(entries, backfill);
     Ok(history.commits(limit))
+}
+
+// A second request can use a recent result directly. An explicit refresh
+// always checks HEAD, including commits made by other working copies.
+fn history_is_recent(root: &Path, file: &Path) -> bool {
+    let Ok(cached) = file.metadata().and_then(|meta| meta.modified()) else {
+        return false;
+    };
+    let Ok(db) = root.join(".svn/wc.db").metadata().and_then(|meta| meta.modified()) else {
+        return false;
+    };
+    db <= cached && cached.elapsed().is_ok_and(|age| age < Duration::from_secs(30))
 }
 
 pub fn show_commit(root: &Path, rev: &str) -> Result<String, String> {
@@ -426,16 +648,16 @@ struct BlameEntry {
     commit: Option<Revision>,
 }
 
-fn parse_blame(output: &str) -> Result<Vec<BlameLine>, String> {
+fn blame_lines(blame: BlameXml) -> Result<Vec<BlameLine>, String> {
     let mut lines = Vec::new();
-    for entry in xml::<BlameXml>(output)?.target.lines {
+    for entry in blame.target.lines {
         if entry.line != lines.len() + 1 {
             return Err("Invalid line numbering in svn blame XML".into());
         }
         lines.push(entry.commit.map_or_else(BlameLine::default, |r| BlameLine {
             rev: format!("r{}", r.number),
             author: r.author,
-            date: r.date.get(..10).unwrap_or("").into(),
+            date: r.date,
             summary: String::new(),
         }));
     }
@@ -443,8 +665,17 @@ fn parse_blame(output: &str) -> Result<Vec<BlameLine>, String> {
 }
 
 pub fn blame(root: &Path, rel: &str) -> Result<Vec<BlameLine>, String> {
-    let file_info = info(root, rel)?;
-    let modified = changes(root, rel)?.iter().any(|entry| entry.status.code().is_some());
+    let status = changes(root, rel, "empty")?.entries().next();
+    let file_info = info(root, rel);
+    // Exact-target status can be empty for a file inside an unversioned directory.
+    let unversioned = status.as_ref().is_some_and(|entry| entry.status.item == "unversioned")
+        || (status.is_none() && file_info.is_err() && root.join(rel).is_file());
+    if unversioned || file_info.as_ref().is_ok_and(|info| info.commit.is_none()) {
+        let text = fs::read_to_string(root.join(rel)).map_err(|err| err.to_string())?;
+        return Ok(vec![BlameLine::default(); text.lines().count()]);
+    }
+    let file_info = file_info?;
+    let modified = status.is_some_and(|entry| entry.status.code().is_some());
     // The last-changed revision comes from local `svn info --xml`.
     let file = file_info.commit.as_ref().filter(|_| !modified).and_then(|rev| {
         Some(
@@ -453,11 +684,11 @@ pub fn blame(root: &Path, rel: &str) -> Result<Vec<BlameLine>, String> {
                 .join(format!("blame-{}-{}.json", cache_key(&file_info.url), rev.number)),
         )
     });
-    // BASE describes the pristine file, so locally edited lines may be offset.
+    // With no explicit revision, SVN annotates the saved working copy.
     let mut lines = if let Some(cached) = file.as_deref().and_then(read_cache) {
         cached
     } else {
-        let lines = parse_blame(&run(root, &["blame", "--xml", "-r", "1:BASE", "--", &target(rel)])?)?;
+        let lines = blame_lines(run_xml(root, &["blame", "--xml", "--", &target(rel)])?)?;
         if let Some(file) = file.as_deref() {
             let _ = write_cache(file, &lines);
         }
@@ -481,6 +712,22 @@ pub fn blame(root: &Path, rel: &str) -> Result<Vec<BlameLine>, String> {
         }
     }
     Ok(lines)
+}
+
+#[cfg(test)]
+pub(crate) mod real_tests;
+
+#[cfg(test)]
+thread_local! {
+    static TEST_CACHE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+fn cache_root() -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(path) = TEST_CACHE.with(|root| root.borrow().clone()) {
+        return Some(path);
+    }
+    Some(dirs::cache_dir()?.join("edittr").join("svn"))
 }
 
 fn cache_key(key: &str) -> String {
@@ -604,7 +851,7 @@ Body &lt;details&gt;</msg>
 
     #[test]
     fn parses_status_and_changelists() {
-        let entries = parse_status(STATUS).unwrap();
+        let entries: Vec<_> = xml::<StatusXml>(STATUS).unwrap().entries().collect();
         let codes: Vec<_> = entries.iter().filter_map(|e| Some((e.path.as_str(), e.status.code()?))).collect();
         assert_eq!(
             codes,
@@ -619,8 +866,14 @@ Body &lt;details&gt;</msg>
                 ("fix.txt", 'R'),
             ]
         );
-        assert!(parse_status("<status><target path=\".\"/></status>").unwrap().is_empty());
-        assert!(parse_status("<status><target><entry/></target></status>").is_err());
+        assert!(
+            xml::<StatusXml>("<status><target path=\".\"/></status>")
+                .unwrap()
+                .entries()
+                .next()
+                .is_none()
+        );
+        assert!(xml::<StatusXml>("<status><target><entry/></target></status>").is_err());
     }
 
     #[test]
@@ -652,15 +905,15 @@ Body &lt;details&gt;</msg>
 
     #[test]
     fn parses_blame_with_unattributed_lines() {
-        let lines = parse_blame(BLAME).unwrap();
+        let lines = blame_lines(xml(BLAME).unwrap()).unwrap();
         assert_eq!(lines.len(), 3);
         assert_eq!(lines[0].rev, "r3");
         assert_eq!(lines[0].author, "sally & bob");
-        assert_eq!(lines[0].date, "2008-05-25");
+        assert_eq!(lines[0].date, "2008-05-25T19:12:31.428953Z");
         assert!(lines[1].rev.is_empty());
         assert_eq!(lines[2].rev, "r17");
         assert!(lines[2].summary.is_empty());
-        assert!(parse_blame(&BLAME.replace("line-number=\"2\"", "line-number=\"5\"")).is_err());
+        assert!(blame_lines(xml(&BLAME.replace("line-number=\"2\"", "line-number=\"5\"")).unwrap()).is_err());
     }
 
     #[test]

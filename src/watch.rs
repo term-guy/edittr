@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 pub const IGNORED_DIRS: &[&str] = &[".git", ".svn", "node_modules", "target", ".venv", "__pycache__", "dist", "build"];
 const QUIET: Duration = Duration::from_millis(300);
 const MAX_DELAY: Duration = Duration::from_secs(1);
+const SVN_QUIET: Duration = Duration::from_secs(2);
 
 #[derive(Default)]
 pub struct Changes {
@@ -161,12 +162,15 @@ fn git_metadata(path: &Path) -> bool {
     }
 }
 
-fn svn_metadata(path: &Path, structural: bool, changes: &mut Changes) -> bool {
+fn svn_metadata(path: &Path, structural: bool, changes: &mut Changes, svn_write: &mut Option<Instant>) -> bool {
     if path.as_os_str().is_empty() && structural {
         changes.rediscover = true;
     } else if path == Path::new("wc.db") || path == Path::new("entries") {
         changes.vcs = true;
     } else {
+        if path == Path::new("wc.db-journal") || path == Path::new("wc.db-wal") {
+            *svn_write = Some(Instant::now());
+        }
         return false;
     }
     true
@@ -186,7 +190,14 @@ fn watch_parent_svn(root: &Path, watcher: &mut impl notify::Watcher, current: &m
     Ok(())
 }
 
-fn classify(root: &Path, git: &GitDirs, parent_svn: Option<&Path>, event: Event, changes: &mut Changes) -> bool {
+fn classify(
+    root: &Path,
+    git: &GitDirs,
+    parent_svn: Option<&Path>,
+    event: Event,
+    changes: &mut Changes,
+    svn_write: &mut Option<Instant>,
+) -> bool {
     if event.need_rescan() {
         changes.rescan = true;
         changes.rediscover = true;
@@ -202,7 +213,7 @@ fn classify(root: &Path, git: &GitDirs, parent_svn: Option<&Path>, event: Event,
     let mut relevant = false;
     'paths: for path in event.paths {
         if let Some(relative) = parent_svn.and_then(|dir| path.strip_prefix(dir).ok()) {
-            relevant |= svn_metadata(relative, structural, changes);
+            relevant |= svn_metadata(relative, structural, changes, svn_write);
             continue;
         }
         if let Some(relative) = git.paths().find_map(|dir| path.strip_prefix(dir).ok()) {
@@ -235,7 +246,7 @@ fn classify(root: &Path, git: &GitDirs, parent_svn: Option<&Path>, event: Event,
                 continue 'paths;
             }
             if part == ".svn" {
-                relevant |= svn_metadata(parts.as_path(), structural, changes);
+                relevant |= svn_metadata(parts.as_path(), structural, changes, svn_write);
                 continue 'paths;
             }
             if !database && part.to_str().is_some_and(|name| IGNORED_DIRS.contains(&name)) {
@@ -272,13 +283,19 @@ fn run(
 
     let mut changes = Changes::default();
     let mut window = None;
+    let mut svn_write = None;
     let mut databases = Vec::<PathBuf>::new();
     let mut database_watches = HashSet::<PathBuf>::new();
     loop {
         let input = match window {
             None => events.recv().ok(),
             Some((start, last)) => {
-                let remaining = deadline(start, last).saturating_duration_since(Instant::now());
+                let due = deadline(start, last);
+                // SVN can finish replacing files before the final wc.db event.
+                // Let journal activity extend the quiet period across that gap
+                // without triggering a refresh by itself.
+                let due = svn_write.map_or(due, |write| due.max(write + SVN_QUIET));
+                let remaining = due.saturating_duration_since(Instant::now());
                 match if remaining.is_zero() {
                     Err(RecvTimeoutError::Timeout)
                 } else {
@@ -297,6 +314,7 @@ fn run(
                         }
                         ctx.request_repaint();
                         window = None;
+                        svn_write = None;
                         continue;
                     }
                 }
@@ -313,7 +331,7 @@ fn run(
                         }
                     }
                 }
-                if classify(&root, &git, parent_svn.as_deref(), event, &mut changes) || database_change {
+                if classify(&root, &git, parent_svn.as_deref(), event, &mut changes, &mut svn_write) || database_change {
                     let now = Instant::now();
                     window = Some((window.map_or(now, |(start, _)| start), now));
                 }
@@ -355,6 +373,61 @@ mod tests {
         assert_eq!(deadline(start, last), last + QUIET);
         let last = start + Duration::from_millis(900);
         assert_eq!(deadline(start, last), start + MAX_DELAY);
+    }
+
+    #[test]
+    #[ignore = "requires svn and svnserve"]
+    fn svn_real_watch_debounces_bulk_commit_and_update() {
+        use crate::svn::real_tests::{Fixture, cli, write};
+        use crate::vcs::Vcs;
+
+        let fixture = Fixture::new();
+        let root = fixture.wc.clone();
+        let path = |i| format!("bulk/dir-{}/file-{i}.txt", i / 10);
+        write(&root, "opened/keep.txt", "stable\n");
+        for i in 0..3_000 {
+            write(&root, &path(i), "original\n");
+        }
+        Vcs::Svn.commit(&root, "Watch baseline", false).unwrap();
+        let other = fixture.checkout("updating");
+        for i in 0..3_000 {
+            write(&root, &path(i), "changed\n");
+        }
+
+        let start = |path: PathBuf| {
+            let watcher = Watcher::start(path.clone(), egui::Context::default());
+            let ready = path.join("watch-ready");
+            watcher
+                .input
+                .send(Input::Event(Ok(Event::new(EventKind::Any).add_path(ready.clone()))))
+                .unwrap();
+            let batch = watcher.output.recv_timeout(Duration::from_secs(5)).unwrap_or_else(|err| {
+                panic!("watcher did not start: {err}; setup error: {:?}", watcher.error());
+            });
+            assert!(batch.affects(&ready));
+            watcher
+        };
+        let assert_debounced = |watcher: &Watcher, operation| {
+            let first = watcher.output.recv_timeout(Duration::from_secs(5)).unwrap_or_else(|err| {
+                panic!("no {operation} watcher batch: {err}; watcher error: {:?}", watcher.error());
+            });
+            assert!(first.vcs, "{operation} should include the wc.db change");
+            assert!(
+                matches!(watcher.output.recv_timeout(MAX_DELAY + QUIET), Err(RecvTimeoutError::Timeout)),
+                "{operation} should emit exactly one watcher batch"
+            );
+            println!("svn {operation} watcher: 1 VCS refresh, 1 total batch");
+        };
+
+        // Opening a subfolder still watches the checkout's administrative directory.
+        let watching_commit = start(root.join("opened"));
+        Vcs::Svn.commit(&root, "Bulk changes", false).unwrap();
+        assert_debounced(&watching_commit, "3,000-file commit");
+
+        let watching_update = start(other.clone());
+        cli(&other, &["update", "--quiet"]);
+        assert_eq!(fs::read_to_string(other.join(path(2_999))).unwrap(), "changed\n");
+        assert_debounced(&watching_update, "3,000-file update");
     }
 
     #[test]
