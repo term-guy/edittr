@@ -120,10 +120,18 @@ impl Startup {
     pub(crate) fn new(arg: Option<PathBuf>, restore_previous: bool) -> Self {
         let window = Window::load();
         let (root, file, restore) = match arg {
-            Some(p) if p.is_file() => (None, Some(p.canonicalize().unwrap_or(p)), true),
-            Some(p) if p.is_dir() => (Some(p.canonicalize().unwrap_or(p)), None, true),
+            Some(p) if p.is_file() => (None, Some(crate::workspace::canonical(&p).unwrap_or(p)), true),
+            Some(p) if p.is_dir() => (Some(crate::workspace::canonical(&p).unwrap_or(p)), None, true),
             Some(_) => (None, None, false),
-            None if restore_previous && enabled() => (window.root.clone().map(PathBuf::from).filter(|path| path.is_dir()), None, true),
+            None if restore_previous && enabled() => (
+                window
+                    .root
+                    .clone()
+                    .map(|p| crate::workspace::plain_path(Path::new(&p)))
+                    .filter(|path| path.is_dir()),
+                None,
+                true,
+            ),
             None => (None, None, false),
         };
         Self {

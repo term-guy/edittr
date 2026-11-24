@@ -33,7 +33,7 @@ struct LoadedWorkspace {
 impl LoadedWorkspace {
     fn load(root: Option<PathBuf>, file: Option<PathBuf>) -> Self {
         let snapshot = Workspace::load(root.as_deref());
-        let mut active = snapshot.active.map(PathBuf::from);
+        let mut active = snapshot.active.map(|p| workspace::plain_path(Path::new(&p)));
         let mut tabs: Vec<_> = snapshot
             .tabs
             .into_iter()
@@ -176,7 +176,11 @@ impl App {
             self.sessions.workspace = Debounce::new(None);
             self.sessions.window.root = self.root.as_ref().map(|path| path.as_os_str().to_owned());
             for (tab, text) in loaded.tabs {
-                let path = PathBuf::from(tab.path);
+                // Sessions saved before paths were normalized may hold both spellings.
+                let path = workspace::plain_path(Path::new(&tab.path));
+                if self.tabs.iter().any(|t| matches!(t, Tab::File(d) if d.path == path)) {
+                    continue;
+                }
                 let index = self.tabs.len();
                 self.add_file_tab(&path, text.text, text.crlf);
                 if let Tab::File(doc) = &mut self.tabs[index] {

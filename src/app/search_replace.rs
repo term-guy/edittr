@@ -278,7 +278,7 @@ fn prepare(request: Request, vcs: Option<Vcs>, mut open: HashMap<String, (PathBu
 }
 
 fn validate_disk_file(root: &Path, path: &Path) -> io::Result<()> {
-    if path.starts_with(root) && path.canonicalize()? == path && fs::symlink_metadata(path)?.is_file() {
+    if path.starts_with(root) && workspace::canonical(path)? == path && fs::symlink_metadata(path)?.is_file() {
         Ok(())
     } else {
         Err(io::Error::other("Expected a regular file inside the project"))

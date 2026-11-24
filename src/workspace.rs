@@ -155,6 +155,27 @@ pub(crate) fn write_config(path: &Path, text: &str) -> io::Result<()> {
     result
 }
 
+/// A path without Windows' `\\?\` verbatim prefix (what `canonicalize` returns there):
+/// `\\?\C:\x` becomes `C:\x` and `\\?\UNC\srv\share` becomes `\\srv\share`. Paths from dialogs,
+/// language servers and the command line use the plain form, so mixing the two would
+/// open the same file twice. A no-op elsewhere.
+pub fn plain_path(path: &Path) -> PathBuf {
+    let Some(s) = path.to_str() else { return path.to_path_buf() };
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+    match s.strip_prefix(r"\\?\") {
+        // Only drive paths: other verbatim forms (\\?\Volume{..}) have no plain spelling.
+        Some(rest) if rest.as_bytes().get(1) == Some(&b':') => PathBuf::from(rest),
+        _ => path.to_path_buf(),
+    }
+}
+
+/// `canonicalize`, in the plain form (see `plain_path`).
+pub fn canonical(path: &Path) -> std::io::Result<PathBuf> {
+    path.canonicalize().map(|p| plain_path(&p))
+}
+
 pub fn is_ignored(rel: &str, ignored: &[String]) -> bool {
     ignored
         .iter()
@@ -218,6 +239,14 @@ fn format_config(root: &str, ignored: &[String], unknown: &[&str]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plain_paths_drop_the_verbatim_prefix() {
+        assert_eq!(plain_path(Path::new(r"\\?\C:\proj\a.c")), PathBuf::from(r"C:\proj\a.c"));
+        assert_eq!(plain_path(Path::new(r"\\?\UNC\srv\share\a.c")), PathBuf::from(r"\\srv\share\a.c"));
+        assert_eq!(plain_path(Path::new(r"\\?\Volume{1234}\a")), PathBuf::from(r"\\?\Volume{1234}\a"));
+        assert_eq!(plain_path(Path::new("/home/u/a.c")), PathBuf::from("/home/u/a.c"));
+    }
 
     #[test]
     fn matches_whole_folder_components() {

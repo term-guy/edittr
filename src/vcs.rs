@@ -36,8 +36,8 @@ impl HistoryAction {
 }
 
 pub fn detect(dir: &Path) -> Option<(PathBuf, Vcs)> {
-    let git = git::repo_root(dir).map(|p| p.canonicalize().unwrap_or(p));
-    let svn = svn::repo_root(dir).map(|p| p.canonicalize().unwrap_or(p));
+    let git = git::repo_root(dir).map(|p| crate::workspace::canonical(&p).unwrap_or(p));
+    let svn = svn::repo_root(dir).map(|p| crate::workspace::canonical(&p).unwrap_or(p));
     nearest(git, svn)
 }
 

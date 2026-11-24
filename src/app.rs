@@ -565,7 +565,7 @@ impl App {
         let path = picker.pick_folder();
 
         if let Some(path) = path {
-            match path.canonicalize() {
+            match workspace::canonical(&path) {
                 Ok(path) => self.set_root(path),
                 Err(err) => self.message = format!("Could not open {}: {err}", path.display()),
             }
@@ -1034,6 +1034,9 @@ impl App {
     }
 
     fn open_file(&mut self, path: &Path) {
+        // One spelling per file (Windows `\\?\C:\...` vs `C:\...`), or it opens twice.
+        let plain = workspace::plain_path(path);
+        let path = plain.as_path();
         if let Some(i) = self.tabs.iter().position(|t| matches!(t, Tab::File(d) if d.path == path)) {
             self.active = i;
             return;
@@ -3706,7 +3709,19 @@ fn recent_file() -> Option<PathBuf> {
 fn load_recent() -> Vec<PathBuf> {
     recent_file()
         .and_then(|f| std::fs::read_to_string(f).ok())
-        .map(|s| s.lines().filter(|l| !l.trim().is_empty()).map(PathBuf::from).collect())
+        .map(|s| {
+            let mut list: Vec<PathBuf> = Vec::new();
+            for path in s
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(|l| workspace::plain_path(Path::new(l)))
+            {
+                if !list.contains(&path) {
+                    list.push(path);
+                }
+            }
+            list
+        })
         .unwrap_or_default()
 }
 
