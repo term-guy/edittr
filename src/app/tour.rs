@@ -36,6 +36,7 @@ const STEPS: &[&str] = &[
     "go-to-definition-install-offer",
     "go-to-definition",
     "light-theme",
+    "column-select",
 ];
 
 impl Tour {
@@ -122,9 +123,30 @@ impl Tour {
                 }
             }
         }
+        if name == "column-select" {
+            // Middle-drag a 4-line box in the editor, then type into every line.
+            let (x0, y0, cw, row) = (350.0 + 4.0 * 7.8, 106.0 + 15.0, 7.8, 15.0);
+            let p = |c: f32, l: f32| egui::pos2(x0 + c * cw, y0 + l * row);
+            // Start after the scroll to the top (set up in `setup`) has settled.
+            if self.started.elapsed() < std::time::Duration::from_millis(1500) {
+                self.frames = 1;
+            }
+            match self.frames {
+                30 => self.click(p(0.0, 0.0), egui::PointerButton::Middle, true),
+                31..=33 => self.inject.push(egui::Event::PointerMoved(p(
+                    (self.frames - 30) as f32 * 2.0,
+                    (self.frames - 30) as f32,
+                ))),
+                34 => self.click(p(6.0, 3.0), egui::PointerButton::Middle, false),
+                36 => self.inject.push(egui::Event::Text("X".into())),
+                37 => self.inject.push(egui::Event::Text("Y".into())),
+                _ => {}
+            }
+        }
         let ready = app.search.rx.is_none() && app.goto_rx.is_none() && app.status_rx.is_none();
         let elapsed = self.started.elapsed();
-        if self.frames < 10 || elapsed < std::time::Duration::from_millis(800) || (!ready && elapsed.as_secs() < 20) {
+        let min_frames = if name == "column-select" { 40 } else { 10 };
+        if self.frames < min_frames || elapsed < std::time::Duration::from_millis(800) || (!ready && elapsed.as_secs() < 20) {
             return;
         }
         let done = Arc::new(AtomicBool::new(false));
@@ -208,6 +230,16 @@ impl Tour {
             "go-to-definition" => {
                 if let Some(cmd) = app.install_prompt.take() {
                     app.install_declined.insert(cmd);
+                }
+            }
+            "column-select" => {
+                ctx.set_theme(egui::Theme::Dark);
+                app.side = Side::Explorer;
+                if let Some(i) = app.tabs.iter().position(|t| matches!(t, Tab::File(_))) {
+                    app.active = i;
+                    if let Some(Tab::File(d)) = app.tabs.get_mut(i) {
+                        d.goto = Some((0, 0)); // scroll to the top
+                    }
                 }
             }
             "light-theme" => {

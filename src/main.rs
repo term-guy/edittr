@@ -2,6 +2,7 @@
 
 mod app;
 mod bundled;
+mod column;
 mod diff;
 mod git;
 mod goto;

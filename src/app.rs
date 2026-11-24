@@ -1,6 +1,7 @@
 #[cfg(feature = "tour")]
 mod tour;
 
+use crate::column::{self, ColumnSel};
 use crate::git::{self, FileChange, Status};
 use crate::graph::Graph;
 use crate::icons as ic;
@@ -42,6 +43,11 @@ struct Doc {
     cursor: usize,
     /// Other end of the selection (== cursor when nothing is selected).
     anchor: usize,
+    /// Column (box) selection made with a middle-button drag; edits apply to every line.
+    column: Option<ColumnSel>,
+    column_drag: bool,
+    /// The text edit's widget id (last frame), to know whether it has keyboard focus.
+    editor_id: Option<egui::Id>,
 }
 
 impl Doc {
@@ -478,6 +484,9 @@ impl App {
             goto: None,
             cursor: 0,
             anchor: 0,
+            column: None,
+            column_drag: false,
+            editor_id: None,
         }));
         // Warm up the language server so the first go-to-definition is fast.
         let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
@@ -1950,6 +1959,11 @@ fn editor(ui: &mut egui::Ui, doc: &mut Doc) -> Option<usize> {
             ui.horizontal_top(|ui| {
                 let gutter: String = (1..=lines).map(|n| format!("{n:>4}\n")).collect();
                 ui.add(egui::Label::new(RichText::new(gutter).monospace().color(ui.visuals().weak_text_color())).selectable(false));
+                // Column mode takes the keys it handles before the text edit sees them.
+                let focused = doc.editor_id.is_some_and(|id| ui.memory(|m| m.has_focus(id)));
+                if focused && doc.column.is_some() {
+                    column_input(ui, doc);
+                }
                 let out = egui::TextEdit::multiline(&mut doc.text)
                     .code_editor()
                     .frame(egui::Frame::NONE)
@@ -1960,7 +1974,7 @@ fn editor(ui: &mut egui::Ui, doc: &mut Doc) -> Option<usize> {
                     .show(ui);
                 if let Some((a, b)) = doc.goto.take() {
                     use egui::text::{CCursor, CCursorRange};
-                    let mut state = out.state;
+                    let mut state = out.state.clone();
                     state
                         .cursor
                         .set_char_range(Some(CCursorRange::two(CCursor::new(a), CCursor::new(b))));
@@ -1972,6 +1986,8 @@ fn editor(ui: &mut egui::Ui, doc: &mut Doc) -> Option<usize> {
                     doc.cursor = r.primary.index.0;
                     doc.anchor = r.secondary.index.0;
                 }
+                doc.editor_id = Some(out.response.id);
+                column_mouse(ui, doc, &out);
 
                 // Ctrl/Cmd + hover underlines the symbol; Ctrl/Cmd + click jumps to it.
                 let mods = ui.input(|i| i.modifiers);
@@ -2001,6 +2017,164 @@ fn editor(ui: &mut egui::Ui, doc: &mut Doc) -> Option<usize> {
             });
         });
     goto_request
+}
+
+/// Line and (virtual, may be past the line end) column under `pos`.
+fn column_pos(ui: &egui::Ui, text: &str, out: &egui::text_edit::TextEditOutput, pos: egui::Pos2) -> (usize, usize) {
+    let idx = out.galley.cursor_from_pos(pos - out.galley_pos).index.0;
+    let starts = column::line_starts(text);
+    let line = starts.partition_point(|&s| s <= idx).saturating_sub(1);
+    let font = egui::TextStyle::Monospace.resolve(ui.style());
+    let cw = ui.fonts_mut(|f| f.glyph_width(&font, 'x')).max(1.0);
+    let col = ((pos.x - out.galley_pos.x) / cw).round().max(0.0) as usize;
+    (line, col)
+}
+
+/// Middle-button drag makes a column selection; a primary click ends it. Also paints it.
+fn column_mouse(ui: &egui::Ui, doc: &mut Doc, out: &egui::text_edit::TextEditOutput) {
+    use egui::PointerButton::{Middle, Primary};
+    let (pressed_mid, down_mid, pressed_primary, pos) = ui.input(|i| {
+        (
+            i.pointer.button_pressed(Middle),
+            i.pointer.button_down(Middle),
+            i.pointer.button_pressed(Primary),
+            i.pointer.interact_pos(),
+        )
+    });
+    let inside = pos.is_some_and(|p| out.response.rect.contains(p) && ui.clip_rect().contains(p));
+    if pressed_mid && inside {
+        let (line, col) = column_pos(ui, &doc.text, out, pos.unwrap());
+        doc.column = Some(ColumnSel {
+            anchor_line: line,
+            anchor_col: col,
+            head_line: line,
+            head_col: col,
+        });
+        doc.column_drag = true;
+        out.response.request_focus();
+    } else if doc.column_drag {
+        if down_mid {
+            if let (Some(p), Some(sel)) = (pos, doc.column.as_mut()) {
+                (sel.head_line, sel.head_col) = column_pos(ui, &doc.text, out, p);
+                ui.scroll_to_rect(egui::Rect::from_center_size(p, egui::vec2(1.0, 1.0)), None);
+            }
+        } else {
+            doc.column_drag = false;
+        }
+    } else if pressed_primary && inside {
+        doc.column = None;
+    }
+    let Some(sel) = doc.column else { return };
+    if !ui.memory(|m| m.has_focus(out.response.id)) && !doc.column_drag {
+        // Focus moved elsewhere (another tab, a panel): drop the column selection.
+        if ui.memory(|m| m.focused().is_some()) {
+            doc.column = None;
+        }
+        return;
+    }
+
+    // Keep the text edit's own cursor on the head line so it lines up with the column carets.
+    use egui::text::{CCursor, CCursorRange};
+    let starts = column::line_starts(&doc.text);
+    let lens = column::line_lens(&doc.text);
+    let lines = sel.lines();
+    let lines = lines.start.min(starts.len())..lines.end.min(starts.len());
+    if let (Some(&hs), Some(&hl)) = (starts.get(sel.head_line), lens.get(sel.head_line)) {
+        let c = hs + sel.caret_in(hl);
+        let mut state = out.state.clone();
+        state.cursor.set_char_range(Some(CCursorRange::one(CCursor::new(c))));
+        state.store(ui.ctx(), out.response.id);
+        doc.cursor = c;
+        doc.anchor = c;
+    }
+    let painter = ui.painter_at(ui.clip_rect());
+    let at = |c: usize| out.galley.pos_from_cursor(CCursor::new(c)).translate(out.galley_pos.to_vec2());
+    let sel_color = ui.visuals().selection.bg_fill.gamma_multiply(0.5);
+    let caret = egui::Stroke::new(1.5, ui.visuals().text_cursor.stroke.color);
+    for l in lines {
+        let r = sel.range_in(lens[l]);
+        let (a, b) = (at(starts[l] + r.start), at(starts[l] + r.end));
+        if r.start < r.end {
+            painter.rect_filled(egui::Rect::from_min_max(a.min, egui::pos2(b.min.x, a.max.y)), 0.0, sel_color);
+        }
+        let x = at(starts[l] + sel.caret_in(lens[l])).min.x;
+        painter.line_segment([egui::pos2(x, a.min.y), egui::pos2(x, a.max.y)], caret);
+    }
+}
+
+/// Keyboard input while a column selection is active: edits apply to every selected line.
+fn column_input(ui: &mut egui::Ui, doc: &mut Doc) {
+    use column::Edit;
+    let Some(mut sel) = doc.column else { return };
+    let mut copied = None;
+    let mut exit = false;
+    let events = ui.input_mut(|i| std::mem::take(&mut i.events));
+    let mut rest = Vec::new();
+    for ev in events {
+        if exit {
+            rest.push(ev);
+            continue;
+        }
+        match &ev {
+            egui::Event::Text(t) if !t.contains('\n') => column::apply(&mut doc.text, &mut sel, Edit::Insert(t)),
+            egui::Event::Copy | egui::Event::Cut => {
+                copied = Some(column::selected_text(&doc.text, &sel));
+                if matches!(ev, egui::Event::Cut) && !sel.is_empty() {
+                    column::apply(&mut doc.text, &mut sel, Edit::Delete);
+                }
+            }
+            egui::Event::Paste(p) => {
+                let pieces: Vec<&str> = p.lines().collect();
+                if !p.contains('\n') {
+                    column::apply(&mut doc.text, &mut sel, Edit::Insert(p));
+                } else if pieces.len() == sel.lines().len() {
+                    column::apply(&mut doc.text, &mut sel, Edit::InsertPerLine(pieces));
+                } else {
+                    exit = true;
+                    rest.push(ev);
+                }
+            }
+            egui::Event::Key {
+                key,
+                pressed: true,
+                modifiers,
+                ..
+            } => {
+                let shift = modifiers.shift;
+                match key {
+                    Key::Backspace => column::apply(&mut doc.text, &mut sel, Edit::Backspace),
+                    Key::Delete => column::apply(&mut doc.text, &mut sel, Edit::Delete),
+                    Key::Tab if !shift => column::apply(&mut doc.text, &mut sel, Edit::Insert("\t")),
+                    Key::ArrowLeft if !modifiers.command && !modifiers.alt => sel.move_by(-1, shift, &doc.text),
+                    Key::ArrowRight if !modifiers.command && !modifiers.alt => sel.move_by(1, shift, &doc.text),
+                    Key::Home => sel.home_end(false, shift),
+                    Key::End => sel.home_end(true, shift),
+                    Key::ArrowLeft if modifiers.command => sel.home_end(false, shift), // macOS Cmd+Left
+                    Key::ArrowRight if modifiers.command => sel.home_end(true, shift),
+                    // Copy/cut/paste arrive as their own events too (handled above).
+                    Key::C | Key::X | Key::V if modifiers.command => rest.push(ev),
+                    // Shortcuts (save, undo, select all, ...) and anything else end column mode.
+                    Key::Escape => exit = true,
+                    _ => {
+                        exit = true;
+                        rest.push(ev);
+                    }
+                }
+            }
+            // Key releases and the like: keep for other widgets.
+            egui::Event::Key { .. } | egui::Event::PointerMoved(_) | egui::Event::PointerButton { .. } => rest.push(ev),
+            egui::Event::Text(_) => {
+                exit = true;
+                rest.push(ev);
+            }
+            _ => rest.push(ev),
+        }
+    }
+    ui.input_mut(|i| i.events = rest);
+    if let Some(t) = copied {
+        ui.ctx().copy_text(t);
+    }
+    doc.column = (!exit).then_some(sel);
 }
 
 fn diff_view(ui: &mut egui::Ui, lines: &[String], id: &str) {
