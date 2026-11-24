@@ -175,11 +175,11 @@ pub fn show_commit(repo: &Path, hash: &str) -> String {
     .unwrap_or_else(|e| e)
 }
 
-/// Files tracked or untracked-but-not-ignored, relative to the repo root.
-pub fn list_files(repo: &Path) -> Option<Vec<String>> {
-    run(repo, &["ls-files", "-co", "--exclude-standard"])
+/// Files tracked or untracked-but-not-ignored, relative to `dir`.
+pub fn list_files(dir: &Path) -> Option<Vec<String>> {
+    run(dir, &["ls-files", "-z", "-co", "--exclude-standard"])
         .ok()
-        .map(|s| s.lines().map(str::to_string).collect())
+        .map(|s| s.split_terminator('\0').map(str::to_string).collect())
 }
 
 #[derive(Clone, Debug)]

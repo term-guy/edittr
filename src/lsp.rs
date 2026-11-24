@@ -3,12 +3,13 @@
 //! One server process per language per project folder, started lazily on first use.
 //! Documents are synced lazily too: before each request we send the current buffer.
 
+use crate::workspace;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -18,6 +19,24 @@ pub struct ServerSpec {
     pub command: &'static str,
     pub args: &'static [&'static str],
     pub language_id: &'static str,
+}
+
+impl ServerSpec {
+    fn initialization_options(&self, ignored: &[String]) -> Option<Value> {
+        if ignored.is_empty() {
+            return None;
+        }
+        match self.name {
+            "rust-analyzer" => Some(json!({"files": {"excludeDirs": ignored}})),
+            "gopls" => {
+                let filters: Vec<_> = std::iter::once("-**/node_modules".to_owned())
+                    .chain(ignored.iter().map(|dir| format!("-{dir}")))
+                    .collect();
+                Some(json!({"directoryFilters": filters}))
+            }
+            _ => None,
+        }
+    }
 }
 
 /// Candidate servers for a file extension, in order of preference.
@@ -101,6 +120,9 @@ struct Synced {
 pub struct Client {
     pub name: &'static str,
     language_id: &'static str,
+    root: PathBuf,
+    ignored: Vec<String>,
+    retired: AtomicBool,
     stdin: Mutex<ChildStdin>,
     child: Mutex<Child>,
     next_id: AtomicI64,
@@ -120,7 +142,7 @@ impl Drop for Client {
 
 impl Client {
     /// Spawn the server and start the `initialize` handshake in the background.
-    pub fn start(spec: &ServerSpec, root: &Path) -> Result<Arc<Client>, String> {
+    pub fn start(spec: &ServerSpec, root: &Path, ignored: &[String]) -> Result<Arc<Client>, String> {
         let launch = resolve(spec.command).ok_or_else(|| format!("{} is not installed", spec.command))?;
         let mut cmd = Command::new(&launch.exe);
         cmd.args(&launch.args)
@@ -141,6 +163,9 @@ impl Client {
         let client = Arc::new(Client {
             name: spec.name,
             language_id: spec.language_id,
+            root: root.to_path_buf(),
+            ignored: ignored.to_vec(),
+            retired: AtomicBool::new(false),
             stdin: Mutex::new(stdin),
             child: Mutex::new(child),
             next_id: AtomicI64::new(1),
@@ -165,16 +190,14 @@ impl Client {
                     }
                     // Request from the server: answer so it doesn't block.
                     (Some(id), Some(method)) => {
+                        let Some(c) = weak.upgrade() else { break };
                         let result = if method == "workspace/configuration" {
-                            let n = msg["params"]["items"].as_array().map_or(0, Vec::len);
-                            Value::Array(vec![Value::Null; n])
+                            let items = msg["params"]["items"].as_array().map_or(&[][..], Vec::as_slice);
+                            Value::Array(items.iter().map(|item| c.configuration(&item["section"])).collect())
                         } else {
                             Value::Null
                         };
-                        match weak.upgrade() {
-                            Some(c) => c.send(&json!({"jsonrpc": "2.0", "id": id, "result": result})),
-                            None => break,
-                        }
+                        c.send(&json!({"jsonrpc": "2.0", "id": id, "result": result}));
                     }
                     _ => {} // notifications (logs, progress, diagnostics) are ignored
                 }
@@ -184,8 +207,9 @@ impl Client {
         let c = client.clone();
         let root_uri = path_to_uri(root);
         let root_name = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let initialization_options = spec.initialization_options(ignored);
         std::thread::spawn(move || {
-            let params = json!({
+            let mut params = json!({
                 "processId": std::process::id(),
                 "clientInfo": {"name": "edittr"},
                 "rootUri": root_uri,
@@ -200,6 +224,9 @@ impl Client {
                     "workspace": {"workspaceFolders": true, "configuration": true},
                 },
             });
+            if let Some(options) = initialization_options {
+                params["initializationOptions"] = options;
+            }
             let res = c
                 .request("initialize", params, Duration::from_secs(60))
                 .map(|_| c.notify("initialized", json!({})));
@@ -212,9 +239,31 @@ impl Client {
         self.child.lock().map(|mut c| matches!(c.try_wait(), Ok(None))).unwrap_or(false)
     }
 
+    /// Prevent workers that still hold an Arc from sending after this client is replaced.
+    pub fn retire(&self) {
+        let mut pending = self.pending.lock().unwrap();
+        self.retired.store(true, Ordering::Release);
+        pending.clear();
+    }
+
+    fn configuration(&self, section: &Value) -> Value {
+        if self.name == "pyright" && !self.ignored.is_empty() {
+            // Pyright reads the parent section and enables autoSearchPaths when it is absent.
+            let analysis = || json!({"exclude": self.ignored, "autoSearchPaths": true});
+            match section.as_str() {
+                Some("python") => return json!({"analysis": analysis()}),
+                Some("python.analysis") => return analysis(),
+                _ => {}
+            }
+        }
+        Value::Null
+    }
+
     fn send(&self, msg: &Value) {
         let body = msg.to_string();
-        if let Ok(mut w) = self.stdin.lock() {
+        if let Ok(mut w) = self.stdin.lock()
+            && !self.retired.load(Ordering::Acquire)
+        {
             let _ = write!(w, "Content-Length: {}\r\n\r\n{body}", body.len());
             let _ = w.flush();
         }
@@ -227,7 +276,13 @@ impl Client {
     fn request(&self, method: &str, params: Value, timeout: Duration) -> Result<Value, String> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = channel();
-        self.pending.lock().unwrap().insert(id, tx);
+        {
+            let mut pending = self.pending.lock().unwrap();
+            if self.retired.load(Ordering::Acquire) {
+                return Err(format!("{} was stopped", self.name));
+            }
+            pending.insert(id, tx);
+        }
         self.send(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}));
         let res = rx.recv_timeout(timeout);
         self.pending.lock().unwrap().remove(&id);
@@ -287,6 +342,11 @@ impl Client {
 
     /// Go to definition; falls back to declaration if the server returns nothing.
     pub fn definition(&self, path: &Path, text: &str, line: usize, col16: usize, timeout: Duration) -> Result<Vec<Location>, String> {
+        if !self.ignored.is_empty()
+            && workspace::relative_path(&self.root, path).is_some_and(|rel| workspace::is_ignored(&rel, &self.ignored))
+        {
+            return Ok(Vec::new());
+        }
         self.wait_ready(timeout)?;
         self.sync(path, text);
         let params = json!({

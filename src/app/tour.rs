@@ -146,6 +146,7 @@ impl Tour {
         match name {
             "welcome" => {
                 app.root = None;
+                app.ignored.clear();
                 app.recent = vec![demo.clone()];
                 app.side = Side::Explorer;
             }
@@ -166,6 +167,9 @@ impl Tour {
                 app.quick_open = None;
                 app.show_search();
                 app.search.opts.query = "lane".into();
+                app.search.opts.include = "*.rs".into();
+                app.search.show_filters = true;
+                app.ignored = vec!["target".into()];
                 app.start_search(ctx);
             }
             "source-control" => {

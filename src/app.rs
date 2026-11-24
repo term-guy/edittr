@@ -6,7 +6,7 @@ use crate::graph::Graph;
 use crate::icons as ic;
 use crate::search::{self, FileHits};
 use crate::settings::Settings;
-use crate::{goto, installer, lsp};
+use crate::{goto, installer, lsp, workspace};
 use eframe::egui::{self, Color32, Key, KeyboardShortcut, Modifiers, RichText};
 use egui_extras::syntax_highlighting::{self, CodeTheme};
 use std::collections::{HashMap, HashSet};
@@ -183,6 +183,7 @@ enum Confirm {
 pub struct App {
     /// Open project folder; None = empty project.
     root: Option<PathBuf>,
+    ignored: Vec<String>,
     /// Recently opened folders, most recent first.
     recent: Vec<PathBuf>,
     repo: Option<PathBuf>,
@@ -237,6 +238,7 @@ impl App {
         let mut app = App {
             repo: None,
             root: None,
+            ignored: Vec::new(),
             recent: load_recent(),
             side: Side::Explorer,
             side_open: true,
@@ -287,14 +289,22 @@ impl App {
         self.recent.insert(0, root.clone());
         self.recent.truncate(10);
         save_recent(&self.recent);
+        self.ignored = workspace::load_ignored(&root);
         self.root = Some(root);
+        self.search.cancel.store(true, Ordering::Relaxed);
+        let opts = std::mem::take(&mut self.search.opts);
+        self.search = SearchState {
+            edited: (!opts.query.is_empty()).then(Instant::now),
+            opts,
+            ..SearchState::default()
+        };
         self.tree.clear();
         self.expanded.clear();
         self.graph = None;
         self.graph_sel = None;
         self.status = Status::default();
-        self.lsp.clear(); // servers are per project; dropping kills them
-        self.lsp_failed.clear();
+        self.reset_lsp();
+        self.goto_rx = None;
         self.nav_back.clear();
         self.refresh_git();
     }
@@ -471,7 +481,9 @@ impl App {
         }));
         // Warm up the language server so the first go-to-definition is fast.
         let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
-        self.client_for(&ext);
+        if !self.path_is_ignored(path) {
+            self.client_for(&ext);
+        }
         self.active = self.tabs.len() - 1;
     }
 
@@ -595,7 +607,7 @@ impl App {
             self.message = "Open a folder to use Go to file".into();
             return;
         };
-        let files = project_files(root, self.repo.is_some());
+        let files = project_files(root, self.repo.is_some(), &self.ignored);
         self.quick_open = Some(QuickOpen {
             query: String::new(),
             files,
@@ -606,6 +618,14 @@ impl App {
     // ------------------------------------------------------------------ UI
 
     // ------------------------------------------------- code intelligence
+
+    fn reset_lsp(&mut self) {
+        for client in self.lsp.values() {
+            client.retire();
+        }
+        self.lsp.clear();
+        self.lsp_failed.clear();
+    }
 
     /// Running language server for files with extension `ext`, starting one if installed.
     fn client_for(&mut self, ext: &str) -> Option<Arc<lsp::Client>> {
@@ -622,8 +642,23 @@ impl App {
             if self.lsp_failed.contains(spec.name) || lsp::resolve(spec.command).is_none() {
                 continue;
             }
-            let root = self.work_dir();
-            match lsp::Client::start(&spec, &root) {
+            let mut root = self.work_dir();
+            let mut ignored = self.ignored.clone();
+            if !ignored.is_empty()
+                && let Some(project) = &self.root
+            {
+                // A server may start at the Git root even when a subfolder is open.
+                match workspace::relative_path(&root, project) {
+                    Some(prefix) if !prefix.is_empty() => {
+                        for dir in &mut ignored {
+                            *dir = format!("{prefix}/{dir}");
+                        }
+                    }
+                    None => root = project.clone(),
+                    _ => {}
+                }
+            }
+            match lsp::Client::start(&spec, &root, &ignored) {
                 Ok(c) => {
                     self.lsp.insert(spec.name, c.clone());
                     return Some(c);
@@ -641,19 +676,24 @@ impl App {
         let Some(Tab::File(doc)) = self.tabs.get(self.active) else { return };
         let (path, text, ext, from) = (doc.path.clone(), doc.text.clone(), doc.ext(), doc.cursor);
         let Some((_, word)) = goto::word_at(&text, char_idx) else { return };
-        let client = self.client_for(&ext);
-        if client.is_none() {
+        // Ignored folders get no language server and are never a source of definitions.
+        let use_lsp = !self.path_is_ignored(&path);
+        let client = use_lsp.then(|| self.client_for(&ext)).flatten();
+        if use_lsp && client.is_none() {
             self.offer_install(&ext);
         }
         // Without a project, the text-search fallback only looks at the current file.
         let project = self.root.clone();
+        let ignored = self.ignored.clone();
+        let ignored_for_goto = ignored.clone();
         let in_repo = self.repo.is_some();
         let root = project.clone().unwrap_or_else(|| self.work_dir());
         let req = goto::Request {
             root,
-            files: Box::new(move || project.map(|r| project_files(&r, in_repo)).unwrap_or_default()),
+            files: Box::new(move || project.map(|r| project_files(&r, in_repo, &ignored)).unwrap_or_default()),
             path: path.clone(),
             text,
+            ignored: if self.root.is_some() { ignored_for_goto } else { Vec::new() },
             char_idx,
             client,
         };
@@ -740,6 +780,33 @@ impl App {
 
     // -------------------------------------------------------------- search
 
+    fn path_is_ignored(&self, path: &Path) -> bool {
+        !self.ignored.is_empty()
+            && self
+                .root
+                .as_deref()
+                .and_then(|root| workspace::relative_path(root, path))
+                .is_some_and(|rel| workspace::is_ignored(&rel, &self.ignored))
+    }
+
+    fn ignore_folder(&mut self, rel: String, ctx: &egui::Context) {
+        if workspace::valid_folder(&rel) && !workspace::is_ignored(&rel, &self.ignored) {
+            self.ignored.push(rel);
+            self.ignored_changed(ctx);
+        }
+    }
+
+    fn ignored_changed(&mut self, ctx: &egui::Context) {
+        if let Some(root) = &self.root {
+            workspace::save_ignored(root, &self.ignored);
+        }
+        self.reset_lsp();
+        if self.goto_rx.take().is_some() {
+            self.nav_back.pop();
+        }
+        self.start_search(ctx);
+    }
+
     fn start_search(&mut self, ctx: &egui::Context) {
         let st = &mut self.search;
         st.cancel.store(true, Ordering::Relaxed);
@@ -761,6 +828,7 @@ impl App {
         };
         st.cancel = Arc::new(AtomicBool::new(false));
         let in_repo = self.repo.is_some();
+        let ignored = self.ignored.clone();
         let list_root = root.clone();
         // Open files are searched first, from their (possibly unsaved) text; active tab first.
         let order = std::iter::once(self.active).chain((0..self.tabs.len()).filter(|&i| i != self.active));
@@ -768,14 +836,14 @@ impl App {
             .filter_map(|i| match self.tabs.get(i) {
                 Some(Tab::File(d)) => {
                     let rel = d.path.strip_prefix(&root).ok()?.to_string_lossy().replace('\\', "/");
-                    Some((rel, d.text.clone()))
+                    (!workspace::is_ignored(&rel, &self.ignored)).then(|| (rel, d.text.clone()))
                 }
                 _ => None,
             })
             .collect();
         st.rx = Some(search::spawn(
             root,
-            move || project_files(&list_root, in_repo),
+            move || project_files(&list_root, in_repo, &ignored),
             open,
             st.opts.clone(),
             st.cancel.clone(),
@@ -875,6 +943,25 @@ impl App {
             self.start_search(ui.ctx());
             self.search.focus = true;
         }
+        if !self.ignored.is_empty() {
+            let mut remove = None;
+            egui::CollapsingHeader::new(format!("Ignored ({})", self.ignored.len()))
+                .id_salt("ignored-folders")
+                .show(ui, |ui| {
+                    for (index, rel) in self.ignored.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            if icon_button(ui, ic::X).on_hover_text("Remove from ignored folders").clicked() {
+                                remove = Some(index);
+                            }
+                            ui.add(egui::Label::new(rel).truncate()).on_hover_text(rel);
+                        });
+                    }
+                });
+            if let Some(index) = remove {
+                self.ignored.remove(index);
+                self.ignored_changed(ui.ctx());
+            }
+        }
         let st = &mut self.search;
         if let Some(e) = &st.error {
             ui.colored_label(ui.visuals().error_fg_color, e);
@@ -904,6 +991,7 @@ impl App {
         }
         let mut toggle_file = None;
         let mut open = None;
+        let mut ignore = None;
         let row_h = 20.0;
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
@@ -948,6 +1036,18 @@ impl App {
                             if resp.clicked() {
                                 toggle_file = Some(fi);
                             }
+                            if f.rel.contains('/') {
+                                resp.context_menu(|ui| {
+                                    let mut path = f.rel.as_str();
+                                    while let Some((parent, _)) = path.rsplit_once('/') {
+                                        if workspace::valid_folder(parent) && ui.button(format!("Ignore folder: {parent}")).clicked() {
+                                            ignore = Some(parent.to_owned());
+                                            ui.close();
+                                        }
+                                        path = parent;
+                                    }
+                                });
+                            }
                             resp.on_hover_text(&f.rel);
                         }
                         SearchRow::Hit(fi, hi) => {
@@ -984,6 +1084,9 @@ impl App {
             let f = &self.search.results[fi];
             let (path, line, cols) = (root.join(&f.rel), f.hits[hi].line, f.hits[hi].cols.clone());
             self.open_at(&path, line, cols);
+        }
+        if let Some(rel) = ignore {
+            self.ignore_folder(rel, ui.ctx());
         }
     }
 
@@ -1143,13 +1246,23 @@ impl App {
                     } else {
                         (ic::CARET_RIGHT, ic::FOLDER)
                     };
-                    if ui.selectable_label(false, format!("{caret} {folder} {name}")).clicked() {
+                    let row = ui.selectable_label(false, format!("{caret} {folder} {name}"));
+                    if row.clicked() {
                         if expanded {
                             self.expanded.remove(&path);
                         } else {
                             self.expanded.insert(path.clone());
                         }
                     }
+                    row.context_menu(|ui| {
+                        if let Some(rel) = self.root.as_deref().and_then(|root| workspace::relative_path(root, &path)) {
+                            let enabled = workspace::valid_folder(&rel) && !workspace::is_ignored(&rel, &self.ignored);
+                            if ui.add_enabled(enabled, egui::Button::new("Ignore folder in search")).clicked() {
+                                self.ignore_folder(rel, ui.ctx());
+                                ui.close();
+                            }
+                        }
+                    });
                 } else {
                     let mut text = RichText::new(format!("     {} {name}", ic::FILE));
                     if let Some(&code) = deco.get(&path) {
@@ -2293,25 +2406,33 @@ fn read_dir_sorted(dir: &Path) -> Vec<(PathBuf, bool)> {
 
 /// Files under `root` as root-relative paths: git's view (tracked + untracked, minus
 /// ignored) inside a repo, otherwise a directory walk that skips common build dirs.
-fn project_files(root: &Path, in_repo: bool) -> Vec<String> {
-    in_repo
-        .then(|| git::list_files(root))
-        .flatten()
-        .unwrap_or_else(|| walk_files(root, 50_000))
+fn project_files(root: &Path, in_repo: bool, ignored: &[String]) -> Vec<String> {
+    if let Some(mut files) = in_repo.then(|| git::list_files(root)).flatten() {
+        if !ignored.is_empty() {
+            files.retain(|rel| !workspace::is_ignored(rel, ignored));
+        }
+        files
+    } else {
+        walk_files(root, 50_000, ignored)
+    }
 }
 
-fn walk_files(root: &Path, limit: usize) -> Vec<String> {
+fn walk_files(root: &Path, limit: usize, ignored: &[String]) -> Vec<String> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         for (p, is_dir) in read_dir_sorted(&dir) {
+            let Some(rel) = workspace::relative_path(root, &p) else { continue };
+            if workspace::is_ignored(&rel, ignored) {
+                continue;
+            }
             if is_dir {
                 let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                 if !IGNORED_DIRS.contains(&name.as_str()) {
                     stack.push(p);
                 }
-            } else if let Ok(rel) = p.strip_prefix(root) {
-                out.push(rel.to_string_lossy().replace('\\', "/"));
+            } else {
+                out.push(rel);
                 if out.len() >= limit {
                     return out;
                 }

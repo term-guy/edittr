@@ -12,6 +12,7 @@ mod lsp;
 mod search;
 mod settings;
 mod tree;
+mod workspace;
 
 use std::path::PathBuf;
 

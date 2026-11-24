@@ -1,7 +1,7 @@
 //! Go to definition: ask a language server when one is available, otherwise
 //! fall back to a heuristic search for definition-looking lines in the project.
 
-use crate::lsp;
+use crate::{lsp, workspace};
 use regex::Regex;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -15,6 +15,8 @@ pub struct Request {
     pub files: Box<dyn FnOnce() -> Vec<String> + Send>,
     pub path: PathBuf,
     pub text: String,
+    /// Ignored folders, relative to `root`: never a source of definitions.
+    pub ignored: Vec<String>,
     pub char_idx: usize,
     pub client: Option<Arc<lsp::Client>>,
 }
@@ -36,6 +38,7 @@ pub fn run(req: Request) -> Outcome {
     let Some((_, word)) = word_at(&req.text, req.char_idx) else {
         return Outcome::NotFound("No symbol under the cursor".into());
     };
+    let ignored = |p: &Path| workspace::relative_path(&req.root, p).is_some_and(|rel| workspace::is_ignored(&rel, &req.ignored));
     let mut lsp_note = String::new();
     if let Some(client) = &req.client {
         let (line, col16) = line_col16(&req.text, req.char_idx);
@@ -54,7 +57,8 @@ pub fn run(req: Request) -> Outcome {
         }
         match result {
             Ok(locs) => {
-                if let Some(loc) = locs.into_iter().next() {
+                // Servers that can't be told to exclude folders may still answer with one.
+                if let Some(loc) = locs.into_iter().find(|l| !ignored(&l.path)) {
                     let line_text = if loc.path == req.path {
                         req.text.split('\n').nth(loc.line).map(str::to_string)
                     } else {
@@ -79,7 +83,8 @@ pub fn run(req: Request) -> Outcome {
         }
     }
     let (cursor_line, _) = line_col16(&req.text, req.char_idx);
-    match heuristic(&req.root, (req.files)(), &req.path, &req.text, cursor_line, &word) {
+    let current = (!ignored(&req.path)).then_some(req.text.as_str());
+    match heuristic(&req.root, (req.files)(), &req.path, current, cursor_line, &word) {
         Some(target) => Outcome::Found {
             target,
             via: format!("{lsp_note}text search"),
@@ -219,12 +224,12 @@ fn best_in_text(pats: &[(Regex, u8)], text: &str) -> Vec<(u8, usize, Range<usize
     out
 }
 
-fn heuristic(root: &Path, files: Vec<String>, current: &Path, text: &str, cursor_line: usize, name: &str) -> Option<Target> {
+fn heuristic(root: &Path, files: Vec<String>, current: &Path, text: Option<&str>, cursor_line: usize, name: &str) -> Option<Target> {
     let pats = patterns(name);
 
     // 1) Current buffer: the highest-scoring definition, preferring the closest one
     //    above the cursor (so local variables resolve to their nearest `let`).
-    let local = best_in_text(&pats, text);
+    let local = text.map(|text| best_in_text(&pats, text)).unwrap_or_default();
     let pick = local.iter().max_by_key(|(score, line, _)| {
         let above = *line <= cursor_line;
         let dist = if above { cursor_line - line } else { usize::MAX / 2 + line };
@@ -295,7 +300,15 @@ mod tests {
     use super::*;
 
     fn find_local(src: &str, cursor_line: usize, name: &str) -> Option<(usize, Range<usize>)> {
-        heuristic(Path::new("/nonexistent"), vec![], Path::new("/x/a.rs"), src, cursor_line, name).map(|t| (t.line, t.cols))
+        heuristic(
+            Path::new("/nonexistent"),
+            vec![],
+            Path::new("/x/a.rs"),
+            Some(src),
+            cursor_line,
+            name,
+        )
+        .map(|t| (t.line, t.cols))
     }
 
     #[test]
@@ -349,7 +362,7 @@ mod tests {
         std::fs::write(dir.join("src/util.rs"), "// fn helper is below\npub fn helper() -> u8 { 1 }\n").unwrap();
         std::fs::write(dir.join("notes.py"), "def helper(): pass\n").unwrap();
         let files = vec!["notes.py".to_string(), "src/util.rs".into()];
-        let t = heuristic(&dir, files, &dir.join("src/main.rs"), "fn main() { helper(); }", 0, "helper").unwrap();
+        let t = heuristic(&dir, files, &dir.join("src/main.rs"), Some("fn main() { helper(); }"), 0, "helper").unwrap();
         std::fs::remove_dir_all(&dir).ok();
         assert_eq!(t.path, dir.join("src/util.rs")); // skips the .py file and the comment
         assert_eq!((t.line, t.cols), (1, 7..13));
@@ -370,7 +383,7 @@ mod tests {
             .into_iter()
             .find(|s| lsp::resolve(s.command).is_some())
             .expect("server not installed");
-        let client = lsp::Client::start(&spec, &dir).unwrap();
+        let client = lsp::Client::start(&spec, &dir, &[]).unwrap();
         let text = std::fs::read_to_string(dir.join(main)).unwrap();
         let idx = text.find(symbol).map(|b| text[..b].chars().count()).unwrap() + 1;
         // Indexing can take a moment: retry until the server answers with a location.
@@ -381,6 +394,7 @@ mod tests {
                 files: Box::new(Vec::new),
                 path: dir.join(main),
                 text: text.clone(),
+                ignored: Vec::new(),
                 char_idx: idx,
                 client: Some(client.clone()),
             };
