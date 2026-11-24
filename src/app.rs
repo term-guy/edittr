@@ -2600,28 +2600,7 @@ impl App {
                             d.inline = true;
                         }
                         ui.checkbox(&mut ignore_eol, "Ignore line endings");
-                        if !d.inline && !d.blocks.is_empty() {
-                            ui.separator();
-                            let n = d.blocks.len();
-                            let current = d.blocks.iter().rposition(|&b| b <= d.top_row + 3).unwrap_or(0);
-                            if icon_button(ui, ic::ARROW_UP).on_hover_text("Previous change").clicked() {
-                                d.jump = d
-                                    .blocks
-                                    .iter()
-                                    .rev()
-                                    .find(|&&b| b + 3 < d.top_row + 3)
-                                    .copied()
-                                    .or(d.blocks.last().copied());
-                            }
-                            if icon_button(ui, ic::ARROW_DOWN).on_hover_text("Next change").clicked() {
-                                d.jump = d.blocks.iter().find(|&&b| b > d.top_row + 3).copied().or(d.blocks.first().copied());
-                            }
-                            ui.weak(format!("change {} of {n}", current + 1));
-                        }
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.colored_label(diff_colors(ui.visuals().dark_mode).1, format!("−{}", d.removed));
-                            ui.colored_label(diff_colors(ui.visuals().dark_mode).0, format!("+{}", d.added));
-                        });
+                        diff_navigation(ui, d);
                     });
                     if ignore_eol != self.settings.diff_ignore_eol {
                         self.run_command(Command::ToggleSetting(Setting::DiffIgnoreEol));
@@ -3546,6 +3525,33 @@ fn diff_colors(dark: bool) -> (Color32, Color32) {
 }
 
 /// Two synchronized panes: old file on the left, new on the right.
+/// Previous / next change, "change N of M" (side by side only) and the +/− counts,
+/// for a diff tab's toolbar and the history's commit view.
+fn diff_navigation(ui: &mut egui::Ui, d: &mut DiffTab) {
+    if !d.inline && !d.blocks.is_empty() {
+        ui.separator();
+        let n = d.blocks.len();
+        let current = d.blocks.iter().rposition(|&b| b <= d.top_row + 3).unwrap_or(0);
+        if icon_button(ui, ic::ARROW_UP).on_hover_text("Previous change").clicked() {
+            d.jump = d
+                .blocks
+                .iter()
+                .rev()
+                .find(|&&b| b + 3 < d.top_row + 3)
+                .copied()
+                .or(d.blocks.last().copied());
+        }
+        if icon_button(ui, ic::ARROW_DOWN).on_hover_text("Next change").clicked() {
+            d.jump = d.blocks.iter().find(|&&b| b > d.top_row + 3).copied().or(d.blocks.first().copied());
+        }
+        ui.weak(format!("change {} of {n}", current + 1));
+    }
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        ui.colored_label(diff_colors(ui.visuals().dark_mode).1, format!("−{}", d.removed));
+        ui.colored_label(diff_colors(ui.visuals().dark_mode).0, format!("+{}", d.added));
+    });
+}
+
 fn side_by_side_view(ui: &mut egui::Ui, d: &mut DiffTab) {
     use crate::diff::Kind;
     use egui::text::CCursor;

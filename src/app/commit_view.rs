@@ -1,4 +1,4 @@
-use super::{DiffSource, DiffTab, background, diff_colors, diff_view, receive, side_by_side_view};
+use super::{DiffSource, DiffTab, background, diff_colors, diff_navigation, diff_view, receive, side_by_side_view};
 use crate::git::{self, Commit};
 use crate::icons as ic;
 use crate::tree::{self, Row};
@@ -231,17 +231,26 @@ impl CommitView {
         let change = &files.changes[index];
         let key = (self.hash.as_str(), change.path.as_str());
         let cached = self.diffs.iter().position(|(k, _)| (k.0.as_str(), k.1.as_str()) == key);
+        if let Some(cached) = cached
+            && cached != 0
+        {
+            let entry = self.diffs.remove(cached).unwrap();
+            self.diffs.push_front(entry);
+        }
+        let loaded = cached.and_then(|_| self.diffs.front_mut()).and_then(|(_, diff)| diff.as_mut().ok());
+        let inline = &mut self.inline;
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.inline, false, format!("{} Side by side", ic::COLUMNS));
-            ui.selectable_value(&mut self.inline, true, format!("{} Inline", ic::ROWS));
+            ui.selectable_value(inline, false, format!("{} Side by side", ic::COLUMNS));
+            ui.selectable_value(inline, true, format!("{} Inline", ic::ROWS));
             ui.add(egui::Label::new(change.path.replace(['\n', '\r'], " ")).truncate())
                 .on_hover_text(&change.path);
-        });
-        if let Some(cached) = cached {
-            if cached != 0 {
-                let entry = self.diffs.remove(cached).unwrap();
-                self.diffs.push_front(entry);
+            // Previous / next change and the counts, like a diff tab.
+            if let Some(diff) = loaded {
+                diff.inline = *inline;
+                diff_navigation(ui, diff);
             }
+        });
+        if cached.is_some() {
             let (_, diff) = self.diffs.front_mut().unwrap();
             match diff {
                 Ok(diff) => {
