@@ -141,11 +141,13 @@ impl Graph {
                 for r in range {
                     let c = &self.commits[r];
                     let mono = egui::FontId::monospace(12.0);
+                    // Branch labels take the color of their line in the graph.
+                    let lane = lane_color(self.rows.get(r).map_or(0, |row| row.col));
                     let refs: Vec<_> = c
                         .refs
                         .iter()
                         .map(|reference| {
-                            let (label, color) = ref_style(reference);
+                            let (label, color) = ref_style(reference, lane);
                             (reference, ui.painter().layout_no_wrap(label, mono.clone(), Color32::WHITE), color)
                         })
                         .collect();
@@ -171,7 +173,7 @@ impl Graph {
                     for (i, (reference, galley, color)) in refs.into_iter().enumerate() {
                         let bg = Rect::from_min_size(Pos2::new(px, cy - galley.size().y / 2.0 - 1.0), galley.size() + Vec2::new(8.0, 2.0));
                         painter.rect_filled(bg, 3.0, color);
-                        painter.galley(bg.min + Vec2::new(4.0, 1.0), galley, Color32::WHITE);
+                        painter.galley(bg.min + Vec2::new(4.0, 1.0), galley, label_text(color));
                         if matches!(reference, CommitRef::Local { .. } | CommitRef::Remote(_) | CommitRef::Tag(_)) {
                             let badge = ui.interact(bg, resp.id.with(i), Sense::click());
                             if badge.clicked() {
@@ -221,12 +223,25 @@ fn free_slot(lanes: &mut Vec<Option<usize>>) -> usize {
     }
 }
 
-fn ref_style(r: &CommitRef) -> (String, Color32) {
+/// Label text and fill: branches (and HEAD) in their lane's color; remote branches a
+/// little darker so local and remote copies of a branch can be told apart; tags amber.
+fn ref_style(r: &CommitRef, lane: Color32) -> (String, Color32) {
+    let darker = |c: Color32| Color32::from_rgb((c.r() as f32 * 0.7) as u8, (c.g() as f32 * 0.7) as u8, (c.b() as f32 * 0.7) as u8);
     match r {
-        CommitRef::Local { name, head: true } => (format!("● {name}"), Color32::from_rgb(0x2f, 0x81, 0x3a)),
-        CommitRef::Local { name, head: false } => (name.clone(), Color32::from_rgb(0x2b, 0x6c, 0xb0)),
-        CommitRef::Remote(name) | CommitRef::Other(name) => (name.clone(), Color32::from_rgb(0x6b, 0x4f, 0x9e)),
+        CommitRef::Local { name, head: true } => (format!("● {name}"), lane),
+        CommitRef::Local { name, head: false } => (name.clone(), lane),
+        CommitRef::Remote(name) | CommitRef::Other(name) => (name.clone(), darker(lane)),
         CommitRef::Tag(name) => (name.clone(), Color32::from_rgb(0x9a, 0x6d, 0x14)),
-        CommitRef::Head => ("HEAD".into(), Color32::from_rgb(0x2f, 0x81, 0x3a)),
+        CommitRef::Head => ("HEAD".into(), lane),
+    }
+}
+
+/// Black or white, whichever reads better on `fill`.
+fn label_text(fill: Color32) -> Color32 {
+    let luminance = 0.299 * f32::from(fill.r()) + 0.587 * f32::from(fill.g()) + 0.114 * f32::from(fill.b());
+    if luminance > 150.0 {
+        Color32::from_rgb(0x1e, 0x1e, 0x1e)
+    } else {
+        Color32::WHITE
     }
 }
