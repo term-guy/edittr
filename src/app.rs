@@ -2904,7 +2904,9 @@ impl App {
                     }
                     // Rank only when the query or the file list changed, not every frame.
                     if q.matched_query.as_deref() != Some(q.query.as_str()) {
-                        q.matches = fuzzy_filter(&q.lower, &q.query, 200);
+                        // `name:183` / `name:183-190`: rank by the name part only.
+                        let (name, _) = goto_line::split_line_target(&q.query);
+                        q.matches = fuzzy_filter(&q.lower, name, 200);
                         q.matched_query = Some(q.query.clone());
                     }
                     let mut moved = false;
@@ -2917,10 +2919,23 @@ impl App {
                             q.selected = q.selected.saturating_sub(1);
                             moved = true;
                         }
-                        if i.key_pressed(Key::Enter) {
+                        // `:183` alone goes to a line in the current file, not the first file.
+                        if i.key_pressed(Key::Enter) && !goto_line::split_line_target(&q.query).0.is_empty() {
                             chosen = q.matches.get(q.selected).map(|&i| q.files[i].clone());
                         }
                     });
+                    if let (_, Some(t)) = goto_line::split_line_target(&q.query) {
+                        let lines = match t.end {
+                            Some(end) => format!("lines {}\u{2013}{}", t.line + 1, end + 1),
+                            None => format!("line {}", t.line + 1),
+                        };
+                        let what = if goto_line::split_line_target(&q.query).0.is_empty() {
+                            "in this file"
+                        } else {
+                            "of the chosen file"
+                        };
+                        ui.weak(format!("Go to {lines} {what}"));
+                    }
                     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                         for (i, &m) in q.matches.iter().enumerate() {
                             let r = ui.selectable_label(i == q.selected, &q.files[m]);
@@ -2939,11 +2954,22 @@ impl App {
                     ctx.input(|i| i.pointer.any_pressed() && i.pointer.interact_pos().is_some_and(|p| !popup.response.rect.contains(p)));
                 close |= outside;
             }
+            let (name, target) = goto_line::split_line_target(&q.query);
+            // `:183` on its own: a line in the current file.
+            let here = name.is_empty() && target.is_some() && chosen.is_none() && ctx.input(|i| i.key_pressed(Key::Enter));
+            let mut opened = false;
             if let (Some(f), Some(root)) = (chosen, self.root.clone()) {
                 self.open_file(&root.join(f));
+                opened = true;
                 close = true;
             }
-            if close {
+            if (opened || here)
+                && let Some(target) = target
+                && let Some(Tab::File(doc)) = self.tabs.get_mut(self.active)
+            {
+                goto_line::select_target(doc, target);
+            }
+            if close || here {
                 self.quick_open = None;
             }
         }

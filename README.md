@@ -26,7 +26,7 @@ A small, fast code editor with built-in git. It's a single native binary written
 ### Navigation
 
 - **Command palette** (`Ctrl/Cmd+Shift+P` or `F1`): every command and setting, fuzzy searched
-- **Go to file** (`Ctrl/Cmd+P`): searches the files git tracks (or all files outside a repo), closest match first: the exact file name, then names starting with or containing what you typed, then looser matches
+- **Go to file** (`Ctrl/Cmd+P`): searches the files git tracks (or all files outside a repo), closest match first: the exact file name, then names starting with or containing what you typed, then looser matches. Add a line or range to jump there: `main.c:183`, `main.c:183:5`, `main.c:183-190` (also with `–` or `—`), or just `:183` for the current file
 - **Go to symbol** in the file (`Ctrl/Cmd+Shift+O`) or the workspace (`Ctrl/Cmd+T`)
 - **Outline** below the Explorer, following the cursor: symbols grouped into collapsible **Macros**, **Constants**, **Variables**, **Types** and **Functions** (collapsed groups are remembered), or in source order. For C/C++ it lists macros with their values, global and `static` variables, and functions
 - **Go to definition** (`Ctrl/Cmd+click` or `F12`; go back with `Alt+Left` (macOS `Ctrl+-`) and forward with `Alt+Right` (macOS `Ctrl+Shift+-`), or the mouse back/forward buttons): uses a language server when available, otherwise a built-in text search that understands common definition syntax (`fn`, `def`, `class`, `const`, `#define`, …)
@@ -150,7 +150,7 @@ On Linux you need the usual windowing dev packages (see `.github/workflows/build
 | Key | Action |
 | --- | --- |
 | `Ctrl/Cmd+Shift+P`, `F1` | Command palette |
-| `Ctrl/Cmd+P` | Go to file |
+| `Ctrl/Cmd+P` | Go to file (`name:line`, `name:line-line`) |
 | `Ctrl+G` | Go to line (`line` or `line:column`) |
 | `Ctrl/Cmd+Shift+O` | Go to symbol in file |
 | `Ctrl/Cmd+T` | Go to symbol in workspace |
