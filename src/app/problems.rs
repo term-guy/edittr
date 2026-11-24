@@ -1,7 +1,7 @@
 use super::{App, Side, Tab, background, receive};
 use crate::diagnostics::{self, ByPath};
 use crate::lsp::Severity;
-use crate::{icons as ic, lsp, workspace};
+use crate::{clangd, icons as ic, lsp, watch::Changes, workspace};
 use eframe::egui::{self, RichText};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -12,12 +12,15 @@ use std::time::Duration;
 const SYNC_DEBOUNCE: Duration = Duration::from_millis(400);
 
 struct Started {
+    database: Option<clangd::CompilationDatabase>,
+    resolved: bool,
     failed: Vec<&'static str>,
     error: Option<String>,
 }
 
 #[derive(Default)]
 pub(super) struct LanguageServers {
+    database: clangd::CompilationDatabase,
     launches: HashMap<&'static str, Arc<lsp::Launch>>,
     starting: HashMap<&'static str, Option<Receiver<Started>>>,
     failed: HashSet<&'static str>,
@@ -55,7 +58,47 @@ impl App {
                 }
             });
         }
+        if let Some(watcher) = &self.watcher {
+            watcher.watch_compilation_database(Vec::new());
+        }
         self.problems = Problems::default();
+    }
+
+    pub(super) fn reconfigure_ignored_servers(&mut self) {
+        let had_clangd = self.lsp.launches.contains_key("clangd");
+        self.reset_lsp();
+        if had_clangd {
+            self.launch_server("cpp", false);
+        }
+    }
+
+    pub(super) fn compilation_database_changed(&mut self, changes: &Changes, rescan: bool) {
+        if !self.lsp.launches.contains_key("clangd") {
+            return;
+        }
+        let root = self.root.as_deref();
+        let changed = rescan
+            || self.lsp.database.paths().any(|path| changes.affects(path))
+            || root.is_some_and(|root| changes.paths.iter().any(|path| clangd::database_event(root, path)));
+        if !changed {
+            return;
+        }
+        let launch = self.lsp.launches.remove("clangd").unwrap();
+        if self
+            .lsp
+            .install_check
+            .as_ref()
+            .is_some_and(|(_, pending)| Arc::ptr_eq(pending, &launch))
+        {
+            self.lsp.install_check = None;
+        }
+        launch.cancel();
+        std::thread::spawn(move || launch.retire_if_cancelled());
+        self.lsp.starting.remove("clangd");
+        self.lsp.failed.remove("clangd");
+        self.lsp.synced = None;
+        // Keep the previous watch until the next launch publishes its database.
+        self.launch_server("cpp", false);
     }
 
     pub(super) fn launch_server(&mut self, ext: &str, retry_missing: bool) -> Option<Arc<lsp::Launch>> {
@@ -74,7 +117,11 @@ impl App {
                 _ => return Some(launch.clone()),
             }
         }
-        let mut root = self.work_dir();
+        let mut root = if key == "clangd" {
+            self.root.clone().unwrap_or_else(|| self.work_dir())
+        } else {
+            self.work_dir()
+        };
         let mut ignored = self.ignored.clone();
         if !ignored.is_empty()
             && let Some(project) = &self.root
@@ -96,12 +143,34 @@ impl App {
         let ctx = self.ctx.clone();
         let rx = background(&self.ctx, move || {
             let mut started = Started {
+                database: None,
+                resolved: false,
                 failed: Vec::new(),
                 error: None,
             };
             let repaint: Arc<dyn Fn() + Send + Sync> = Arc::new(move || ctx.request_repaint());
             let client = specs.into_iter().filter(|spec| !failed.contains(spec.name)).find_map(|spec| {
-                let command = lsp::resolve(spec.command)?;
+                if shared.is_cancelled() {
+                    return None;
+                }
+                let mut command = lsp::resolve(spec.command)?;
+                started.resolved = true;
+                if spec.name == "clangd" {
+                    let database = clangd::CompilationDatabase::find(&root);
+                    let prepared = database.prepare(&root, &ignored, || shared.is_cancelled());
+                    started.database = Some(database);
+                    match prepared {
+                        Ok(Some(dir)) => command.args.push(format!("--compile-commands-dir={}", dir.display())),
+                        Ok(None) => {}
+                        Err(error) => {
+                            started.error = Some(format!("Could not prepare clangd compilation database: {error}"));
+                            return None;
+                        }
+                    }
+                }
+                if shared.is_cancelled() {
+                    return None;
+                }
                 match lsp::Client::start(&spec, command, &root, &ignored, Some(repaint.clone())) {
                     Ok(client) => Some(client),
                     Err(error) => {
@@ -123,8 +192,26 @@ impl App {
     }
 
     pub(super) fn poll_problems(&mut self) {
-        self.lsp.starting.retain(|_, rx| {
-            if let Some(Started { failed, error }) = receive(rx) {
+        self.lsp.starting.retain(|key, rx| {
+            if let Some(Started {
+                database,
+                resolved,
+                failed,
+                error,
+            }) = receive(rx)
+            {
+                if resolved
+                    && let Some((_, pending)) = &self.lsp.install_check
+                    && self.lsp.launches.get(key).is_some_and(|launch| Arc::ptr_eq(pending, launch))
+                {
+                    self.lsp.install_check = None;
+                }
+                if let Some(database) = database {
+                    if let Some(watcher) = &self.watcher {
+                        watcher.watch_compilation_database(database.paths().cloned().collect());
+                    }
+                    self.lsp.database = database;
+                }
                 self.lsp.failed.extend(failed);
                 if let Some(error) = error {
                     self.message = error;
@@ -132,7 +219,14 @@ impl App {
             }
             rx.is_some()
         });
-        if self.lsp.install_check.as_ref().is_some_and(|(_, launch)| launch.get().is_some()) {
+        if self.lsp.install_check.as_ref().is_some_and(|(_, pending)| {
+            pending.get().is_some()
+                && !self
+                    .lsp
+                    .starting
+                    .keys()
+                    .any(|key| self.lsp.launches.get(key).is_some_and(|launch| Arc::ptr_eq(pending, launch)))
+        }) {
             let (ext, launch) = self.lsp.install_check.take().unwrap();
             if matches!(launch.get(), Some(None)) {
                 self.offer_install(&ext);

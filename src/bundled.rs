@@ -6,7 +6,8 @@
 //!   "pyright-langserver": { "exe": "node/node", "args": ["@js/node_modules/pyright/langserver.index.js"] } }
 //! ```
 //! `exe` is relative to the bundle folder; an argument starting with `@` is a
-//! path relative to it too. The folder is looked for next to the executable,
+//! path relative to it too. Protocol and clangd defaults come from the common
+//! server spec for every launch source. The folder is looked for next to the executable,
 //! in `Contents/Resources` of a macOS app, and in `../lib/edittr` (Linux install).
 
 use std::path::{Path, PathBuf};

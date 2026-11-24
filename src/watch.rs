@@ -1,4 +1,5 @@
 //! Publish filesystem changes after a quiet period, with no timer when idle.
+use crate::clangd;
 use eframe::egui;
 use notify::{Event, EventKind, RecursiveMode};
 use std::collections::HashSet;
@@ -35,6 +36,7 @@ impl Changes {
 
 enum Input {
     Event(notify::Result<Event>),
+    CompilationDatabase(Vec<PathBuf>),
     Stop,
 }
 
@@ -72,6 +74,10 @@ impl Watcher {
             output: batches,
             errors: failures,
         }
+    }
+
+    pub fn watch_compilation_database(&self, paths: Vec<PathBuf>) {
+        let _ = self.input.send(Input::CompilationDatabase(paths));
     }
 
     pub fn take(&self) -> Changes {
@@ -210,6 +216,11 @@ fn classify(root: &Path, git: &GitDirs, parent_svn: Option<&Path>, event: Event,
             continue;
         }
         let Ok(relative) = path.strip_prefix(root) else { continue };
+        if clangd::is_index_path(relative) {
+            continue;
+        }
+        // Build directories are normally quiet, but clangd needs database changes.
+        let database = path.file_name().is_some_and(|name| name == clangd::DATABASE || name == ".clangd");
         let mut parts = relative.iter();
         while let Some(part) = parts.next() {
             if part == ".git" {
@@ -227,7 +238,7 @@ fn classify(root: &Path, git: &GitDirs, parent_svn: Option<&Path>, event: Event,
                 relevant |= svn_metadata(parts.as_path(), structural, changes);
                 continue 'paths;
             }
-            if part.to_str().is_some_and(|name| IGNORED_DIRS.contains(&name)) {
+            if !database && part.to_str().is_some_and(|name| IGNORED_DIRS.contains(&name)) {
                 continue 'paths;
             }
         }
@@ -261,6 +272,8 @@ fn run(
 
     let mut changes = Changes::default();
     let mut window = None;
+    let mut databases = Vec::<PathBuf>::new();
+    let mut database_watches = HashSet::<PathBuf>::new();
     loop {
         let input = match window {
             None => events.recv().ok(),
@@ -291,10 +304,37 @@ fn run(
         };
         match input {
             Some(Input::Event(event)) => {
-                if classify(&root, &git, parent_svn.as_deref(), event?, &mut changes) {
+                let event = event?;
+                let mut database_change = false;
+                if !matches!(event.kind, EventKind::Access(_)) {
+                    for path in &event.paths {
+                        if databases.iter().any(|db| db.starts_with(path)) {
+                            database_change |= changes.paths.insert(path.clone());
+                        }
+                    }
+                }
+                if classify(&root, &git, parent_svn.as_deref(), event, &mut changes) || database_change {
                     let now = Instant::now();
                     window = Some((window.map_or(now, |(start, _)| start), now));
                 }
+            }
+            Some(Input::CompilationDatabase(paths)) => {
+                let wanted: HashSet<_> = paths
+                    .iter()
+                    .filter(|path| !path.starts_with(&root))
+                    .filter_map(|path| path.ancestors().skip(1).find(|dir| dir.is_dir()))
+                    .map(Path::to_path_buf)
+                    .collect();
+                for dir in database_watches.difference(&wanted) {
+                    let _ = watcher.unwatch(dir);
+                }
+                database_watches.retain(|dir| wanted.contains(dir));
+                for dir in wanted.difference(&database_watches).cloned().collect::<Vec<_>>() {
+                    if watcher.watch(&dir, RecursiveMode::NonRecursive).is_ok() {
+                        database_watches.insert(dir);
+                    }
+                }
+                databases = paths;
             }
             Some(Input::Stop) | None => return Ok(()),
         }
@@ -400,6 +440,14 @@ mod tests {
             assert!(changes.paths.is_empty());
         }
 
+        fs::create_dir_all(root.join("build")).unwrap();
+        let database = root.join("build/compile_commands.json");
+        fs::write(&database, "[]").unwrap();
+        assert!(receive().0.affects(&database));
+
+        fs::create_dir_all(root.join(".cache/clangd/index")).unwrap();
+        let _ = receive(); // The new .cache directory itself is visible.
+        fs::write(root.join(".cache/clangd/index/entry.idx"), "cached").unwrap();
         fs::write(admin.join("index.lock"), "lock").unwrap();
         fs::write(common.join("objects/ignored"), "object").unwrap();
         fs::write(base.0.join(".svn/wc.db-journal"), "journal").unwrap();

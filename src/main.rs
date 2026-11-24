@@ -3,6 +3,7 @@
 mod app;
 mod blame;
 mod bundled;
+mod clangd;
 mod commands;
 mod diagnostics;
 mod diff;
@@ -22,6 +23,7 @@ mod search;
 mod session;
 mod settings;
 mod svn;
+mod symbol_cache;
 mod symbols;
 mod tree;
 pub mod vcs;

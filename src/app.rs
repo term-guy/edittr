@@ -1,4 +1,5 @@
 mod assist;
+mod code_navigation;
 mod document_save;
 mod find;
 mod gutter;
@@ -294,6 +295,7 @@ pub struct App {
     root: Option<PathBuf>,
     watcher: Option<Watcher>,
     ignored: Vec<String>,
+    code_navigation: code_navigation::CodeNavigation,
     /// Recently opened folders, most recent first.
     recent: Vec<PathBuf>,
     repo: Option<PathBuf>,
@@ -386,6 +388,7 @@ impl App {
             root: None,
             watcher: None,
             ignored: Vec::new(),
+            code_navigation: code_navigation::CodeNavigation::default(),
             recent: load_recent(),
             side: Side::Explorer,
             side_open: true,
@@ -450,6 +453,7 @@ impl App {
         self.watcher = Some(Watcher::start(root.clone(), self.ctx.clone()));
         self.ignored = ignored;
         self.root = Some(root);
+        self.refresh_symbol_cache();
         self.search.cancel.store(true, Ordering::Relaxed);
         let opts = std::mem::take(&mut self.search.opts);
         self.search = SearchState {
@@ -466,6 +470,7 @@ impl App {
     }
 
     fn clear_project(&mut self) {
+        self.code_navigation = code_navigation::CodeNavigation::default();
         self.root = None;
         self.watcher = None;
         self.update_repository(None);
@@ -741,6 +746,7 @@ impl App {
             self.message = format!("Could not save settings: {err}");
         }
         self.poll_project_changes(ctx);
+        self.poll_code_navigation();
         self.poll_document_saves();
         self.poll_vcs(ctx);
         self.poll_blame(ctx);
@@ -767,6 +773,7 @@ impl App {
             match detected {
                 Ok(repository) => {
                     if self.update_repository(repository) {
+                        self.refresh_symbol_cache();
                         self.refresh_history();
                     }
                     self.refresh_vcs();
@@ -777,6 +784,9 @@ impl App {
         if let Some(refresh) = receive(&mut self.status_rx) {
             if self.bg_task.is_none() && self.repo_rx.is_none() {
                 let repo_changed = self.update_repository(refresh.repository);
+                if repo_changed {
+                    self.refresh_symbol_cache();
+                }
                 if let Some(status) = refresh.status {
                     match status {
                         Ok(status) => self.status = status,
@@ -892,6 +902,8 @@ impl App {
         } else if gained_focus {
             changes.rescan = true;
         }
+        self.compilation_database_changed(&changes, watcher_rescan);
+        self.symbol_cache_changed(&changes, watcher_rescan);
         self.invalidate_editorconfigs(&changes, watcher_rescan);
         if changes.rescan || !changes.dirs.is_empty() {
             self.invalidate_tree(|dir| changes.rescan || changes.dirs.contains(dir) || changes.affects(dir));
@@ -1251,7 +1263,8 @@ impl App {
         if let Some(root) = &self.root {
             workspace::save_ignored(root, &self.ignored);
         }
-        self.reset_lsp();
+        self.reconfigure_ignored_servers();
+        self.code_navigation_ignored_changed();
         if self.goto_rx.take().is_some() {
             self.nav_back.pop();
         }
@@ -1287,7 +1300,8 @@ impl App {
             .filter_map(|i| match self.tabs.get(i) {
                 Some(Tab::File(d)) => {
                     let rel = d.path.strip_prefix(&root).ok()?.to_string_lossy().replace('\\', "/");
-                    (!workspace::is_ignored(&rel, &self.ignored)).then(|| (rel, d.text.clone()))
+                    (!workspace::is_ignored(&rel, &self.ignored) && !crate::clangd::is_index_path(Path::new(&rel)))
+                        .then(|| (rel, d.text.clone()))
                 }
                 _ => None,
             })
@@ -3200,6 +3214,7 @@ fn read_dir_sorted(dir: &Path) -> DirEntries {
         .map(|rd| {
             rd.filter_map(Result::ok)
                 .filter(|e| e.file_name() != ".git" && e.file_name() != ".svn")
+                .filter(|e| !(dir.file_name().is_some_and(|name| name == ".cache") && e.file_name() == "clangd"))
                 .map(|e| {
                     let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
                     (e.path(), is_dir)
@@ -3240,9 +3255,7 @@ fn receive<T>(rx: &mut Option<Receiver<T>>) -> Option<T> {
 /// ignored) inside a repo, otherwise a directory walk that skips common build dirs.
 fn project_files(root: &Path, vcs: Option<Vcs>, ignored: &[String]) -> Vec<String> {
     if let Some(mut files) = vcs::list_files(root, vcs) {
-        if !ignored.is_empty() {
-            files.retain(|rel| !workspace::is_ignored(rel, ignored));
-        }
+        files.retain(|rel| !workspace::is_ignored(rel, ignored) && !crate::clangd::is_index_path(Path::new(rel)));
         files
     } else {
         walk_files(root, 50_000, ignored)

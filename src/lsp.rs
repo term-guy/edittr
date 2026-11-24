@@ -4,7 +4,7 @@
 
 use crate::diagnostics::{self, ByPath};
 pub use crate::diagnostics::{Diagnostic, Severity};
-use crate::workspace;
+use crate::{clangd, workspace};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -24,12 +24,13 @@ pub struct ServerSpec {
 
 impl ServerSpec {
     fn initialization_options(&self, ignored: &[String]) -> Option<Value> {
-        if ignored.is_empty() {
-            return None;
-        }
         match self.name {
-            "rust-analyzer" => Some(json!({"files": {"excludeDirs": ignored}})),
-            "gopls" => {
+            "rust-analyzer" => Some(json!({
+                "files": {"excludeDirs": ignored},
+                "cachePriming": {"enable": true},
+                "cargo": {"targetDir": true},
+            })),
+            "gopls" if !ignored.is_empty() => {
                 let filters: Vec<_> = std::iter::once("-**/node_modules".to_owned())
                     .chain(ignored.iter().map(|dir| format!("-{dir}")))
                     .collect();
@@ -68,15 +69,16 @@ pub fn servers_for(ext: &str) -> Vec<ServerSpec> {
             s("pylsp", "pylsp", &[][..], "python"),
         ],
         "go" => vec![s("gopls", "gopls", &[][..], "go")],
-        "c" | "h" => vec![s("clangd", "clangd", &[][..], "c")],
-        "cc" | "cpp" | "cxx" | "hpp" | "hh" | "hxx" => vec![s("clangd", "clangd", &[][..], "cpp")],
         "java" => vec![s("jdtls", "jdtls", &[][..], "java")],
         "rb" => vec![s("ruby-lsp", "ruby-lsp", &[][..], "ruby")],
         "php" => vec![s("intelephense", "intelephense", &["--stdio"][..], "php")],
         "lua" => vec![s("lua-language-server", "lua-language-server", &[][..], "lua")],
         "zig" => vec![s("zls", "zls", &[][..], "zig")],
         "cs" => vec![s("csharp-ls", "csharp-ls", &[][..], "csharp")],
-        _ => vec![],
+        _ => clangd::language(ext)
+            .map(|language| s("clangd", "clangd", clangd::ARGS, language))
+            .into_iter()
+            .collect(),
     }
 }
 
@@ -175,8 +177,12 @@ impl Launch {
         self.cancelled.store(true, Ordering::Release);
     }
 
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
     pub fn retire_if_cancelled(&self) {
-        if self.cancelled.load(Ordering::Acquire)
+        if self.is_cancelled()
             && let Some(Some(client)) = self.get()
         {
             client.retire();
@@ -281,6 +287,10 @@ impl Client {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
+        if spec.name == "clangd" {
+            let cores = std::thread::available_parallelism().map_or(1, usize::from);
+            cmd.arg(format!("-j={}", (cores / 2).max(2)));
+        }
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -709,6 +719,16 @@ impl Client {
         let extra = json!({"context": {"includeDeclaration": true}});
         let v = self.at_position("textDocument/references", path, text, revision, pos, extra, timeout)?;
         Ok(parse_locations(&v))
+    }
+
+    pub(crate) fn switch_source_header(&self, path: &Path, text: &str, revision: Revision, timeout: Duration) -> Option<PathBuf> {
+        let kind = self.wait_ready(timeout).ok()?;
+        self.sync(path, text, revision, kind).then_some(())?;
+        // This clangd extension takes a TextDocumentIdentifier directly.
+        let result = self
+            .request("textDocument/switchSourceHeader", json!({"uri": path_to_uri(path)}), timeout)
+            .ok()?;
+        result.as_str().and_then(uri_to_path)
     }
 
     pub(crate) fn document_symbols(&self, path: &Path, text: &str, revision: Revision, timeout: Duration) -> Result<Vec<Symbol>, String> {

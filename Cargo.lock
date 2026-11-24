@@ -586,6 +586,7 @@ dependencies = [
  "ureq",
  "url",
  "winresource",
+ "yaml-rust",
  "zip",
 ]
 

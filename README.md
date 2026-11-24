@@ -30,6 +30,10 @@ Run `edittr --list-servers` to see which server each language uses and where it 
 
 Servers edittr installs go into its own folder (`~/Library/Application Support/edittr/servers` on macOS, `~/.local/share/edittr/servers` on Linux, `%LOCALAPPDATA%\edittr\servers` on Windows; override it with `EDITTR_SERVERS_DIR`). edittr also starts servers it finds on `PATH` for Java (jdtls), Ruby (ruby-lsp), PHP (intelephense), Lua, Zig and C#.
 
+When a workspace has a compilation database, edittr gives clangd a filtered copy in the OS cache directory under `edittr/clangd/`. It checks the workspace root, `build*/`, `out/`, `cmake-build-*/`, and a workspace-wide `CompileFlags.CompilationDatabase` path in `.clangd`. Ignored folders are excluded from the copy, and edittr restarts clangd when the database or the workspace ignore list changes. clangd stores its persistent index alongside the database it uses. If clangd discovers a project-local database on its own, edittr hides its `.cache/clangd` directory from Explorer, search and untracked Source Control results.
+
+Rust-analyzer warms its analysis caches and uses a separate Cargo target subdirectory. gopls manages its own persistent cache. edittr also caches regex-based symbols from saved workspace files under `edittr/symbols/` in the OS cache directory, up to 16 MiB per workspace.
+
 ## Install
 
 Download from the [Releases](https://github.com/term-guy/edittr/releases) page. Every platform comes in two flavors:
@@ -72,6 +76,7 @@ On Linux you need the usual windowing dev packages (see `.github/workflows/build
 | `Ctrl/Cmd+P` | Go to file |
 | `Ctrl/Cmd+Shift+F` | Search in files |
 | `Ctrl/Cmd+click`, `F12` | Go to definition |
+| `Alt+O` | Switch between C/C++ source and header |
 | `Alt+Left` (macOS: `Ctrl+-`) | Go back |
 | `Ctrl/Cmd+W` | Close tab |
 | `Ctrl/Cmd+Enter` | Commit (in the commit box) |

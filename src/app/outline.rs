@@ -91,9 +91,11 @@ impl App {
             return;
         }
         let (path, text, client) = (doc.path.clone(), doc.text.clone(), client.cloned());
+        let (root, ignored) = (self.root.clone(), self.ignored.clone());
         self.outline.rx = Some(background(&self.ctx, move || {
             let source = client.as_ref().map(Arc::downgrade);
-            let tree = Tree::new(symbols::document(&path, &text, revision, client));
+            let project = root.as_deref().map(|root| (root, ignored.as_slice()));
+            let tree = Tree::new(symbols::document(&path, &text, revision, client, project, None));
             Snapshot {
                 revision,
                 client: source,

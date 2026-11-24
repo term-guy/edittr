@@ -216,6 +216,10 @@ impl App {
         }
         // The palette binding precedes Go to file because egui accepts extra Shift modifiers.
         for command in COMMANDS.iter().filter(|c| c.id != Command::Commit) {
+            if command.id == Command::SwitchSourceHeader && !ctx.input(|input| input.key_pressed(Key::O) && self.can_switch_source_header())
+            {
+                continue;
+            }
             if ctx.input_mut(|input| command.consume(input)) {
                 self.run_command(command.id);
             }
@@ -225,6 +229,7 @@ impl App {
     pub(super) fn run_command(&mut self, cmd: Command) {
         match cmd {
             Command::Palette | Command::DocumentSymbols | Command::WorkspaceSymbols => self.start_picker(cmd),
+            Command::SwitchSourceHeader => self.switch_source_header(),
             Command::OpenFolder => self.request_open_folder(),
             Command::QuickOpen => self.start_quick_open(),
             Command::Find => self.show_find(false),
@@ -340,8 +345,12 @@ impl App {
                 });
                 let (path, text, revision) = (doc.path.clone(), doc.text.clone(), (doc.id, doc.version));
                 let client = self.document_symbol_client(doc).cloned();
+                let root = self.root.clone();
+                let ignored = self.ignored.clone();
+                let cache = self.symbol_snapshot();
                 picker.rx = Some(background(&self.ctx, move || {
-                    symbols::flatten(symbols::document(&path, &text, revision, client))
+                    let project = root.as_deref().map(|root| (root, ignored.as_slice()));
+                    symbols::flatten(symbols::document(&path, &text, revision, client, project, cache.as_deref()))
                         .into_iter()
                         .map(|symbol| Row::symbol(symbol, None))
                         .collect()
@@ -366,7 +375,16 @@ impl App {
         self.ctx.request_repaint();
     }
 
+    pub(super) fn refresh_workspace_symbols(&mut self) {
+        if let Some(picker) = &mut self.picker
+            && matches!(picker.mode, Mode::Workspace)
+        {
+            picker.schedule_workspace_search(&self.ctx);
+        }
+    }
+
     pub(super) fn poll_picker(&mut self) {
+        let cache = self.symbol_snapshot();
         let Some(picker) = &mut self.picker else { return };
         if let Some(rows) = receive(&mut picker.rx) {
             picker.set_rows(rows);
@@ -387,10 +405,12 @@ impl App {
             self.ignored.clone(),
         );
         picker.rx = Some(background(&self.ctx, move || {
-            symbols::project(&root, &ignored, clients, &query, &cancel, || project_files(&root, vcs, &ignored))
-                .into_iter()
-                .map(|symbol| Row::symbol(symbol, Some(&root)))
-                .collect()
+            symbols::project(&root, &ignored, clients, &query, &cancel, cache.as_deref(), || {
+                project_files(&root, vcs, &ignored)
+            })
+            .into_iter()
+            .map(|symbol| Row::symbol(symbol, Some(&root)))
+            .collect()
         }));
     }
 
@@ -413,6 +433,9 @@ impl App {
     }
 
     fn reveal_symbol(&mut self, mode: Mode, symbol: symbols::Symbol) {
+        if self.path_is_ignored(&symbol.path) {
+            return;
+        }
         if let Mode::Document { id, version } = mode {
             if let Some(Tab::File(doc)) = self.tabs.get_mut(self.active)
                 && doc.id == id

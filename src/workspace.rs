@@ -3,15 +3,15 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 fn config_file(root: &str) -> Option<PathBuf> {
-    let hash = root.bytes().fold(0xcbf29ce484222325_u64, |hash, byte| {
+    let hash = root_hash(Path::new(root));
+    Some(dirs::config_dir()?.join("edittr").join("workspaces").join(format!("{hash}.txt")))
+}
+
+pub(crate) fn root_hash(root: &Path) -> String {
+    let hash = root.to_string_lossy().bytes().fold(0xcbf29ce484222325_u64, |hash, byte| {
         (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
     });
-    Some(
-        dirs::config_dir()?
-            .join("edittr")
-            .join("workspaces")
-            .join(format!("{hash:016x}.txt")),
-    )
+    format!("{hash:016x}")
 }
 
 pub fn load_ignored(root: &Path) -> Vec<String> {

@@ -1,4 +1,4 @@
-use crate::{goto, lsp, workspace};
+use crate::{clangd, goto, lsp, symbol_cache, workspace};
 use std::ops::{Range, RangeInclusive};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -36,7 +36,7 @@ pub(crate) fn selection(text: &str, line: usize, cols: Columns) -> (usize, usize
 
 pub(crate) struct Symbol {
     pub(crate) name: String,
-    pub(crate) kind: &'static str,
+    pub(crate) kind: String,
     pub(crate) container: Option<String>,
     pub(crate) path: PathBuf,
     /// Location of the symbol name, used for navigation.
@@ -51,11 +51,24 @@ impl Symbol {
     fn from_definition(path: &Path, def: goto::Definition<'_>) -> Self {
         Self {
             name: def.name.to_owned(),
-            kind: def.kind,
+            kind: def.kind.to_owned(),
             container: None,
             path: path.to_path_buf(),
             line: def.line,
             cols: Columns::Chars(def.cols),
+            lines: def.line..=def.line,
+            children: Vec::new(),
+        }
+    }
+
+    fn from_cached(path: &Path, def: &symbol_cache::Definition) -> Self {
+        Self {
+            name: def.name.clone(),
+            kind: def.kind.clone(),
+            container: None,
+            path: path.to_path_buf(),
+            line: def.line,
+            cols: Columns::Chars(def.cols.clone()),
             lines: def.line..=def.line,
             children: Vec::new(),
         }
@@ -66,7 +79,7 @@ impl From<lsp::Symbol> for Symbol {
     fn from(symbol: lsp::Symbol) -> Self {
         Self {
             name: symbol.name,
-            kind: symbol.kind,
+            kind: symbol.kind.to_owned(),
             container: symbol.container,
             path: symbol.location.path,
             line: symbol.location.line,
@@ -77,7 +90,24 @@ impl From<lsp::Symbol> for Symbol {
     }
 }
 
-pub(crate) fn document(path: &Path, text: &str, revision: lsp::Revision, client: Option<Arc<lsp::Client>>) -> Vec<Symbol> {
+pub(crate) fn document(
+    path: &Path,
+    text: &str,
+    revision: lsp::Revision,
+    client: Option<Arc<lsp::Client>>,
+    project: Option<(&Path, &[String])>,
+    // The outline needs the hierarchy, which the flat cached definitions lack; re-parsing
+    // one open file is cheap. (The cache serves workspace-symbol search.)
+    _cache: Option<&symbol_cache::Snapshot>,
+) -> Vec<Symbol> {
+    let rel = project.and_then(|(root, _)| workspace::relative_path(root, path));
+    if rel
+        .as_deref()
+        .zip(project)
+        .is_some_and(|(rel, (_, ignored))| excluded(rel, ignored))
+    {
+        return Vec::new();
+    }
     if let Some(client) = client
         && let Ok(symbols) = client.document_symbols(path, text, revision, TIMEOUT)
     {
@@ -170,12 +200,17 @@ pub(crate) fn flatten(symbols: Vec<Symbol>) -> Vec<Symbol> {
     rows
 }
 
+fn excluded(rel: &str, ignored: &[String]) -> bool {
+    workspace::is_ignored(rel, ignored) || clangd::is_index_path(Path::new(rel))
+}
+
 pub(crate) fn project(
     root: &Path,
     ignored: &[String],
     clients: Vec<Arc<lsp::Client>>,
     query: &str,
     cancel: &AtomicBool,
+    cache: Option<&symbol_cache::Snapshot>,
     files: impl FnOnce() -> Vec<String>,
 ) -> Vec<Symbol> {
     if cancel.load(Ordering::Relaxed) {
@@ -200,7 +235,7 @@ pub(crate) fn project(
         .flatten()
         .filter(|symbol| {
             let loc = &symbol.location;
-            workspace::relative_path(root, &loc.path).is_some_and(|rel| !workspace::is_ignored(&rel, ignored))
+            workspace::relative_path(root, &loc.path).is_some_and(|rel| !excluded(&rel, ignored))
                 && seen.insert((loc.path.clone(), loc.line, loc.col16.start, symbol.name.clone()))
         })
         .take(LIMIT)
@@ -212,21 +247,44 @@ pub(crate) fn project(
 
     let query = query.to_lowercase();
     let mut results = Vec::new();
-    for rel in files() {
+    let matches_query = |name: &str| query.is_empty() || name.to_lowercase().contains(&query);
+    if let Some(cache) = cache {
+        for (rel, definitions) in cache.files() {
+            if cancel.load(Ordering::Relaxed) {
+                return Vec::new();
+            }
+            if excluded(rel, ignored) {
+                continue;
+            }
+            let path = root.join(rel);
+            results.extend(
+                definitions
+                    .iter()
+                    .filter(|def| matches_query(&def.name))
+                    .take(LIMIT - results.len())
+                    .map(|def| Symbol::from_cached(&path, def)),
+            );
+            if results.len() == LIMIT {
+                return results;
+            }
+        }
+    }
+    let remaining = cache.map_or_else(files, |cache| cache.overflow.clone());
+    for rel in remaining {
         if cancel.load(Ordering::Relaxed) {
             return Vec::new();
         }
+        if excluded(&rel, ignored) {
+            continue;
+        }
         let path = root.join(rel);
-        if !std::fs::metadata(&path).is_ok_and(|meta| meta.is_file() && meta.len() <= 2_000_000) {
+        if !std::fs::metadata(&path).is_ok_and(|meta| meta.is_file() && meta.len() <= symbol_cache::MAX_FILE_BYTES) {
             continue;
         }
-        let Ok(text) = std::fs::read_to_string(&path) else { continue };
-        if text.as_bytes().contains(&0) {
-            continue;
-        }
+        let Some(text) = symbol_cache::source(&path) else { continue };
         let matches = goto::definitions(&text)
             .take_while(|_| !cancel.load(Ordering::Relaxed))
-            .filter(|def| query.is_empty() || def.name.to_lowercase().contains(&query))
+            .filter(|def| matches_query(def.name))
             .take(LIMIT - results.len())
             .map(|def| Symbol::from_definition(&path, def));
         results.extend(matches);
@@ -245,8 +303,8 @@ mod tests {
     fn fallback_outline_shares_definition_patterns_and_char_columns() {
         let path = Path::new("fixture.txt");
         let source = "// fn fake() {}\nstruct Model;\nfn café() {}\n  let mut value = 1;\n#define MAX 10\nstatic int count(void) {\n  return count();\nconst MAX_COUNT: usize = 10;\n";
-        let symbols = document(path, source, (0, 0), None);
-        let outline: Vec<_> = symbols.iter().map(|s| (s.name.as_str(), s.kind, s.line)).collect();
+        let symbols = document(path, source, (0, 0), None, None, None);
+        let outline: Vec<_> = symbols.iter().map(|s| (s.name.as_str(), s.kind.as_str(), s.line)).collect();
         assert_eq!(
             outline,
             [
@@ -272,7 +330,9 @@ mod tests {
         let path = root.join("lib.rs");
         let text: String = (0..LIMIT + 10).map(|i| format!("fn symbol_{i}() {{}}\n")).collect();
         std::fs::write(&path, format!("fn skip_me() {{}}\n{text}")).unwrap();
-        let results = project(&root, &[], Vec::new(), "SYM", &AtomicBool::new(false), || vec!["lib.rs".into()]);
+        let results = project(&root, &[], Vec::new(), "SYM", &AtomicBool::new(false), None, || {
+            vec!["lib.rs".into()]
+        });
         std::fs::remove_dir_all(&root).unwrap();
         assert_eq!(results.len(), LIMIT);
         assert_eq!((&*results[0].name, results[0].line, &results[0].path), ("symbol_0", 1, &path));

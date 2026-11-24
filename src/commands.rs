@@ -11,6 +11,7 @@ pub(crate) enum Command {
     FindInFiles,
     DocumentSymbols,
     WorkspaceSymbols,
+    SwitchSourceHeader,
     GoToDefinition,
     FindReferences,
     GoBack,
@@ -92,6 +93,22 @@ impl Entry {
     }
 
     pub(crate) fn consume(&self, input: &mut egui::InputState) -> bool {
+        if self.id == Command::SwitchSourceHeader {
+            // egui-winit emits a Text event immediately after an Alt+O key
+            // press (for example, Option+O types ø on a US Mac keyboard).
+            let mut consumed = false;
+            let mut paired_text = false;
+            input.events.retain(|event| {
+                let text = std::mem::take(&mut paired_text) && matches!(event, egui::Event::Text(_));
+                paired_text = matches!(
+                    event,
+                    egui::Event::Key { key: Key::O, pressed: true, modifiers, .. } if *modifiers == Modifiers::ALT
+                );
+                consumed |= paired_text;
+                !paired_text && !text
+            });
+            return consumed;
+        }
         self.shortcuts.iter().any(|shortcut| input.consume_shortcut(shortcut))
     }
 }
@@ -139,6 +156,11 @@ pub(crate) const COMMANDS: &[Entry] = &[
         "Go to definition",
         &[KeyboardShortcut::new(Modifiers::NONE, Key::F12)],
     ),
+    Entry::new(
+        SwitchSourceHeader,
+        "Switch between C/C++ source and header",
+        &[KeyboardShortcut::new(Modifiers::ALT, Key::O)],
+    ),
     Entry::new(GoBack, "Go back", &[GO_BACK]),
     Entry::new(Explorer, "Show Explorer", &[]),
     Entry::new(ToggleSidebar, "Toggle sidebar", &[]),
@@ -173,4 +195,27 @@ pub(crate) const COMMANDS: &[Entry] = &[
 
 pub(crate) fn entry(id: Command) -> &'static Entry {
     COMMANDS.iter().find(|entry| entry.id == id).expect("command is registered")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn switch_source_header_consumes_text_generated_by_the_shortcut() {
+        let mut input = egui::InputState::default();
+        input.events = vec![
+            egui::Event::Key {
+                key: Key::O,
+                physical_key: Some(Key::O),
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::ALT,
+            },
+            egui::Event::Text("ø".into()),
+            egui::Event::Text("other input".into()),
+        ];
+        assert!(entry(Command::SwitchSourceHeader).consume(&mut input));
+        assert_eq!(input.events, [egui::Event::Text("other input".into())]);
+    }
 }

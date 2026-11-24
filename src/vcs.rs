@@ -51,10 +51,14 @@ impl Vcs {
     }
 
     pub fn status(self, root: &Path) -> Result<Status, String> {
-        match self {
+        let mut status = match self {
             Self::Git => git::status(root),
             Self::Svn => svn::status(root),
-        }
+        }?;
+        status
+            .unstaged
+            .retain(|change| change.code != '?' || !crate::clangd::is_index_path(Path::new(&change.path)));
+        Ok(status)
     }
 
     pub fn diff(self, root: &Path, change: &FileChange, staged: bool) -> String {
