@@ -18,6 +18,7 @@ pub const FILES: &str = "\u{E710}";
 pub const FILE_SEARCH: &str = "\u{E238}";
 pub const FOLDER: &str = "\u{E24A}";
 pub const FOLDER_OPEN: &str = "\u{E256}";
+pub const GEAR: &str = "\u{E270}";
 pub const GIT_BRANCH: &str = "\u{E278}";
 pub const GIT_DIFF: &str = "\u{E27C}";
 pub const MAGNIFYING_GLASS: &str = "\u{E30C}";

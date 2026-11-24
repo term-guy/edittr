@@ -6,7 +6,7 @@ use crate::git::{self, FileChange, Status};
 use crate::graph::Graph;
 use crate::icons as ic;
 use crate::search::{self, FileHits};
-use crate::settings::Settings;
+use crate::settings::{Settings, SettingsWriter};
 use crate::{goto, installer, lsp, workspace};
 use eframe::egui::{self, Color32, Key, KeyboardShortcut, Modifiers, RichText};
 use egui_extras::syntax_highlighting::{self, CodeTheme};
@@ -236,6 +236,7 @@ pub struct App {
     install_prompt: Option<&'static str>,
     install_declined: HashSet<&'static str>,
     settings: Settings,
+    settings_writer: SettingsWriter,
     /// Collapsed folders in the Changes tree, keyed "S:<path>" (staged) or "U:<path>".
     changes_collapsed: HashSet<String>,
     #[cfg(feature = "tour")]
@@ -243,7 +244,13 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext, root: Option<PathBuf>, file: Option<PathBuf>) -> Self {
+    pub fn new(
+        cc: &eframe::CreationContext,
+        root: Option<PathBuf>,
+        file: Option<PathBuf>,
+        settings: Settings,
+        settings_writer: SettingsWriter,
+    ) -> Self {
         ic::install(&cc.egui_ctx);
         cc.egui_ctx.global_style_mut(|s| {
             s.spacing.item_spacing.y = 3.0;
@@ -283,7 +290,8 @@ impl App {
             install: None,
             install_prompt: None,
             install_declined: HashSet::new(),
-            settings: Settings::load(),
+            settings,
+            settings_writer,
             changes_collapsed: HashSet::new(),
             #[cfg(feature = "tour")]
             tour: tour::Tour::from_env(),
@@ -440,6 +448,9 @@ impl App {
     fn poll_background(&mut self, ctx: &egui::Context) {
         self.poll_goto();
         self.poll_search(ctx);
+        if let Some(err) = self.settings_writer.errors.try_iter().last() {
+            self.message = format!("Could not save settings: {err}");
+        }
         if let Some(rx) = &self.status_rx {
             match rx.try_recv() {
                 Ok(refresh) => {
@@ -1171,8 +1182,37 @@ impl App {
                 if activity_button(ui, ic::FOLDER_OPEN, false).on_hover_text("Open folder").clicked() {
                     self.request_open_folder();
                 }
+                self.settings_menu(ui);
             });
         });
+    }
+
+    fn settings_menu(&mut self, ui: &mut egui::Ui) {
+        let gear = activity_button(ui, ic::GEAR, false).on_hover_text("Settings");
+        let menu = egui::Popup::menu(&gear)
+            .align(egui::RectAlign::RIGHT_END)
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .accessible_name("Settings")
+            .show(|ui| {
+                let mut changed = false;
+                for (label, value) in [
+                    ("Highlight current line", &mut self.settings.highlight_line),
+                    ("Show whitespace", &mut self.settings.show_whitespace),
+                    ("Source Control: view as tree", &mut self.settings.changes_tree),
+                ] {
+                    changed |= ui.checkbox(value, label).changed();
+                }
+                changed
+            });
+        if menu.is_some_and(|menu| menu.inner) {
+            self.save_settings(ui.ctx());
+        }
+    }
+
+    fn save_settings(&mut self, ctx: &egui::Context) {
+        if let Err(err) = self.settings_writer.save(self.settings, ctx) {
+            self.message = format!("Could not save settings: {err}");
+        }
     }
 
     fn explorer(&mut self, ui: &mut egui::Ui) {
@@ -1376,9 +1416,7 @@ impl App {
             };
             if icon_button(ui, icon).on_hover_text(tip).clicked() {
                 self.settings.changes_tree = !self.settings.changes_tree;
-                if let Err(err) = self.settings.save() {
-                    self.message = format!("Could not save settings: {err}");
-                }
+                self.save_settings(ui.ctx());
             }
             if icon_button(ui, ic::TREE_STRUCTURE).on_hover_text("Git graph").clicked() {
                 self.open_graph();
@@ -1558,7 +1596,7 @@ impl App {
         let mut goto_at = None;
         match &mut self.tabs[active] {
             Tab::File(doc) => {
-                if let Some(idx) = editor(ui, doc) {
+                if let Some(idx) = editor(ui, doc, self.settings) {
                     goto_at = Some(idx);
                 }
             }
@@ -2081,7 +2119,7 @@ mod folder_picker {
 // -------------------------------------------------------------- widgets
 
 /// Draws the editor. Returns a char index when the user Ctrl/Cmd+clicked a symbol.
-fn editor(ui: &mut egui::Ui, doc: &mut Doc) -> Option<usize> {
+fn editor(ui: &mut egui::Ui, doc: &mut Doc, settings: Settings) -> Option<usize> {
     let mut goto_request = None;
     let theme = CodeTheme::from_style(ui.style());
     let highlight = doc.text.len() <= HIGHLIGHT_LIMIT;
@@ -2106,6 +2144,7 @@ fn editor(ui: &mut egui::Ui, doc: &mut Doc) -> Option<usize> {
         .auto_shrink([false, false])
         .show(ui, |ui| {
             ui.horizontal_top(|ui| {
+                let line_slot = settings.highlight_line.then(|| ui.painter().add(egui::Shape::Noop));
                 let gutter: String = (1..=lines).map(|n| format!("{n:>4}\n")).collect();
                 ui.add(egui::Label::new(RichText::new(gutter).monospace().color(ui.visuals().weak_text_color())).selectable(false));
                 // Column mode takes the keys it handles before the text edit sees them.
@@ -2121,6 +2160,11 @@ fn editor(ui: &mut egui::Ui, doc: &mut Doc) -> Option<usize> {
                     .desired_rows(40)
                     .layouter(&mut layouter)
                     .show(ui);
+                paint_current_line(ui, line_slot, &out);
+                if settings.show_whitespace {
+                    paint_whitespace(ui, &out);
+                }
+
                 if let Some((a, b)) = doc.goto.take() {
                     use egui::text::{CCursor, CCursorRange};
                     let mut state = out.state.clone();
@@ -2324,6 +2368,59 @@ fn column_input(ui: &mut egui::Ui, doc: &mut Doc) {
         ui.ctx().copy_text(t);
     }
     doc.column = (!exit).then_some(sel);
+}
+
+/// Middle dots for spaces and arrows for tabs, on the visible rows only.
+fn paint_whitespace(ui: &egui::Ui, out: &egui::text_edit::TextEditOutput) {
+    let clip = ui.clip_rect();
+    let origin = out.galley_pos.to_vec2();
+    let rows = &out.galley.rows;
+    let first = rows.partition_point(|r| r.max_y() + origin.y < clip.min.y);
+    let color = ui.visuals().weak_text_color().gamma_multiply(0.6);
+    let stroke = egui::Stroke::new(1.0, color);
+    let painter = ui.painter();
+    for row in rows[first..].iter().take_while(|r| r.min_y() + origin.y <= clip.max.y) {
+        let y = row.rect().center().y + origin.y;
+        for g in &row.row.glyphs {
+            if g.chr != ' ' && g.chr != '\t' {
+                continue;
+            }
+            let x0 = row.pos.x + g.pos.x + origin.x;
+            let x1 = x0 + g.advance_width;
+            if x1 < clip.min.x || x0 > clip.max.x {
+                continue;
+            }
+            if g.chr == ' ' {
+                painter.circle_filled(egui::pos2((x0 + x1) / 2.0, y), 1.0, color);
+            } else {
+                let (a, b) = (x0 + 2.0, (x1 - 2.0).max(x0 + 6.0));
+                painter.line_segment([egui::pos2(a, y), egui::pos2(b, y)], stroke);
+                painter.line_segment([egui::pos2(b - 3.0, y - 3.0), egui::pos2(b, y)], stroke);
+                painter.line_segment([egui::pos2(b - 3.0, y + 3.0), egui::pos2(b, y)], stroke);
+            }
+        }
+    }
+}
+
+fn paint_current_line(ui: &egui::Ui, slot: Option<egui::layers::ShapeIdx>, out: &egui::text_edit::TextEditOutput) {
+    let (Some(slot), Some(selection)) = (slot, out.state.cursor.char_range()) else {
+        return;
+    };
+    // Shown even while another panel has focus, like VS Code.
+    let cursor = out.galley.layout_from_cursor(selection.primary);
+    if !selection.is_empty() && cursor.row != out.galley.layout_from_cursor(selection.secondary).row {
+        return;
+    }
+
+    let mut row = out.galley.pos_from_layout_cursor(&cursor).translate(out.galley_pos.to_vec2());
+    if row.height() == 0.0 {
+        row.max.y += ui.text_style_height(&egui::TextStyle::Monospace);
+    }
+    let clip = ui.clip_rect();
+    row.min.x = clip.min.x;
+    row.max.x = clip.max.x;
+    let color = ui.visuals().text_color().gamma_multiply(0.08);
+    ui.painter().set(slot, egui::Shape::rect_filled(row, 0.0, color));
 }
 
 fn diff_view(ui: &mut egui::Ui, lines: &[String], id: &str) {

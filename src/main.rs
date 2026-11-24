@@ -51,7 +51,16 @@ fn main() -> eframe::Result {
         viewport,
         ..Default::default()
     };
-    eframe::run_native("edittr", options, Box::new(move |cc| Ok(Box::new(app::App::new(cc, root, file)))))
+    let settings = settings::Settings::load();
+    let (settings_writer, worker) = settings::SettingsWriter::start();
+    let result = eframe::run_native(
+        "edittr",
+        options,
+        Box::new(move |cc| Ok(Box::new(app::App::new(cc, root, file, settings, settings_writer)))),
+    );
+    // Finish queued settings writes once the event loop and its app have exited.
+    let _ = worker.join();
+    result
 }
 
 /// GUI-launched apps on macOS/Linux get a minimal PATH, which hides tools like

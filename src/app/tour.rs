@@ -234,6 +234,7 @@ impl Tour {
             }
             "column-select" => {
                 ctx.set_theme(egui::Theme::Dark);
+                app.settings.show_whitespace = true;
                 app.side = Side::Explorer;
                 if let Some(i) = app.tabs.iter().position(|t| matches!(t, Tab::File(_))) {
                     app.active = i;
