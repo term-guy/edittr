@@ -10,38 +10,44 @@ A small, fast code editor with built-in git. It's a single native binary written
 - **Multiple cursors**: `Alt+click` adds a cursor, `Ctrl/Cmd+D` selects the next occurrence, and middle-click drag makes a column selection; typing edits every line at once
 - **Editing helpers**: smart indentation (detected from the file or `.editorconfig`), `Tab` / `Shift+Tab` indent, `Ctrl/Cmd+/` toggles comments, undo/redo grouped by typing pauses
 - **Code folding** by indentation (`Ctrl/Cmd+Alt+[` / `]`, or the gutter arrows)
-- **Minimap**, **split view** (`Ctrl/Cmd+\` or "Open to the Side"), **bracket pair colors**, **current line highlight** and optional **whitespace markers** (spaces as `·`, tabs as `→`)
-- **Gutter change markers**: added, modified and deleted lines compared with the last commit
+- **Syntax colors**: macros and constants (`#define` names, `const`, `ALL_CAPS` names) get their own color, apart from variables, in C/C++ and other languages
+- **Minimap** (with a clear visible-area band), **split view** (`Ctrl/Cmd+\` or "Open to the Side"), **bracket pair colors**, **current line highlight** and optional **whitespace markers** (spaces as `·`, tabs as `→`)
+- **Gutter change markers**: added, modified and deleted lines compared with the last commit (CRLF files too)
 - **Inline blame**: a dimmed note at the end of the current line saying who changed it, when, and in which commit
 - **Find and replace** in the file (`Ctrl/Cmd+F`, `Ctrl/Cmd+H`) with match case / whole word / regex, all matches highlighted
 - **Format document** (`Shift+Alt+F`) with rustfmt, clang-format, prettier, black or gofmt when installed; **format on save** is optional (off by default)
 - **Large files**: files of 64 MB or more open in a read-only viewer that indexes them in the background without loading them into memory, with find and go to line
 - **Unicode**: Chinese, Japanese, Korean and other scripts render with the system fonts, and input methods (IME) work
+- **Tab size**: click "Tab size: N" in the status bar (or the command palette) to set how wide tabs are drawn and how many spaces files without an indentation style of their own indent with
+- **Files changed outside edittr**: nothing is reloaded behind your back. A bar offers **Reload**, **Compare** (the disk version against the editor text) or **Keep mine**
+- **Start page**: edittr opens on a start page with your recent folders; the ✕ in the Explorer header (or **Close folder**) goes back to it
 - **Session restore**: reopens each folder's tabs, cursor positions and layout
 
 ### Navigation
 
 - **Command palette** (`Ctrl/Cmd+Shift+P` or `F1`): every command and setting, fuzzy searched
-- **Go to file** (`Ctrl/Cmd+P`): fuzzy search over files git tracks (or all files outside a repo)
+- **Go to file** (`Ctrl/Cmd+P`): searches the files git tracks (or all files outside a repo), closest match first: the exact file name, then names starting with or containing what you typed, then looser matches
 - **Go to symbol** in the file (`Ctrl/Cmd+Shift+O`) or the workspace (`Ctrl/Cmd+T`)
-- **Outline** below the Explorer: functions, types, constants etc. of the current file, following the cursor
-- **Go to definition** (`Ctrl/Cmd+click` or `F12`, go back with `Alt+Left` / `Ctrl+-` on macOS): uses a language server when available, otherwise a built-in text search that understands common definition syntax (`fn`, `def`, `class`, `const`, `#define`, …)
+- **Outline** below the Explorer, following the cursor: symbols grouped into collapsible **Macros**, **Constants**, **Variables**, **Types** and **Functions** (collapsed groups are remembered), or in source order. For C/C++ it lists macros with their values, global and `static` variables, and functions
+- **Go to definition** (`Ctrl/Cmd+click` or `F12`; go back with `Alt+Left` (macOS `Ctrl+-`) and forward with `Alt+Right` (macOS `Ctrl+Shift+-`), or the mouse back/forward buttons): uses a language server when available, otherwise a built-in text search that understands common definition syntax (`fn`, `def`, `class`, `const`, `#define`, …)
 - **Find all references** (`Shift+F12`), **hover info**, and **autocomplete** (as you type or `Ctrl+Space`) from the language server
 - **Diagnostics**: errors and warnings as squiggles, in a Problems panel and as counts in the status bar
 - **Switch between C/C++ source and header** (`Alt+O`)
 
 ### Search
 
-- **Search in files** (`Ctrl/Cmd+Shift+F`): searches the whole folder in the background as you type, open files first, with match case / whole word / regex toggles; results are grouped by file and clicking one opens the file with the match selected. Respects `.gitignore` and skips binary files and files over 4 MB
-- **Include / exclude filters**: comma-separated globs such as `*.c,*.h` or `build/**,*.min.js`
+- **Search in files** (`Ctrl/Cmd+Shift+F`, which searches the selected text right away): press **Enter** to search the whole folder in the background, open files first, with match case / whole word / regex toggles; results are grouped by file and clicking one opens the file with the match selected. The matches are also highlighted in the open file (blue, apart from the file's own Find matches in amber). Respects `.gitignore` and skips binary files and files over 4 MB
+- **Find in file** (`Ctrl/Cmd+F`) starts with the selected text
+- **Include / exclude filters**: comma-separated globs such as `*.c,*.h` or `build/**,*.min.js`, saved per folder
 - **Replace in files**, previewed before anything is written
-- **Ignored folders** per workspace: right-click a folder (in the Explorer or search results) and choose **Ignore folder**. Ignored folders are skipped by search and by the language servers, so their definitions never show up
+- **Ignored folders** per workspace: right-click a folder (in the Explorer or search results) and choose **Ignore folder**. Ignored folders are skipped by search and by the language servers, so their definitions never show up. In the Search panel's **Ignored** list each folder can be switched off (kept in the list) or removed with ✕
 
 ### Source control
 
 - **Git and Subversion**, detected automatically. Large working copies stay fast: tested with 20,000 files and 8,000 pending changes
-- Staged and unstaged changes as a list or a tree (remembered), per-file diffs, stage/unstage/discard (single file or all), commit / amend, switch branches, fetch / pull (fast-forward only) / push
-- **Graph and history**: branch lanes, merges, branch and tag badges; click a commit to see its stats and patch. For Subversion, the log and blame are cached so the server isn't asked again
+- Staged and unstaged changes as a list or a tree (remembered), stage/unstage/discard per file, per folder (with a confirmation) or all, commit / amend, switch branches, fetch / pull (fast-forward only) / push
+- **Diffs** side by side or inline. For working-copy changes the right side is the real editor: edit, undo and save right there, with the changes recomputed as you type. **Ignore line endings** (on by default) hides CRLF/LF-only differences
+- **Graph and history**: branch lanes, merges, branch and tag labels in their lane's color. Selecting a commit shows its changed files as a tree with each file's diff (side by side or inline). Right-click a commit or a branch/tag label to check out, create a branch or tag, reset (soft/mixed/hard), cherry-pick, revert, merge, delete a branch, or copy the hash, message, author or ref name. For Subversion, the log and blame are cached so the server isn't asked again, and history times are shown in local time
 - A **background watcher** keeps the Explorer colors and Source Control view up to date when files or the repository change outside the editor
 
 Git runs through your installed `git` (and Subversion through `svn`), so your config, credential helpers, SSH keys and hooks all apply.
@@ -62,9 +68,13 @@ Toggle these from the command palette; they are saved in your user settings.
 | Show minimap | on |
 | Color nested brackets | on |
 | Show outline | on |
-| Restore previous session | on |
+| Restore previous session (each folder's tabs) | on |
+| Reopen last folder at startup (instead of the start page) | off |
 | Format on save | off |
 | Source Control: view as tree | off |
+| Diff: ignore line endings | on |
+| Outline: grouped by kind | on |
+| Tab size | 4 |
 
 ## Language servers
 
@@ -143,14 +153,15 @@ On Linux you need the usual windowing dev packages (see `.github/workflows/build
 | `Ctrl/Cmd+P` | Go to file |
 | `Ctrl/Cmd+Shift+O` | Go to symbol in file |
 | `Ctrl/Cmd+T` | Go to symbol in workspace |
-| `Ctrl/Cmd+F` | Find in file |
+| `Ctrl/Cmd+F` | Find in file (the selection, if any) |
 | `Ctrl/Cmd+H`, `Ctrl/Cmd+Alt+F` | Replace in file |
-| `Ctrl/Cmd+Shift+F` | Search in files |
+| `Ctrl/Cmd+Shift+F` | Search in files (the selection, if any); `Enter` runs a search |
 | `Ctrl/Cmd+click`, `F12` | Go to definition |
 | `Shift+F12` | Find all references |
 | `Ctrl+Space` | Autocomplete |
 | `Alt+O` | Switch between C/C++ source and header |
-| `Alt+Left` (macOS: `Ctrl+-`) | Go back |
+| `Alt+Left` (macOS: `Ctrl+-`), mouse back button | Go back |
+| `Alt+Right` (macOS: `Ctrl+Shift+-`), mouse forward button | Go forward |
 | `Alt+click` | Add a cursor |
 | `Ctrl/Cmd+D` | Select the next occurrence |
 | Middle-click drag | Column selection |

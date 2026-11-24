@@ -43,8 +43,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - The editor is a custom widget (`src/editor/`: `buffer.rs` text model + undo, `fold.rs`, `mod.rs` widget) that lays out only visible lines; don't reintroduce `egui::TextEdit` for code. Its keyboard behavior is covered by headless widget tests in `src/editor/mod.rs` (drive the real widget with injected events). Headless `ctx.run_ui` calls must `textures_delta.clear()` the output, or epaint panics in debug builds.
 - Editor text changes must bump `Doc::version` (use `Doc::reload` / `Doc::mark_saved`): highlighting, blame, dirty state and the gutter are cached per version. Syntax highlighting is incremental (`src/highlight.rs`), not egui_extras' whole-buffer highlighter.
 - VCS calls go through `src/vcs.rs` (Git or Subversion) on background workers; refreshes are driven by the file watcher (`src/watch.rs`), not a timer. `svn` is not installed on the dev Mac: svn code is only unit-tested against sample XML.
+- The release workflow builds macOS on `macos-15-intel` (Apple Silicon runners were often not assigned in time); it still produces the universal app, and the `verify` job runs it on Apple Silicon. A run that fails only because a runner wasn't assigned or `hdiutil` was busy can be re-run with `gh run rerun <id> --failed`.
 - To measure frame times, time `App::ui` temporarily and run the tour against a demo repo containing a ~20k-line file; remove the timer afterwards.
 
+- Paths: use `workspace::canonical` / `workspace::plain_path`, never bare `canonicalize()` for paths that reach the UI, tabs or comparisons: on Windows it returns `\\?\C:\...`, which doesn't match the `C:\...` paths from language servers, dialogs and search, so the same file opened twice.
+- The editor keeps LF text for CRLF files (`Doc::crlf`); anything that compares the buffer with git/svn content must restore or strip CR (`blame::git_with_endings`, the gutter base, the diff "ignore line endings" option).
+- egui matches shortcuts even with extra Shift/Alt held: commands are dispatched most-modifiers-first (`commands::dispatch_order`); don't loop over `COMMANDS` to consume shortcuts.
+- eframe is built with `default-features = false`: keep the `clipboard` feature (without it copy/paste silently stays inside the app).
 - Every spawned process needs `CREATE_NO_WINDOW` on Windows (see `git::cmd`), or a console window flashes.
 - Downloads use ureq with `RootCerts::PlatformVerifier` (OS trust store). Don't switch back to bundled webpki roots: that broke clangd downloads.
 - `rfd` is pinned to `=0.18.0` because Linux portal-failure detection in `app.rs` hooks its internal log target.
