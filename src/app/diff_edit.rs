@@ -291,8 +291,15 @@ impl App {
         if live.tops.0 != left_top || live.tops.1 != right_top {
             ui.ctx().request_repaint();
         }
+        let goto = out.and_then(|o| o.goto);
         if ignore_eol != settings.diff_ignore_eol {
             self.run_command(Command::ToggleSetting(Setting::DiffIgnoreEol));
+        }
+        // Ctrl/Cmd+click in the working copy: go to the definition, from the file's own
+        // tab (the jump and Go back work as in the normal editor).
+        if let Some(idx) = goto {
+            self.active = file;
+            self.go_to_definition(idx, &ui.ctx().clone());
         }
         open_path
     }

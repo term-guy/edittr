@@ -41,6 +41,8 @@ const FALLBACK_POLL: Duration = Duration::from_secs(3);
 const ACTIVITY_POLL: Duration = Duration::from_millis(250);
 const HIGHLIGHT_LIMIT: usize = 1_000_000; // bytes; bigger files are shown as plain text
 type DirEntries = Vec<(PathBuf, bool)>;
+/// A read-only side-by-side selection: (left side?, anchor (row, char), head (row, char)).
+type SbsSelection = (bool, (usize, usize), (usize, usize));
 /// Byte ranges of search-in-files matches in one document.
 type SearchMarks = Arc<Vec<std::ops::Range<usize>>>;
 
@@ -198,6 +200,9 @@ struct DiffTab {
     only_line_endings: bool,
     /// Working-copy change: editable side-by-side view (see diff_edit.rs).
     live: Option<Box<diff_edit::LiveDiff>>,
+    /// Text selected in the side-by-side view (read-only): which side, and
+    /// (row, char) anchor and head.
+    sel: Option<SbsSelection>,
 }
 
 #[derive(Clone)]
@@ -250,6 +255,7 @@ impl DiffTab {
             jump,
             top_row: 0,
             hscroll: 0.0,
+            sel: None,
             source,
             ignore_eol,
             only_line_endings,
@@ -359,6 +365,9 @@ pub struct App {
     tree_requested: HashSet<PathBuf>,
     tree_rx: Option<Receiver<HashMap<PathBuf, DirEntries>>>,
     expanded: HashSet<PathBuf>,
+    /// The file last revealed in the Explorer, and one to scroll into view.
+    explorer_revealed: Option<PathBuf>,
+    explorer_scroll_to: Option<PathBuf>,
     outline: outline::Outline,
 
     status: Status,
@@ -459,6 +468,8 @@ impl App {
             tree_requested: HashSet::new(),
             tree_rx: None,
             expanded: HashSet::new(),
+            explorer_revealed: None,
+            explorer_scroll_to: None,
             outline: Default::default(),
             status: Status::default(),
             status_rx: None,
@@ -537,6 +548,8 @@ impl App {
 
     fn clear_project(&mut self) {
         self.ignored_off.clear();
+        self.explorer_revealed = None;
+        self.explorer_scroll_to = None;
         self.code_navigation = code_navigation::CodeNavigation::default();
         self.root = None;
         self.search.opts.include.clear();
@@ -1992,6 +2005,19 @@ impl App {
             egui::ScrollArea::vertical().show(ui, |ui| self.welcome(ui));
             return;
         };
+        // Switching to another file reveals it in the tree: open its folders, scroll to it.
+        if let Some(Tab::File(doc)) = self.tabs.get(self.active)
+            && self.explorer_revealed.as_ref() != Some(&doc.path)
+        {
+            let path = doc.path.clone();
+            if path.starts_with(&root) {
+                for dir in path.ancestors().skip(1).take_while(|dir| *dir != root) {
+                    self.expanded.insert(dir.to_path_buf());
+                }
+                self.explorer_scroll_to = Some(path.clone());
+            }
+            self.explorer_revealed = Some(path);
+        }
         ui.horizontal(|ui| {
             ui.label(RichText::new(dir_name(&root).to_uppercase()).small().strong());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2184,7 +2210,12 @@ impl App {
                     if let Some(&code) = deco.get(&path) {
                         text = text.color(status_color(code));
                     }
-                    if ui.selectable_label(active_path.as_deref() == Some(&path), text).clicked() {
+                    let row = ui.selectable_label(active_path.as_deref() == Some(&path), text);
+                    if self.explorer_scroll_to.as_ref() == Some(&path) {
+                        row.scroll_to_me(Some(egui::Align::Center));
+                        self.explorer_scroll_to = None;
+                    }
+                    if row.clicked() {
                         *open = Some(path.clone());
                     }
                 }
@@ -3557,6 +3588,17 @@ fn diff_navigation(ui: &mut egui::Ui, d: &mut DiffTab) {
     });
 }
 
+/// Where a side's text is drawn (right of its line numbers).
+fn text_clip_of(half: egui::Rect, gutter: f32) -> egui::Rect {
+    egui::Rect::from_min_max(egui::pos2(half.left() + gutter, half.top()), half.max)
+}
+
+/// The selection band of one row, clipped to the text area.
+fn painter_sel(ui: &egui::Ui, clip: egui::Rect, origin: egui::Pos2, x0: f32, x1: f32, half: egui::Rect, color: Color32) {
+    let band = egui::Rect::from_x_y_ranges(origin.x + x0..=origin.x + x1, half.y_range());
+    ui.painter_at(clip).rect_filled(band, 0.0, color);
+}
+
 fn side_by_side_view(ui: &mut egui::Ui, d: &mut DiffTab) {
     use crate::diff::Kind;
     use egui::text::CCursor;
@@ -3589,10 +3631,17 @@ fn side_by_side_view(ui: &mut egui::Ui, d: &mut DiffTab) {
     }
     let mut widest = 0.0f32;
     let mut half_w = 0.0f32;
+    // Selection (read-only): press starts it on one side, dragging extends it.
+    let focus_id = ui.make_persistent_id("sbs-selection");
+    let (pressed, down, pointer) = ui.input(|i| (i.pointer.primary_pressed(), i.pointer.primary_down(), i.pointer.interact_pos()));
+    let mut sel = d.sel;
+    let sel_color = ui.visuals().selection.bg_fill.gamma_multiply(0.6);
     let out = area.show_rows(ui, row_h, d.sbs.rows.len(), |ui, range| {
         let full = ui.available_width();
         half_w = (full - 1.0) / 2.0;
-        for row in &d.sbs.rows[range] {
+        let first = range.start;
+        for (offset, row) in d.sbs.rows[range].iter().enumerate() {
+            let index = first + offset;
             let (rect, _) = ui.allocate_exact_size(egui::vec2(full, row_h), egui::Sense::hover());
             if let Kind::Gap(n) = row.kind {
                 ui.painter().rect_filled(rect, 0.0, empty_bg);
@@ -3638,6 +3687,27 @@ fn side_by_side_view(ui: &mut egui::Ui, d: &mut DiffTab) {
                 let text_clip = egui::Rect::from_min_max(egui::pos2(half.left() + gutter, half.top()), half.max);
                 let painter = ui.painter_at(text_clip);
                 let origin = egui::pos2(half.left() + gutter - d.hscroll, half.center().y - galley.size().y / 2.0);
+                // Pointer on this side's text: start or extend the selection.
+                if let Some(p) = pointer.filter(|p| half.contains(*p) && ui.is_rect_visible(half)) {
+                    let at = (index, galley.cursor_from_pos(p - origin).index.0);
+                    if pressed {
+                        sel = Some((is_left, at, at));
+                        ui.memory_mut(|m| m.request_focus(focus_id));
+                    } else if down && let Some((left, anchor, _)) = sel.filter(|s| s.0 == is_left) {
+                        sel = Some((left, anchor, at));
+                    }
+                }
+                if let Some((_, a, b)) = sel.filter(|s| s.0 == is_left) {
+                    let (start, end) = if a <= b { (a, b) } else { (b, a) };
+                    if (start.0..=end.0).contains(&index) && start != end {
+                        let len = side.text.chars().count();
+                        let from = if index == start.0 { start.1 } else { 0 };
+                        let to = if index == end.0 { end.1 } else { len };
+                        let x0 = galley.pos_from_cursor(CCursor::new(from)).min.x;
+                        let x1 = galley.pos_from_cursor(CCursor::new(to.min(len))).min.x + if index < end.0 { 6.0 } else { 0.0 };
+                        painter_sel(ui, text_clip_of(half, gutter), origin, x0, x1, half, sel_color);
+                    }
+                }
                 if let Some(r) = side.hl.as_ref().filter(|r| !r.is_empty()) {
                     let x0 = galley.pos_from_cursor(CCursor::new(r.start)).min.x;
                     let x1 = galley.pos_from_cursor(CCursor::new(r.end)).min.x;
@@ -3653,6 +3723,31 @@ fn side_by_side_view(ui: &mut egui::Ui, d: &mut DiffTab) {
         }
     });
     d.top_row = (out.state.clamped_offset().y / row_h) as usize;
+    // Ctrl/Cmd+C copies the selected lines of that side.
+    if let Some((left, a, b)) = sel
+        && a != b
+        // Ctrl/Cmd+C is ours unless a text field (or the editor) has the focus.
+        && ui.memory(|m| m.focused().is_none_or(|id| id == focus_id))
+        && ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Copy)))
+    {
+        let (start, end) = if a <= b { (a, b) } else { (b, a) };
+        let mut text = Vec::new();
+        for index in start.0..=end.0 {
+            let Some(row) = d.sbs.rows.get(index) else { break };
+            let Some(side) = (if left { &row.left } else { &row.right }) else {
+                continue;
+            };
+            let chars: Vec<char> = side.text.chars().collect();
+            let from = if index == start.0 { start.1.min(chars.len()) } else { 0 };
+            let to = if index == end.0 { end.1.min(chars.len()) } else { chars.len() };
+            text.push(chars[from.min(to)..to].iter().collect::<String>());
+        }
+        ui.ctx().copy_text(text.join("\n"));
+    }
+    if pressed && pointer.is_some_and(|p| !out.inner_rect.contains(p)) {
+        sel = None; // a click elsewhere drops the selection
+    }
+    d.sel = sel;
     // Horizontal scrolling moves both sides together.
     if ui.rect_contains_pointer(out.inner_rect) {
         let dx = ui.input(|i| i.smooth_scroll_delta.x);
