@@ -1550,7 +1550,8 @@ pub fn comment_token(ext: &str) -> Option<&'static str> {
 
 /// Indent unit for a text: a tab if most indented lines start with a tab, otherwise
 /// the most common small step of leading spaces (2 or 4; default 4).
-pub fn detect_indent(text: &str) -> String {
+/// The file's indentation unit; `default` spaces when the file doesn't show one.
+pub fn detect_indent(text: &str, default: usize) -> String {
     let (mut tabs, mut spaces) = (0, 0);
     let mut steps = [0usize; 9];
     let mut prev = 0usize;
@@ -1574,6 +1575,9 @@ pub fn detect_indent(text: &str) -> String {
     }
     if tabs > spaces {
         return "\t".into();
+    }
+    if steps.iter().all(|&n| n == 0) {
+        return " ".repeat(default);
     }
     let best = if steps[2] > steps[4] { 2 } else { 4 };
     " ".repeat(best)
@@ -1754,9 +1758,11 @@ mod tests {
 
     #[test]
     fn indent_detection_and_comment_tokens() {
-        assert_eq!(detect_indent("fn a() {\n  b();\n  if x {\n    c();\n  }\n}"), "  ");
-        assert_eq!(detect_indent("fn a() {\n    b();\n}"), "    ");
-        assert_eq!(detect_indent("a:\n\tb\n\tc"), "\t");
+        assert_eq!(detect_indent("fn a() {\n  b();\n  if x {\n    c();\n  }\n}", 8), "  ");
+        assert_eq!(detect_indent("fn a() {\n    b();\n}", 8), "    ");
+        assert_eq!(detect_indent("a:\n\tb\n\tc", 8), "\t");
+        // No indentation to go by: the tab size setting.
+        assert_eq!(detect_indent("a\nb\n", 2), "  ");
         assert_eq!(comment_token("rs"), Some("//"));
         assert_eq!(comment_token("py"), Some("#"));
         assert_eq!(comment_token("md"), None);

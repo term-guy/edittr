@@ -31,6 +31,9 @@ pub(crate) struct Settings {
     pub(crate) restore_previous_session: bool,
     /// Start in the last folder instead of the start page (when no folder is given).
     pub(crate) reopen_last_folder: bool,
+    /// Width of a tab character, and the spaces Tab inserts in files without an
+    /// indentation style of their own.
+    pub(crate) tab_size: usize,
 }
 
 impl Default for Settings {
@@ -50,6 +53,7 @@ impl Default for Settings {
             outline_collapsed_groups: CollapsedGroups::default(),
             restore_previous_session: true,
             reopen_last_folder: false,
+            tab_size: 4,
         }
     }
 }
@@ -99,6 +103,14 @@ impl Settings {
     fn parse(text: &str) -> Self {
         let mut settings = Self::default();
         for (key, value) in text.lines().filter_map(entry) {
+            if key == "tab_size" {
+                if let Ok(n) = value.parse::<usize>()
+                    && (1..=16).contains(&n)
+                {
+                    settings.tab_size = n;
+                }
+                continue;
+            }
             if key == "outline_collapsed_groups" {
                 let mut collapsed = CollapsedGroups::default();
                 for group in Group::ALL {
@@ -146,6 +158,7 @@ impl Settings {
                         | "bracket_colors"
                         | "restore_previous_session"
                         | "reopen_last_folder"
+                        | "tab_size"
                         | "format_on_save"
                         | "show_outline"
                         | "outline_expanded"
@@ -167,6 +180,7 @@ impl Settings {
         text.push_str(&format!("bracket_colors={}\n", self.bracket_colors));
         text.push_str(&format!("restore_previous_session={}\n", self.restore_previous_session));
         text.push_str(&format!("reopen_last_folder={}\n", self.reopen_last_folder));
+        text.push_str(&format!("tab_size={}\n", self.tab_size));
         text.push_str(&format!("format_on_save={}\n", self.format_on_save));
         text.push_str(&format!("show_outline={}\n", self.show_outline));
         text.push_str(&format!("outline_expanded={}\n", self.outline_expanded));
@@ -301,7 +315,7 @@ mod tests {
         let text = settings.format(previous);
         assert_eq!(
             text,
-            "future_key=one=two\nfuture_key = three\n# A comment\nchanges_tree=false\nhighlight_line=false\nshow_whitespace=false\ndiff_ignore_eol=true\ninline_blame=true\nminimap=true\nbracket_colors=true\nrestore_previous_session=true\nreopen_last_folder=false\nformat_on_save=false\nshow_outline=true\noutline_expanded=true\noutline_grouped=true\noutline_collapsed_groups=\n"
+            "future_key=one=two\nfuture_key = three\n# A comment\nchanges_tree=false\nhighlight_line=false\nshow_whitespace=false\ndiff_ignore_eol=true\ninline_blame=true\nminimap=true\nbracket_colors=true\nrestore_previous_session=true\nreopen_last_folder=false\ntab_size=4\nformat_on_save=false\nshow_outline=true\noutline_expanded=true\noutline_grouped=true\noutline_collapsed_groups=\n"
         );
         assert!(!Settings::parse(&text).changes_tree);
     }
@@ -347,6 +361,25 @@ mod tests {
     fn missing_or_invalid_value_enables_line_highlight() {
         assert!(Settings::parse("changes_tree=true").highlight_line);
         assert!(Settings::parse("highlight_line=maybe").highlight_line);
+    }
+
+    #[test]
+    fn tab_size_defaults_to_four_and_rejects_nonsense() {
+        assert_eq!(Settings::parse("").tab_size, 4);
+        for (text, n) in [
+            ("tab_size=2", 2),
+            ("tab_size=8", 8),
+            ("tab_size=0", 4),
+            ("tab_size=99", 4),
+            ("tab_size=x", 4),
+        ] {
+            assert_eq!(Settings::parse(text).tab_size, n, "{text}");
+        }
+        let settings = Settings {
+            tab_size: 2,
+            ..Settings::default()
+        };
+        assert_eq!(Settings::parse(&settings.format("")).tab_size, 2);
     }
 
     #[test]

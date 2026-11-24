@@ -37,8 +37,12 @@ pub const X: &str = "\u{E4F6}";
 pub const COLUMNS: &str = "\u{E1E2}";
 pub const ROWS: &str = "\u{E5A2}";
 
-pub fn install(ctx: &eframe::egui::Context) {
+/// Fonts with the Phosphor icons; `tab_size` is how many spaces wide a tab is drawn.
+pub fn install(ctx: &eframe::egui::Context, tab_size: usize) {
     let mut fonts = FontDefinitions::default();
+    for data in fonts.font_data.values_mut() {
+        Arc::make_mut(data).tweak.tab_size = tab_size as f32;
+    }
     fonts.font_data.insert(
         "phosphor".into(),
         Arc::new(FontData::from_static(include_bytes!("../assets/Phosphor.ttf"))),
@@ -72,5 +76,23 @@ mod tests {
             });
         });
         full.textures_delta.clear(); // no renderer here (epaint asserts on dropped deltas in debug)
+    }
+
+    #[test]
+    fn tab_size_sets_the_drawn_width_of_a_tab() {
+        for n in [2usize, 8] {
+            let ctx = Context::default();
+            install(&ctx, n);
+            let mut full = ctx.run_ui(Default::default(), |ui| {
+                let width = |text: &str| {
+                    ui.fonts_mut(|f| f.layout_no_wrap(text.into(), FontId::monospace(14.0), eframe::egui::Color32::WHITE))
+                        .size()
+                        .x
+                };
+                let (tab, spaces) = (width("\tx"), width(&format!("{}x", " ".repeat(n))));
+                assert!((tab - spaces).abs() < 0.5, "tab size {n}: tab {tab} vs spaces {spaces}");
+            });
+            full.textures_delta.clear();
+        }
     }
 }

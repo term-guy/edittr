@@ -429,7 +429,7 @@ impl App {
         settings_writer: SettingsWriter,
         session_writer: Option<Writer>,
     ) -> Self {
-        ic::install(&cc.egui_ctx);
+        ic::install(&cc.egui_ctx, settings.tab_size);
         highlight::warm_up();
         cc.egui_ctx.global_style_mut(|s| {
             s.spacing.item_spacing.y = 3.0;
@@ -1114,7 +1114,7 @@ impl App {
             .or_else(|| path.file_name())
             .map(|e| e.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let indent = editor::detect_indent(&text);
+        let indent = editor::detect_indent(&text, self.settings.tab_size);
         let comment = editor::comment_token(&lang.to_lowercase());
         self.tabs.push(Tab::File(Doc {
             id: self.next_doc_id,
@@ -1295,6 +1295,18 @@ impl App {
         } else {
             self.active - removed_before_active
         };
+    }
+
+    /// Tab width (drawn) and the default indent for files without one of their own.
+    fn set_tab_size(&mut self, n: usize) {
+        let n = n.clamp(1, 16);
+        if self.settings.tab_size == n {
+            return;
+        }
+        self.settings.tab_size = n;
+        ic::install(&self.ctx, n);
+        self.save_settings(&self.ctx.clone());
+        self.message = format!("Tab size: {n}");
     }
 
     fn show_search(&mut self) {
@@ -2738,6 +2750,7 @@ impl App {
         let activity = self.background_activity(server);
         let mut open_problems = false;
         let mut open_c_settings = false;
+        let mut set_tab_size = None;
         ui.horizontal(|ui| {
             if self.repo.is_some() {
                 let branch = format!("{} {} {}", ic::GIT_BRANCH, self.status.branch, self.status.ahead_behind);
@@ -2785,6 +2798,16 @@ impl App {
                             open_c_settings = true;
                         }
                     }
+                    // Tab size: click to change.
+                    let tab_size = self.settings.tab_size;
+                    ui.menu_button(RichText::new(format!("Tab size: {tab_size}")).weak(), |ui| {
+                        for n in 1..=8 {
+                            if ui.radio(tab_size == n, n.to_string()).clicked() {
+                                set_tab_size = Some(n);
+                                ui.close();
+                            }
+                        }
+                    });
                     let (line, col) = doc.line_col();
                     ui.add(egui::Label::new(RichText::new(format!("Ln {}, Col {}", line + 1, col + 1)).weak()).truncate());
                 }
@@ -2822,6 +2845,9 @@ impl App {
         }
         if open_c_settings {
             self.open_c_settings();
+        }
+        if let Some(n) = set_tab_size {
+            self.set_tab_size(n);
         }
     }
 

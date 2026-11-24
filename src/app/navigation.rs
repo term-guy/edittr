@@ -313,6 +313,7 @@ impl App {
                 egui::Theme::Dark => egui::Theme::Light,
                 egui::Theme::Light => egui::Theme::Dark,
             }),
+            Command::TabSize(n) => self.set_tab_size(n),
             Command::ToggleSetting(setting) => {
                 let value = setting.value(&mut self.settings);
                 *value = !*value;

@@ -32,6 +32,7 @@ pub(crate) enum Command {
     CSettings,
     GenerateCompileDatabase,
     ToggleSetting(Setting),
+    TabSize(usize),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -208,6 +209,9 @@ pub(crate) const COMMANDS: &[Entry] = &[
     Entry::new(ToggleSetting(Setting::Minimap), "Toggle minimap", &[]),
     Entry::new(ToggleSetting(Setting::BracketColors), "Toggle bracket pair colors", &[]),
     Entry::new(ToggleSetting(Setting::ShowOutline), "Show outline", &[]),
+    Entry::new(TabSize(2), "Tab size: 2", &[]),
+    Entry::new(TabSize(4), "Tab size: 4", &[]),
+    Entry::new(TabSize(8), "Tab size: 8", &[]),
     Entry::new(CSettings, "C/C++: Compile flags and build settings", &[]),
     Entry::new(GenerateCompileDatabase, "C/C++: Generate compile database", &[]),
     Entry::new(
