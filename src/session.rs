@@ -160,6 +160,7 @@ fn read<T: serde::de::DeserializeOwned>(filename: &str) -> Option<T> {
 pub(crate) enum Update {
     Workspace(Option<PathBuf>, Workspace),
     Window(Window),
+    SearchFilters(PathBuf, crate::workspace::SearchFilters),
 }
 
 impl Update {
@@ -167,6 +168,7 @@ impl Update {
         let (filename, json) = match self {
             Self::Workspace(root, data) => (workspace_filename(root.as_deref()), serde_json::to_string(&data)?),
             Self::Window(data) => ("window.json".into(), serde_json::to_string(&data)?),
+            Self::SearchFilters(root, filters) => return crate::workspace::save_search_filters(&root, &filters),
         };
         crate::workspace::write_config(&dir.join(filename), &json)
     }

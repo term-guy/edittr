@@ -1,15 +1,19 @@
 use super::{App, Confirm, DiskText, Tab, background, read_doc_text, receive, save_recent};
 use crate::session::{Debounce, Decision, FileTab, Side, Sidebar, Startup, Update, Window, Workspace, Writer};
-use crate::workspace;
+use crate::workspace::{self, SearchFilters};
 use eframe::egui;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+const SEARCH_FILTER_DEBOUNCE: Duration = Duration::from_millis(500);
 
 pub(super) struct Sessions {
     writer: Option<Writer>,
     loading: Option<Receiver<LoadedWorkspace>>,
     workspace: Debounce<Workspace>,
+    saved_filters: SearchFilters,
+    pending_filters: Option<(SearchFilters, Instant)>,
     window: Window,
     saved_window: Debounce<Window>,
     width: f32,
@@ -19,6 +23,7 @@ pub(super) struct Sessions {
 struct LoadedWorkspace {
     root: Option<PathBuf>,
     ignored: Vec<String>,
+    search_filters: SearchFilters,
     sidebar: Sidebar,
     tabs: Vec<(FileTab, DiskText)>,
     active: Option<PathBuf>,
@@ -69,9 +74,11 @@ impl LoadedWorkspace {
             }
         }
         let ignored = root.as_deref().map(workspace::load_ignored).unwrap_or_default();
+        let search_filters = root.as_deref().map(workspace::load_search_filters).unwrap_or_default();
         Self {
             root,
             ignored,
+            search_filters,
             sidebar: snapshot.sidebar,
             tabs,
             active,
@@ -86,6 +93,8 @@ impl Sessions {
             writer,
             loading: None,
             workspace: Debounce::new(Some(Workspace::default())),
+            saved_filters: SearchFilters::default(),
+            pending_filters: None,
             saved_window: Debounce::new(Some(window.clone())),
             window,
             width: Sidebar::default().width,
@@ -116,7 +125,9 @@ impl App {
         }
         if !crate::session::enabled() {
             let ignored = workspace::load_ignored(&root);
+            let search_filters = workspace::load_search_filters(&root);
             self.activate_root(root, ignored);
+            self.apply_search_filters(search_filters);
         } else if self.tabs.iter().any(|tab| matches!(tab, Tab::File(doc) if doc.dirty())) {
             self.confirm = Some(Confirm::SwitchWorkspace(root));
         } else {
@@ -127,7 +138,9 @@ impl App {
     pub(super) fn restore_workspace(&mut self, root: Option<PathBuf>, file: Option<PathBuf>) {
         // Queue the outgoing snapshot before reading the incoming one. The barrier
         // also covers a quick return to a workspace whose last save is still queued.
-        self.save_workspace_session(Instant::now(), true);
+        let now = Instant::now();
+        self.save_workspace_session(now, true);
+        self.save_search_filters(now, true);
         let pending = self.sessions.writer.as_ref().map(Writer::after_pending_writes);
         let recent = root.as_ref().map(|root| {
             self.recent.retain(|r| r != root);
@@ -152,7 +165,10 @@ impl App {
             self.active = 0;
             if let Some(root) = loaded.root {
                 self.activate_root(root, loaded.ignored);
+            } else {
+                self.clear_project();
             }
+            self.apply_search_filters(loaded.search_filters);
             self.side = loaded.sidebar.side;
             self.side_open = loaded.sidebar.open;
             self.sessions.width = loaded.sidebar.width.max(160.0);
@@ -212,6 +228,7 @@ impl App {
         let now = Instant::now();
         self.sessions.window.geometry.capture(&self.ctx);
         self.save_workspace_session(now, flush);
+        self.save_search_filters(now, flush);
         let writer = self.sessions.writer.as_ref().unwrap();
         match self.sessions.saved_window.update(self.sessions.window.clone(), now, flush) {
             Decision::Unchanged => {}
@@ -221,6 +238,44 @@ impl App {
         if let Some(error) = writer.errors.try_iter().last() {
             self.message = format!("Could not save session: {error}");
         }
+    }
+
+    fn apply_search_filters(&mut self, filters: SearchFilters) {
+        self.search.opts.include.clone_from(&filters.include);
+        self.search.opts.exclude.clone_from(&filters.exclude);
+        self.search.show_filters = !filters.include.is_empty() || !filters.exclude.is_empty();
+        self.sessions.saved_filters = filters;
+        self.sessions.pending_filters = None;
+    }
+
+    fn save_search_filters(&mut self, now: Instant, flush: bool) {
+        let (Some(writer), Some(root)) = (&self.sessions.writer, &self.root) else {
+            return;
+        };
+        let opts = &self.search.opts;
+        let matches = |filters: &SearchFilters| filters.include == opts.include && filters.exclude == opts.exclude;
+        if matches(&self.sessions.saved_filters) {
+            self.sessions.pending_filters = None;
+            return;
+        }
+        let pending = &mut self.sessions.pending_filters;
+        if pending.as_ref().is_none_or(|(filters, _)| !matches(filters)) {
+            *pending = Some((
+                SearchFilters {
+                    include: opts.include.clone(),
+                    exclude: opts.exclude.clone(),
+                },
+                now,
+            ));
+        }
+        let elapsed = now.duration_since(pending.as_ref().unwrap().1);
+        if !flush && elapsed < SEARCH_FILTER_DEBOUNCE {
+            self.ctx.request_repaint_after(SEARCH_FILTER_DEBOUNCE - elapsed);
+            return;
+        }
+        let (filters, _) = pending.take().unwrap();
+        writer.save(Update::SearchFilters(root.clone(), filters.clone()), &self.ctx);
+        self.sessions.saved_filters = filters;
     }
 
     fn save_workspace_session(&mut self, now: Instant, flush: bool) {

@@ -1,5 +1,6 @@
 use std::io::{self, ErrorKind, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 fn config_file(root: &str) -> Option<PathBuf> {
@@ -23,18 +24,25 @@ pub fn load_ignored(root: &Path) -> Vec<String> {
 }
 
 pub fn save_ignored(root: &Path, list: &[String]) {
+    let _ = update_config(root, |root, config| format_config(root, list, &config.unknown));
+}
+
+fn update_config(root: &Path, format: impl FnOnce(&str, &Config<'_>) -> String) -> io::Result<()> {
     if cfg!(feature = "tour") && std::env::var_os("EDITTR_TOUR_OUT").is_some() {
-        return;
+        return Ok(());
     }
     let root = root.to_string_lossy();
-    let Some(path) = config_file(&root) else { return };
+    let Some(path) = config_file(&root) else { return Ok(()) };
+    // Keep read-modify-write updates ordered across the UI and session writer.
+    static CONFIG_UPDATE: Mutex<()> = Mutex::new(());
+    let _guard = CONFIG_UPDATE.lock().unwrap();
     let existing = match std::fs::read_to_string(&path) {
         Ok(text) => text,
         Err(err) if err.kind() == ErrorKind::NotFound => String::new(),
-        Err(_) => return,
+        Err(err) => return Err(err),
     };
-    let Some(config) = parse(&root, &existing) else { return };
-    let _ = write_config(&path, &format_config(&root, list, &config.unknown));
+    let Some(config) = parse(&root, &existing) else { return Ok(()) };
+    write_config(&path, &format(&root, &config))
 }
 
 /// Per-workspace C/C++ settings (stored as `c.<key>=` lines in the workspace file).
@@ -70,36 +78,66 @@ pub(crate) fn load_c_settings(root: &Path) -> CSettings {
 }
 
 pub(crate) fn save_c_settings(root: &Path, settings: &CSettings) {
-    if cfg!(feature = "tour") && std::env::var_os("EDITTR_TOUR_OUT").is_some() {
-        return;
-    }
-    let root = root.to_string_lossy();
-    let Some(path) = config_file(&root) else { return };
-    let existing = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(err) if err.kind() == ErrorKind::NotFound => String::new(),
-        Err(_) => return,
-    };
-    let Some(config) = parse(&root, &existing) else { return };
-    let _ = write_config(&path, &format_with_c(&root, &config, settings));
+    let _ = update_config(root, |root, config| format_with_c(root, config, settings));
 }
 
 fn format_with_c(root: &str, config: &Config, settings: &CSettings) -> String {
-    let one_line = |v: &str| v.replace(['\r', '\n'], " ").trim().to_owned();
-    let values = [one_line(&settings.flags), one_line(&settings.compiler), one_line(&settings.build)];
-    let c_lines: Vec<String> = C_KEYS
+    format_with_settings(root, config, C_KEYS, [&settings.flags, &settings.compiler, &settings.build])
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SearchFilters {
+    pub include: String,
+    pub exclude: String,
+}
+
+const SEARCH_KEYS: [&str; 2] = ["search.include=", "search.exclude="];
+
+pub(crate) fn load_search_filters(root: &Path) -> SearchFilters {
+    let root = root.to_string_lossy();
+    let text = config_file(&root)
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .unwrap_or_default();
+    parse(&root, &text).map(|config| parse_search_filters(&config)).unwrap_or_default()
+}
+
+fn parse_search_filters(config: &Config<'_>) -> SearchFilters {
+    let mut filters = SearchFilters::default();
+    for line in &config.unknown {
+        if let Some(value) = line.strip_prefix(SEARCH_KEYS[0]) {
+            filters.include = value.to_owned();
+        } else if let Some(value) = line.strip_prefix(SEARCH_KEYS[1]) {
+            filters.exclude = value.to_owned();
+        }
+    }
+    filters
+}
+
+pub(crate) fn save_search_filters(root: &Path, filters: &SearchFilters) -> io::Result<()> {
+    update_config(root, |root, config| format_with_search_filters(root, config, filters))
+}
+
+fn format_with_search_filters(root: &str, config: &Config, filters: &SearchFilters) -> String {
+    format_with_settings(root, config, SEARCH_KEYS, [&filters.include, &filters.exclude])
+}
+
+fn format_with_settings<const N: usize>(root: &str, config: &Config, keys: [&str; N], values: [&str; N]) -> String {
+    let lines: Vec<_> = keys
         .iter()
-        .zip(&values)
-        .filter(|(_, v)| !v.is_empty())
-        .map(|(k, v)| format!("{k}{v}"))
+        .zip(values)
+        .filter_map(|(key, value)| {
+            let one_line = value.replace(['\r', '\n'], " ");
+            let value = one_line.trim();
+            (!value.is_empty()).then(|| format!("{key}{value}"))
+        })
         .collect();
     let mut unknown: Vec<&str> = config
         .unknown
         .iter()
         .copied()
-        .filter(|l| !C_KEYS.iter().any(|k| l.starts_with(k)))
+        .filter(|line| !keys.iter().any(|key| line.starts_with(key)))
         .collect();
-    unknown.extend(c_lines.iter().map(String::as_str));
+    unknown.extend(lines.iter().map(String::as_str));
     format_config(root, &config.ignored, &unknown)
 }
 
@@ -226,5 +264,45 @@ mod tests {
         );
         let cleared = format_with_c(root, &parse(root, &text).unwrap(), &CSettings::default());
         assert_eq!(cleared, "root=/home/user/project\nignore=vendor\nfuture=1\n");
+    }
+
+    #[test]
+    fn search_filters_round_trip_and_clear_next_to_other_settings() {
+        let root = "/home/user/project";
+        let other = concat!(
+            "root=/home/user/project\n",
+            "ignore=vendor\n",
+            "c.flags=-DDEBUG\n",
+            "c.compiler=clang\n",
+            "c.build=make all\n",
+            "# comment\n",
+            "search.future=1\n",
+        );
+        let original = format!("{other}search.include=*.old\nsearch.exclude=tmp/**\n");
+        let filters = SearchFilters {
+            include: "*.c, src/**/*.h".into(),
+            exclude: "*.min.js, path with spaces/**".into(),
+        };
+        let saved = format_with_search_filters(root, &parse(root, &original).unwrap(), &filters);
+        assert_eq!(
+            saved,
+            format!("{other}search.include=*.c, src/**/*.h\nsearch.exclude=*.min.js, path with spaces/**\n")
+        );
+        let config = parse(root, &saved).unwrap();
+        assert_eq!(parse_search_filters(&config), filters);
+        let cleared = format_with_search_filters(root, &config, &SearchFilters::default());
+        assert_eq!(cleared, other);
+        assert_eq!(parse_search_filters(&parse(root, &cleared).unwrap()), SearchFilters::default());
+    }
+
+    #[test]
+    fn search_filter_values_stay_on_one_line() {
+        let root = "/home/user/project";
+        let filters = SearchFilters {
+            include: "*.c,\nsrc/**/*.h".into(),
+            exclude: "\r\n".into(),
+        };
+        let text = format_with_search_filters(root, &Config::default(), &filters);
+        assert_eq!(text, "root=/home/user/project\nsearch.include=*.c, src/**/*.h\n");
     }
 }

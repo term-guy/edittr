@@ -503,6 +503,9 @@ impl App {
     fn clear_project(&mut self) {
         self.code_navigation = code_navigation::CodeNavigation::default();
         self.root = None;
+        self.search.opts.include.clear();
+        self.search.opts.exclude.clear();
+        self.search.show_filters = false;
         self.watcher = None;
         self.update_repository(None);
         self.repo_rx = None;
