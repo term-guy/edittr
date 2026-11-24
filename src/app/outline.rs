@@ -185,12 +185,21 @@ impl App {
                             ui.allocate_space(egui::vec2(row_height, row_height));
                         }
                         let details = format!("{}  {}", symbol.kind, symbol.line.saturating_add(1));
-                        let button = egui::Button::selectable(selected == Some(index), &symbol.name)
-                            .shortcut_text(RichText::new(&details).small())
-                            .truncate();
+                        let selected = selected == Some(index);
+                        let (button, tooltip) = if let Some(detail) = &symbol.detail {
+                            (
+                                egui::Button::selectable(selected, (&symbol.name, RichText::new(detail).small().weak())),
+                                format!("{}  {detail}\n{details}", symbol.name),
+                            )
+                        } else {
+                            (
+                                egui::Button::selectable(selected, &symbol.name).shortcut_text(RichText::new(&details).small()),
+                                format!("{}  ({details})", symbol.name),
+                            )
+                        };
                         if ui
-                            .add_sized([ui.available_width(), row_height], button)
-                            .on_hover_text(format!("{}  ({details})", symbol.name))
+                            .add_sized([ui.available_width(), row_height], button.truncate())
+                            .on_hover_text(tooltip)
                             .clicked()
                         {
                             reveal = Some(index);

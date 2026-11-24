@@ -118,9 +118,13 @@ pub struct Location {
 /// Document id and edit version, ordered across reopening the same file.
 pub type Revision = (u64, u64);
 
+type Position = (usize, usize);
+
 pub(crate) struct Symbol {
     pub(crate) name: String,
     pub(crate) kind: &'static str,
+    pub(crate) detail: Option<String>,
+    pub(crate) range: Option<std::ops::Range<Position>>,
     pub(crate) container: Option<String>,
     pub(crate) location: Location,
     pub(crate) lines: std::ops::RangeInclusive<usize>,
@@ -960,6 +964,8 @@ fn collect_symbols(value: &Value, document: Option<&Path>, parent: Option<&str>,
             out.push(Symbol {
                 name: name.to_owned(),
                 kind: symbol_kind(item["kind"].as_u64()),
+                detail: document.and_then(|_| item["detail"].as_str()).map(str::to_owned),
+                range: document.and_then(|_| Some(symbol_position(&range["start"])?..symbol_position(&range["end"])?)),
                 container: item["containerName"].as_str().or(parent).map(str::to_owned),
                 lines: symbol_lines(range, location.line),
                 location,
@@ -969,6 +975,13 @@ fn collect_symbols(value: &Value, document: Option<&Path>, parent: Option<&str>,
             collect_symbols(&item["children"], document, name.or(parent), out);
         }
     }
+}
+
+fn symbol_position(value: &Value) -> Option<Position> {
+    Some((
+        usize::try_from(value["line"].as_u64()?).ok()?,
+        usize::try_from(value["character"].as_u64()?).ok()?,
+    ))
 }
 
 fn symbol_lines(range: &Value, selection_line: usize) -> std::ops::RangeInclusive<usize> {

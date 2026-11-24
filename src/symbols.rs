@@ -5,6 +5,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+mod c_family;
+
 pub(crate) const LIMIT: usize = 200;
 const TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -37,6 +39,7 @@ pub(crate) fn selection(text: &str, line: usize, cols: Columns) -> (usize, usize
 pub(crate) struct Symbol {
     pub(crate) name: String,
     pub(crate) kind: String,
+    pub(crate) detail: Option<String>,
     pub(crate) container: Option<String>,
     pub(crate) path: PathBuf,
     /// Location of the symbol name, used for navigation.
@@ -52,6 +55,7 @@ impl Symbol {
         Self {
             name: def.name.to_owned(),
             kind: def.kind.to_owned(),
+            detail: None,
             container: None,
             path: path.to_path_buf(),
             line: def.line,
@@ -65,6 +69,7 @@ impl Symbol {
         Self {
             name: def.name.clone(),
             kind: def.kind.clone(),
+            detail: None,
             container: None,
             path: path.to_path_buf(),
             line: def.line,
@@ -80,6 +85,7 @@ impl From<lsp::Symbol> for Symbol {
         Self {
             name: symbol.name,
             kind: symbol.kind.to_owned(),
+            detail: None,
             container: symbol.container,
             path: symbol.location.path,
             line: symbol.location.line,
@@ -108,9 +114,11 @@ pub(crate) fn document(
     {
         return Vec::new();
     }
-    if let Some(client) = client
-        && let Ok(symbols) = client.document_symbols(path, text, revision, TIMEOUT)
-    {
+    let symbols = client.and_then(|client| client.document_symbols(path, text, revision, TIMEOUT).ok());
+    if let Some(header) = c_family::header(path) {
+        return c_family::document(path, text, header, symbols);
+    }
+    if let Some(symbols) = symbols {
         let symbols = document_symbols(path, symbols);
         if !symbols.is_empty() {
             return symbols;
