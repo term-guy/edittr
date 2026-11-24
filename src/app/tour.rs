@@ -177,8 +177,7 @@ impl Tour {
         let demo = self.demo.clone();
         match name {
             "welcome" => {
-                app.root = None;
-                app.ignored.clear();
+                app.clear_project();
                 app.recent = vec![demo.clone()];
                 app.side = Side::Explorer;
             }

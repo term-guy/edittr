@@ -17,6 +17,7 @@ mod settings;
 mod svn;
 mod tree;
 pub mod vcs;
+mod watch;
 mod workspace;
 
 use std::path::PathBuf;

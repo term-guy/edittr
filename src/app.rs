@@ -7,6 +7,7 @@ use crate::icons as ic;
 use crate::search::{self, FileHits};
 use crate::settings::{Settings, SettingsWriter};
 use crate::vcs::{self, FileChange, Status, Vcs};
+use crate::watch::{Changes, IGNORED_DIRS, Watcher};
 use crate::{blame, highlight};
 use crate::{goto, installer, lsp, workspace};
 use eframe::egui::{self, Color32, Key, KeyboardShortcut, Modifiers, RichText};
@@ -29,12 +30,14 @@ const GO_BACK: KeyboardShortcut = KeyboardShortcut::new(Modifiers::CTRL, Key::Mi
 #[cfg(not(target_os = "macos"))]
 const GO_BACK: KeyboardShortcut = KeyboardShortcut::new(Modifiers::ALT, Key::ArrowLeft);
 const COMMIT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Enter);
-const STATUS_POLL: Duration = Duration::from_secs(3);
+const SAFETY_POLL: Duration = Duration::from_secs(30);
+const FALLBACK_POLL: Duration = Duration::from_secs(3);
 const ACTIVITY_POLL: Duration = Duration::from_millis(250);
 const HIGHLIGHT_LIMIT: usize = 1_000_000; // bytes; bigger files are shown as plain text
-const IGNORED_DIRS: &[&str] = &[".git", ".svn", "node_modules", "target", ".venv", "__pycache__", "dist", "build"];
+type DirEntries = Vec<(PathBuf, bool)>;
 
 struct Doc {
+    id: u64,
     path: PathBuf,
     text: String,
     saved: String,
@@ -92,8 +95,11 @@ struct InstallJob {
 }
 
 struct VcsRefresh {
-    status: Result<Status, String>,
+    repository: DetectedRepo,
+    status: Option<Result<Status, String>>,
     branches: Vec<String>,
+    refresh_git_history: bool,
+    files: Vec<(u64, u64, String)>,
 }
 
 impl Doc {
@@ -112,15 +118,6 @@ impl Doc {
         self.dirty_cache.set((self.version, false));
     }
 
-    /// Replace the buffer with `text` as read from disk.
-    fn reload(&mut self, text: String) {
-        self.saved = text.clone();
-        self.text = text;
-        self.version += 1;
-        self.cursor = self.cursor.min(self.text.chars().count());
-        self.anchor = self.anchor.min(self.text.chars().count());
-    }
-
     /// 0-based line and UTF-16 column of the cursor (cached: it scans the text).
     fn line_col(&self) -> (usize, usize) {
         let (v, c, lc) = self.line_col_cache.get();
@@ -133,6 +130,35 @@ impl Doc {
     }
     fn name(&self) -> String {
         self.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+    }
+
+    /// Replace a clean buffer with the latest text from disk.
+    fn reload(&mut self, text: String, ctx: &egui::Context) {
+        use egui::text::{CCursor, CCursorRange};
+        let len = text.chars().count();
+        self.cursor = self.cursor.min(len);
+        self.anchor = self.anchor.min(len);
+        self.goto = self.goto.map(|(a, b)| (a.min(len), b.min(len)));
+        self.column = None;
+        self.column_drag = false;
+        if let Some(id) = self.editor_id
+            && let Some(mut state) = egui::TextEdit::load_state(ctx, id)
+        {
+            state
+                .cursor
+                .set_char_range(Some(CCursorRange::two(CCursor::new(self.cursor), CCursor::new(self.anchor))));
+            state.store(ctx, id);
+        }
+        self.saved = text.clone();
+        self.text = text;
+        self.version += 1;
+        self.clear_blame();
+    }
+
+    fn clear_blame(&mut self) {
+        self.blame = None;
+        self.blame_version = None;
+        self.blame_rx = None;
     }
 }
 
@@ -252,7 +278,7 @@ enum VcsOperation {
     Change(&'static str),
     History(&'static str),
     Commit(String, bool),
-    Discard,
+    Discard(PathBuf),
 }
 
 impl VcsOperation {
@@ -260,7 +286,7 @@ impl VcsOperation {
         match self {
             Self::Change(label) | Self::History(label) => label,
             Self::Commit(..) => "Commit",
-            Self::Discard => "Discard",
+            Self::Discard(_) => "Discard",
         }
     }
 }
@@ -276,6 +302,7 @@ pub struct App {
     title: String,
     /// Open project folder; None = empty project.
     root: Option<PathBuf>,
+    watcher: Option<Watcher>,
     ignored: Vec<String>,
     /// Recently opened folders, most recent first.
     recent: Vec<PathBuf>,
@@ -286,13 +313,20 @@ pub struct App {
     side_open: bool,
     tabs: Vec<Tab>,
     active: usize,
+    next_doc_id: u64,
 
-    tree: HashMap<PathBuf, Vec<(PathBuf, bool)>>,
+    tree: HashMap<PathBuf, DirEntries>,
+    tree_loading: HashSet<PathBuf>,
+    tree_requested: HashSet<PathBuf>,
+    tree_rx: Option<Receiver<HashMap<PathBuf, DirEntries>>>,
     expanded: HashSet<PathBuf>,
 
     status: Status,
     status_rx: Option<Receiver<VcsRefresh>>,
+    refresh_pending: bool,
+    pending_changes: Changes,
     last_poll: Instant,
+    was_focused: Option<bool>,
     branches: Vec<String>,
     commit_msg: String,
     amend: bool,
@@ -348,17 +382,25 @@ impl App {
             vcs: None,
             repo_rx: None,
             root: None,
+            watcher: None,
             ignored: Vec::new(),
             recent: load_recent(),
             side: Side::Explorer,
             side_open: true,
             tabs: Vec::new(),
             active: 0,
+            next_doc_id: 0,
             tree: HashMap::new(),
+            tree_loading: HashSet::new(),
+            tree_requested: HashSet::new(),
+            tree_rx: None,
             expanded: HashSet::new(),
             status: Status::default(),
             status_rx: None,
+            refresh_pending: false,
+            pending_changes: Changes::default(),
             last_poll: Instant::now(),
+            was_focused: None,
             branches: Vec::new(),
             commit_msg: String::new(),
             amend: false,
@@ -398,12 +440,8 @@ impl App {
     }
 
     fn set_root(&mut self, root: PathBuf) {
-        self.repo = None;
-        self.vcs = None;
-        self.repo_rx = Some(background(&self.ctx, {
-            let root = root.clone();
-            move || Ok(vcs::detect(&root))
-        }));
+        self.clear_project();
+        self.watcher = Some(Watcher::start(root.clone(), self.ctx.clone()));
         self.recent.retain(|r| r != &root);
         self.recent.insert(0, root.clone());
         self.recent.truncate(10);
@@ -417,24 +455,32 @@ impl App {
             opts,
             ..SearchState::default()
         };
-        self.tree.clear();
+        self.reset_lsp();
+        self.goto_rx = None;
+        self.nav_back.clear();
+        self.last_poll = Instant::now();
+        self.pending_changes.rediscover = true;
+        self.refresh_vcs();
+    }
+
+    fn clear_project(&mut self) {
+        self.root = None;
+        self.watcher = None;
+        self.update_repository(None);
+        self.repo_rx = None;
+        self.ignored.clear();
         self.expanded.clear();
-        self.graph = None;
-        self.graph_sel = None;
-        self.graph_detail.clear();
-        self.graph_rx = None;
-        self.graph_detail_rx = None;
-        self.diff_rx = None;
+        self.tree.clear();
+        self.tree_loading.clear();
+        self.tree_requested.clear();
+        self.tree_rx = None;
+        self.status_rx = None;
+        self.refresh_pending = false;
+        self.pending_changes = Changes::default();
         self.bg_task = None;
         self.amend = false;
         self.quick_open = None;
         self.confirm = None;
-        self.status = Status::default();
-        self.status_rx = None;
-        self.branches.clear();
-        self.reset_lsp();
-        self.goto_rx = None;
-        self.nav_back.clear();
     }
 
     /// Folder to run tools in: the project, else the active file's folder.
@@ -503,12 +549,78 @@ impl App {
     }
 
     fn refresh_vcs(&mut self) {
-        let Some((repo, vcs)) = self.repository() else { return };
-        self.status_rx = Some(background(&self.ctx, move || VcsRefresh {
-            status: vcs.status(&repo),
-            branches: vcs.branches(&repo),
+        self.refresh_pending = true;
+        self.start_refresh();
+    }
+
+    fn start_refresh(&mut self) {
+        if self.status_rx.is_some() || self.repo_rx.is_some() || self.bg_task.is_some() || !self.refresh_pending {
+            return;
+        }
+        self.refresh_pending = false;
+        let changes = std::mem::take(&mut self.pending_changes);
+        let files: Vec<_> = self
+            .tabs
+            .iter()
+            .filter_map(|tab| match tab {
+                Tab::File(doc) if (changes.rescan || changes.affects(&doc.path)) && !doc.dirty() => {
+                    Some((doc.path.clone(), doc.id, doc.version))
+                }
+                _ => None,
+            })
+            .collect();
+        let root = self
+            .root
+            .clone()
+            .filter(|_| changes.rediscover || (self.repo.is_none() && changes.vcs));
+        let repository = self.repository();
+        if root.is_none() && repository.is_none() && files.is_empty() {
+            return;
+        }
+        self.status_rx = Some(background(&self.ctx, move || {
+            let repository = match root {
+                Some(root) => vcs::detect(&root),
+                None => repository,
+            };
+            let (status, branches) = repository
+                .as_ref()
+                .map_or_else(|| (None, Vec::new()), |(repo, vcs)| (Some(vcs.status(repo)), vcs.branches(repo)));
+            let files = files
+                .into_iter()
+                .filter_map(|(path, id, version)| read_doc_text(&path).ok().flatten().map(|text| (id, version, text)))
+                .collect();
+            VcsRefresh {
+                repository,
+                status,
+                branches,
+                refresh_git_history: changes.vcs || changes.rediscover,
+                files,
+            }
         }));
-        self.last_poll = Instant::now();
+    }
+
+    fn update_repository(&mut self, repository: DetectedRepo) -> bool {
+        if self.repository() == repository {
+            return false;
+        }
+        (self.repo, self.vcs) = match repository {
+            Some((root, vcs)) => (Some(root), Some(vcs)),
+            None => (None, None),
+        };
+        self.status = Status::default();
+        self.branches.clear();
+        self.graph = None;
+        self.graph_sel = None;
+        self.graph_detail.clear();
+        self.graph_rx = None;
+        self.graph_detail_rx = None;
+        self.diff_rx = None;
+        for tab in &mut self.tabs {
+            if let Tab::File(doc) = tab {
+                doc.clear_blame();
+            }
+        }
+        true
     }
 
     fn refresh_history(&mut self) {
@@ -551,7 +663,6 @@ impl App {
         if self.bg_task.is_some() {
             return;
         }
-        self.status_rx = None;
         let rx = background(&self.ctx, move || work(vcs, &repo));
         self.message = format!("{}…", operation.label());
         self.bg_task = Some(VcsJob { operation, rx });
@@ -614,13 +725,22 @@ impl App {
     }
 
     fn poll_background(&mut self, ctx: &egui::Context) {
-        self.poll_blame(ctx);
         self.poll_goto();
         self.poll_search(ctx);
         if let Some(err) = self.settings_writer.errors.try_iter().last() {
             self.message = format!("Could not save settings: {err}");
         }
+        self.poll_project_changes(ctx);
         self.poll_vcs(ctx);
+        self.poll_blame(ctx);
+        self.start_refresh();
+        if let Some(entries) = receive(&mut self.tree_rx) {
+            self.tree
+                .extend(entries.into_iter().filter(|(dir, _)| self.tree_loading.contains(dir)));
+        }
+        if self.tree_rx.is_none() {
+            self.tree_loading.clear();
+        }
         if let Some(q) = &mut self.quick_open
             && let Some((files, lower)) = receive(&mut q.files_rx)
         {
@@ -633,22 +753,40 @@ impl App {
     fn poll_vcs(&mut self, ctx: &egui::Context) {
         if let Some(detected) = receive(&mut self.repo_rx) {
             match detected {
-                Ok(Some((root, vcs))) => {
-                    self.repo = Some(root);
-                    self.vcs = Some(vcs);
+                Ok(repository) => {
+                    if self.update_repository(repository) {
+                        self.refresh_history();
+                    }
                     self.refresh_vcs();
-                    self.refresh_history();
                 }
-                Ok(None) => {}
                 Err(e) => self.message = e,
             }
         }
         if let Some(refresh) = receive(&mut self.status_rx) {
-            match refresh.status {
-                Ok(s) => self.status = s,
-                Err(e) => self.message = e,
+            if self.bg_task.is_none() && self.repo_rx.is_none() {
+                let repo_changed = self.update_repository(refresh.repository);
+                if let Some(status) = refresh.status {
+                    match status {
+                        Ok(status) => self.status = status,
+                        Err(e) => self.message = e,
+                    }
+                }
+                self.branches = refresh.branches;
+                if repo_changed || (refresh.refresh_git_history && self.vcs == Some(Vcs::Git)) {
+                    self.refresh_history();
+                }
             }
-            self.branches = refresh.branches;
+            for (id, version, text) in refresh.files {
+                if let Some(doc) = self.tabs.iter_mut().find_map(|tab| match tab {
+                    Tab::File(doc) if doc.id == id => Some(doc),
+                    _ => None,
+                }) && doc.version == version
+                    && !doc.dirty()
+                    && doc.text != text
+                {
+                    doc.reload(text, ctx);
+                }
+            }
         }
         if let Some(job) = &self.bg_task {
             let result = match job.rx.try_recv() {
@@ -674,7 +812,12 @@ impl App {
                                 }
                                 self.refresh_history();
                             }
-                            VcsOperation::Discard => self.reload_clean_docs(),
+                            VcsOperation::Discard(path) => {
+                                if let Some(parent) = path.parent() {
+                                    self.invalidate_tree(|dir| dir == parent);
+                                }
+                                self.pending_changes.paths.insert(path);
+                            }
                             VcsOperation::History(_) => self.refresh_history(),
                             VcsOperation::Change(_) => {}
                         }
@@ -714,17 +857,33 @@ impl App {
             tab.inline = matches!(self.tabs.iter().find(|t| matches!(t, Tab::Diff(_))), Some(Tab::Diff(d)) if d.inline);
             self.show_tab(Tab::Diff(Box::new(tab)));
         }
-        let focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
-        if self.repo.is_some() && focused && self.bg_task.is_none() {
-            if self.last_poll.elapsed() >= STATUS_POLL && self.status_rx.is_none() {
-                self.refresh_vcs();
-                if self.vcs == Some(Vcs::Git) && self.graph_rx.is_none() {
-                    self.refresh_history();
-                }
+    }
+
+    fn poll_project_changes(&mut self, ctx: &egui::Context) {
+        let mut changes = self.watcher.as_ref().map_or_else(Changes::default, Watcher::take);
+        if let Some(error) = self.watcher.as_ref().and_then(Watcher::error) {
+            self.watcher = None;
+            self.message = format!("File watcher unavailable. Checking for changes while focused: {error}");
+        }
+        let focused = ctx.input(|i| i.viewport().focused.unwrap_or(i.focused));
+        let gained_focus = self.was_focused.replace(focused) == Some(false) && focused;
+        if self.root.is_some() && focused {
+            let interval = if self.watcher.is_some() { SAFETY_POLL } else { FALLBACK_POLL };
+            if gained_focus || self.last_poll.elapsed() >= interval {
+                self.last_poll = Instant::now();
+                changes.rescan = true;
+                changes.rediscover = true;
             }
-            if self.status_rx.is_none() {
-                ctx.request_repaint_after(STATUS_POLL.saturating_sub(self.last_poll.elapsed()));
-            }
+            ctx.request_repaint_after(interval.saturating_sub(self.last_poll.elapsed()));
+        } else if gained_focus {
+            changes.rescan = true;
+        }
+        if changes.rescan || !changes.dirs.is_empty() {
+            self.invalidate_tree(|dir| changes.rescan || changes.dirs.contains(dir) || changes.affects(dir));
+        }
+        if changes.rescan || changes.rediscover || changes.vcs || !changes.paths.is_empty() {
+            self.pending_changes.merge(changes);
+            self.refresh_pending = true;
         }
     }
 
@@ -735,24 +894,24 @@ impl App {
             self.active = i;
             return;
         }
-        let bytes = match std::fs::read(path) {
-            Ok(b) => b,
+        let text = match read_doc_text(path) {
+            Ok(Some(text)) => text,
+            Ok(None) => {
+                self.message = format!("{} looks binary; not opening", path.display());
+                return;
+            }
             Err(e) => {
                 self.message = format!("{}: {e}", path.display());
                 return;
             }
         };
-        if bytes.iter().take(8000).any(|&b| b == 0) {
-            self.message = format!("{} looks binary; not opening", path.display());
-            return;
-        }
-        let text = String::from_utf8_lossy(&bytes).replace("\r\n", "\n");
         let lang = path
             .extension()
             .or_else(|| path.file_name())
             .map(|e| e.to_string_lossy().into_owned())
             .unwrap_or_default();
         self.tabs.push(Tab::File(Doc {
+            id: self.next_doc_id,
             path: path.to_path_buf(),
             saved: text.clone(),
             text,
@@ -773,6 +932,7 @@ impl App {
             line_col_cache: std::cell::Cell::new((u64::MAX, 0, (0, 0))),
             gutter: (u64::MAX, 0, String::new()),
         }));
+        self.next_doc_id += 1;
         // Warm up the language server so the first go-to-definition is fast.
         let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
         if !self.path_is_ignored(path) {
@@ -821,15 +981,19 @@ impl App {
         if let Some(Tab::File(doc)) = self.tabs.get_mut(self.active) {
             match std::fs::write(&doc.path, &doc.text) {
                 Ok(()) => {
+                    // Reject disk reads started before this save.
+                    doc.version += 1;
                     doc.mark_saved();
                     if self.vcs == Some(Vcs::Svn) {
-                        doc.blame_version = None; // svn blames the saved file: redo it
+                        doc.clear_blame(); // SVN blames the saved file.
                     }
                     self.message = format!("Saved {}", doc.path.display());
                 }
                 Err(e) => self.message = format!("Save failed: {e}"),
             }
-            self.refresh_vcs();
+            if self.watcher.is_none() || !self.root.as_ref().is_some_and(|root| doc.path.starts_with(root)) {
+                self.refresh_vcs();
+            }
         }
     }
 
@@ -1498,7 +1662,7 @@ impl App {
             ui.label(RichText::new(dir_name(&root).to_uppercase()).small().strong());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if icon_button(ui, ic::ARROWS_CLOCKWISE).on_hover_text("Refresh").clicked() {
-                    self.tree.clear();
+                    self.invalidate_tree(|_| true);
                     self.refresh_vcs();
                 }
             });
@@ -1520,6 +1684,7 @@ impl App {
         egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
             self.tree_dir(ui, &root, 0, &decorations, &mut open);
         });
+        self.read_tree_entries();
         if let Some(p) = open {
             self.open_file(&p);
         }
@@ -1578,7 +1743,12 @@ impl App {
     }
 
     fn tree_dir(&mut self, ui: &mut egui::Ui, dir: &Path, depth: usize, deco: &HashMap<PathBuf, char>, open: &mut Option<PathBuf>) {
-        let entries = self.tree.entry(dir.to_path_buf()).or_insert_with(|| read_dir_sorted(dir)).clone();
+        let Some(entries) = self.tree.get(dir).cloned() else {
+            if !self.tree_loading.contains(dir) {
+                self.tree_requested.insert(dir.to_path_buf());
+            }
+            return;
+        };
         let active_path = match self.tabs.get(self.active) {
             Some(Tab::File(d)) => Some(d.path.clone()),
             _ => None,
@@ -1627,6 +1797,34 @@ impl App {
         }
     }
 
+    fn invalidate_tree(&mut self, invalid: impl Fn(&Path) -> bool) {
+        self.tree_requested.extend(self.tree.keys().filter(|dir| invalid(dir)).cloned());
+        self.tree_loading.retain(|dir| {
+            if invalid(dir) {
+                self.tree_requested.insert(dir.clone());
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    fn read_tree_entries(&mut self) {
+        if self.tree_rx.is_some() || self.tree_requested.is_empty() {
+            return;
+        }
+        let dirs = std::mem::take(&mut self.tree_requested);
+        self.tree_loading.clone_from(&dirs);
+        self.tree_rx = Some(background(&self.ctx, move || {
+            dirs.into_iter()
+                .map(|dir| {
+                    let entries = read_dir_sorted(&dir);
+                    (dir, entries)
+                })
+                .collect()
+        }));
+    }
+
     fn changes(&mut self, ui: &mut egui::Ui) {
         let heading = match self.vcs {
             Some(Vcs::Svn) => "SOURCE CONTROL · SUBVERSION",
@@ -1642,7 +1840,7 @@ impl App {
             }
             return;
         };
-        if self.repo_rx.is_some() {
+        if self.repo_rx.is_some() || (self.status_rx.is_some() && self.repo.is_none()) {
             ui.weak("Detecting source control…");
             return;
         }
@@ -2283,24 +2481,12 @@ impl App {
                     match c {
                         Confirm::CloseTabs(idx) => self.close_tabs(idx, true),
                         Confirm::Discard(f) => {
-                            self.spawn_vcs(VcsOperation::Discard, move |vcs, repo| vcs.discard(repo, &f));
+                            if let Some(repo) = &self.repo {
+                                let path = repo.join(&f.path);
+                                self.spawn_vcs(VcsOperation::Discard(path), move |vcs, repo| vcs.discard(repo, &f));
+                            }
                         }
                     }
-                }
-            }
-        }
-    }
-
-    /// Reload open files that have no unsaved edits (e.g. after a discard).
-    fn reload_clean_docs(&mut self) {
-        for tab in &mut self.tabs {
-            if let Tab::File(d) = tab
-                && !d.dirty()
-                && let Ok(t) = std::fs::read_to_string(&d.path)
-            {
-                let t = t.replace("\r\n", "\n");
-                if t != d.text {
-                    d.reload(t);
                 }
             }
         }
@@ -3185,8 +3371,13 @@ fn save_recent(list: &[PathBuf]) {
     let _ = std::fs::write(f, text);
 }
 
-fn read_dir_sorted(dir: &Path) -> Vec<(PathBuf, bool)> {
-    let mut v: Vec<(PathBuf, bool)> = std::fs::read_dir(dir)
+fn read_doc_text(path: &Path) -> std::io::Result<Option<String>> {
+    let bytes = std::fs::read(path)?;
+    Ok((!bytes.iter().take(8000).any(|&b| b == 0)).then(|| String::from_utf8_lossy(&bytes).replace("\r\n", "\n")))
+}
+
+fn read_dir_sorted(dir: &Path) -> DirEntries {
+    let mut v: DirEntries = std::fs::read_dir(dir)
         .map(|rd| {
             rd.filter_map(Result::ok)
                 .filter(|e| e.file_name() != ".git" && e.file_name() != ".svn")

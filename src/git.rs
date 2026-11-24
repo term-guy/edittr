@@ -54,7 +54,8 @@ pub struct Status {
 }
 
 pub fn status(repo: &Path) -> Result<Status, String> {
-    let out = run(repo, &["status", "--porcelain=v1", "-b", "-z", "-uall"])?;
+    // Status runs in response to filesystem events. Avoid writing the index stat cache.
+    let out = run(repo, &["--no-optional-locks", "status", "--porcelain=v1", "-b", "-z", "-uall"])?;
     let mut st = Status::default();
     let mut parts = out.split('\0').filter(|s| !s.is_empty());
     while let Some(entry) = parts.next() {

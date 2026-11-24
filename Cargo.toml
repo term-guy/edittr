@@ -14,6 +14,7 @@ egui_extras = { version = "0.37.0", default-features = false, features = ["synte
 syntect = { version = "5.3.0", default-features = false, features = ["default-fancy"] }
 flate2 = "1.1.11"
 image = { version = "0.25", default-features = false, features = ["png"], optional = true }
+notify = "8.2"
 quick-xml = { version = "0.42.0", features = ["serialize"] }
 regex = "1.13.2"
 # Pinned: the Linux portal-failure detection in app.rs relies on rfd 0.18 internals.
