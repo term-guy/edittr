@@ -8,6 +8,8 @@ use std::{
 
 use eframe::egui;
 
+use crate::outline::{CollapsedGroups, Group};
+
 #[derive(Clone, Copy)]
 pub(crate) struct Settings {
     pub(crate) changes_tree: bool,
@@ -24,6 +26,8 @@ pub(crate) struct Settings {
     pub(crate) bracket_colors: bool,
     pub(crate) show_outline: bool,
     pub(crate) outline_expanded: bool,
+    pub(crate) outline_grouped: bool,
+    pub(crate) outline_collapsed_groups: CollapsedGroups,
     pub(crate) restore_previous_session: bool,
     /// Start in the last folder instead of the start page (when no folder is given).
     pub(crate) reopen_last_folder: bool,
@@ -42,6 +46,8 @@ impl Default for Settings {
             bracket_colors: true,
             show_outline: true,
             outline_expanded: true,
+            outline_grouped: true,
+            outline_collapsed_groups: CollapsedGroups::default(),
             restore_previous_session: true,
             reopen_last_folder: false,
         }
@@ -93,6 +99,16 @@ impl Settings {
     fn parse(text: &str) -> Self {
         let mut settings = Self::default();
         for (key, value) in text.lines().filter_map(entry) {
+            if key == "outline_collapsed_groups" {
+                let mut collapsed = CollapsedGroups::default();
+                for group in Group::ALL {
+                    if value.split(',').any(|name| name.trim() == group.label()) {
+                        collapsed.toggle(group);
+                    }
+                }
+                settings.outline_collapsed_groups = collapsed;
+                continue;
+            }
             if let Ok(value) = value.parse() {
                 match key {
                     "changes_tree" => settings.changes_tree = value,
@@ -105,6 +121,7 @@ impl Settings {
                     "bracket_colors" => settings.bracket_colors = value,
                     "show_outline" => settings.show_outline = value,
                     "outline_expanded" => settings.outline_expanded = value,
+                    "outline_grouped" => settings.outline_grouped = value,
                     "restore_previous_session" => settings.restore_previous_session = value,
                     "reopen_last_folder" => settings.reopen_last_folder = value,
                     _ => {}
@@ -131,7 +148,9 @@ impl Settings {
                         | "reopen_last_folder"
                         | "format_on_save"
                         | "show_outline"
-                        | "outline_expanded",
+                        | "outline_expanded"
+                        | "outline_grouped"
+                        | "outline_collapsed_groups",
                     _
                 ))
             ) {
@@ -151,6 +170,14 @@ impl Settings {
         text.push_str(&format!("format_on_save={}\n", self.format_on_save));
         text.push_str(&format!("show_outline={}\n", self.show_outline));
         text.push_str(&format!("outline_expanded={}\n", self.outline_expanded));
+        text.push_str(&format!("outline_grouped={}\n", self.outline_grouped));
+        let collapsed = Group::ALL
+            .into_iter()
+            .filter(|group| self.outline_collapsed_groups.contains(*group))
+            .map(Group::label)
+            .collect::<Vec<_>>()
+            .join(",");
+        text.push_str(&format!("outline_collapsed_groups={collapsed}\n"));
         text
     }
 }
@@ -191,6 +218,22 @@ fn entry(line: &str) -> Option<(&str, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn outline_group_layout_round_trips() {
+        let defaults = Settings::parse("");
+        assert!(defaults.outline_grouped);
+        assert_eq!(defaults.outline_collapsed_groups, CollapsedGroups::default());
+        let previous = "outline_grouped=false\n outline_collapsed_groups = Variables, Unknown, Macros, Variables\n";
+        let settings = Settings::parse(previous);
+        let text = settings.format(previous);
+        assert_eq!(text.matches("outline_collapsed_groups=").count(), 1);
+        assert_eq!(text.matches("outline_grouped=").count(), 1);
+        assert!(text.contains("outline_collapsed_groups=Macros,Variables\n"));
+        let parsed = Settings::parse(&text);
+        assert!(!parsed.outline_grouped);
+        assert_eq!(parsed.outline_collapsed_groups, settings.outline_collapsed_groups);
+    }
 
     #[test]
     fn outline_visibility_and_expansion_round_trip_independently() {
@@ -258,7 +301,7 @@ mod tests {
         let text = settings.format(previous);
         assert_eq!(
             text,
-            "future_key=one=two\nfuture_key = three\n# A comment\nchanges_tree=false\nhighlight_line=false\nshow_whitespace=false\ndiff_ignore_eol=true\ninline_blame=true\nminimap=true\nbracket_colors=true\nrestore_previous_session=true\nreopen_last_folder=false\nformat_on_save=false\nshow_outline=true\noutline_expanded=true\n"
+            "future_key=one=two\nfuture_key = three\n# A comment\nchanges_tree=false\nhighlight_line=false\nshow_whitespace=false\ndiff_ignore_eol=true\ninline_blame=true\nminimap=true\nbracket_colors=true\nrestore_previous_session=true\nreopen_last_folder=false\nformat_on_save=false\nshow_outline=true\noutline_expanded=true\noutline_grouped=true\noutline_collapsed_groups=\n"
         );
         assert!(!Settings::parse(&text).changes_tree);
     }

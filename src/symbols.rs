@@ -51,6 +51,13 @@ pub(crate) struct Symbol {
 }
 
 impl Symbol {
+    pub(super) fn position(&self) -> (usize, usize) {
+        let col = match &self.cols {
+            Columns::Chars(cols) | Columns::Utf16(cols) => cols.start,
+        };
+        (self.line, col)
+    }
+
     fn from_definition(path: &Path, def: goto::Definition<'_>) -> Self {
         Self {
             name: def.name.to_owned(),
@@ -118,13 +125,61 @@ pub(crate) fn document(
     if let Some(header) = c_family::header(path) {
         return c_family::document(path, text, header, symbols);
     }
-    if let Some(symbols) = symbols {
-        let symbols = document_symbols(path, symbols);
-        if !symbols.is_empty() {
-            return symbols;
-        }
+    let mut symbols = symbols.map_or_else(Vec::new, |symbols| document_symbols(path, symbols));
+    if symbols.is_empty() {
+        symbols = fallback_document(path, text);
     }
-    fallback_document(path, text)
+    classify_outline_roots(path, text, &mut symbols);
+    symbols
+}
+
+fn classify_outline_roots(path: &Path, text: &str, symbols: &mut [Symbol]) {
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some("py" | "pyi") => {
+            for symbol in symbols {
+                if symbol.kind == "Variable" && is_all_caps(&symbol.name) {
+                    symbol.kind = "Constant".to_owned();
+                }
+            }
+        }
+        Some("rs") => {
+            let lines: Vec<_> = text.lines().collect();
+            for symbol in symbols {
+                if matches!(symbol.kind.as_str(), "Variable" | "Constant" | "Function")
+                    && let Some(kind) = rust_outline_kind(symbol, &lines)
+                    && kind != symbol.kind
+                {
+                    symbol.kind = kind.to_owned();
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn rust_outline_kind(symbol: &Symbol, lines: &[&str]) -> Option<&'static str> {
+    let line = lines.get(symbol.line)?;
+    let col = match &symbol.cols {
+        Columns::Chars(cols) => cols.start,
+        Columns::Utf16(cols) => goto::col16_to_char(line, cols.start),
+    };
+    let offset = line.char_indices().nth(col)?.0;
+    let mut words = std::iter::once(&line[..offset])
+        .chain(lines.get(*symbol.lines.start()..symbol.line)?.iter().rev().copied())
+        .flat_map(|prefix| prefix.split_whitespace().rev());
+    // rust-analyzer reports macros as Function and both forms of static as Constant.
+    match (symbol.kind.as_str(), words.next()) {
+        ("Function", Some("macro" | "macro_rules!")) => Some("Macro"),
+        ("Function", Some("!")) if words.next() == Some("macro_rules") => Some("Macro"),
+        ("Variable" | "Constant", Some("const")) => Some("Constant"),
+        ("Variable" | "Constant", Some("static")) => Some(if is_all_caps(&symbol.name) { "Constant" } else { "Variable" }),
+        ("Constant", Some("mut")) if words.next() == Some("static") => Some("Variable"),
+        _ => None,
+    }
+}
+
+fn is_all_caps(name: &str) -> bool {
+    name.bytes().any(|c| c.is_ascii_uppercase()) && name.bytes().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'_')
 }
 
 fn document_symbols(path: &Path, symbols: Vec<lsp::Symbol>) -> Vec<Symbol> {
@@ -132,6 +187,14 @@ fn document_symbols(path: &Path, symbols: Vec<lsp::Symbol>) -> Vec<Symbol> {
     for mut symbol in symbols {
         let children = document_symbols(path, std::mem::take(&mut symbol.children));
         if symbol.location.path == path {
+            if symbol.kind == "Variable"
+                && symbol
+                    .detail
+                    .as_deref()
+                    .is_some_and(|detail| matches!(detail.split_whitespace().next(), Some("const" | "constexpr")) && !detail.contains('*'))
+            {
+                symbol.kind = "Constant";
+            }
             let mut symbol = Symbol::from(symbol);
             symbol.children = children;
             result.push(symbol);
@@ -139,6 +202,7 @@ fn document_symbols(path: &Path, symbols: Vec<lsp::Symbol>) -> Vec<Symbol> {
             result.extend(children);
         }
     }
+    result.sort_by_key(Symbol::position);
     result
 }
 
@@ -306,6 +370,31 @@ pub(crate) fn project(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn outlines_use_rust_declarations_when_server_kinds_are_ambiguous() {
+        let path = Path::new("lib.rs");
+        let source = "fn f() {}\nstatic mut STATE: i32 = 0;\nstatic DEFAULT: i32 = 1;\nconst LIMIT: i32 = 4;\nmacro_rules! update {}\n";
+        let mut symbols = fallback_document(path, source);
+        // Model the kinds rust-analyzer gives these declarations.
+        symbols[1].kind = "Constant".to_owned();
+        symbols[4].kind = "Function".to_owned();
+        classify_outline_roots(path, source, &mut symbols);
+        assert_eq!(
+            symbols.iter().map(|symbol| symbol.kind.as_str()).collect::<Vec<_>>(),
+            ["Function", "Variable", "Constant", "Constant", "Macro"]
+        );
+    }
+
+    #[test]
+    fn python_only_classifies_uppercase_variables_at_module_scope() {
+        let path = Path::new("model.py");
+        let source = "LIMIT = 4\ncurrent = 0\nclass Model:\n    MEMBER = 1\n";
+        let symbols = document(path, source, (0, 0), None, None, None);
+        assert_eq!(symbols[0].kind, "Constant");
+        assert_eq!(symbols[1].kind, "Variable");
+        assert_eq!(symbols[2].children[0].kind, "Variable");
+    }
 
     #[test]
     fn fallback_outline_shares_definition_patterns_and_char_columns() {

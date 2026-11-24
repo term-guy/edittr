@@ -228,12 +228,18 @@ fn from_server(path: &Path, source: &Source<'_>, header: bool, member: bool, sym
                 }
                 None
             }
-            "Variable" | "Constant" if !member => {
+            "Variable" | "Constant" | "Enum member" if !member => {
                 let prefix = symbol.range.as_ref().and_then(|range| {
                     let name = (symbol.location.line, symbol.location.col16.start);
                     source.text.get(source.offset(range.start)?..source.offset(name)?)
                 });
-                prefix.is_some_and(has_static).then(|| "static".to_owned())
+                let qualifiers = prefix
+                    .or(symbol.detail.as_deref())
+                    .map_or_else(Qualifiers::default, declaration_qualifiers);
+                if symbol.kind == "Variable" && qualifiers.is_constant() {
+                    symbol.kind = "Constant";
+                }
+                qualifiers.detail()
             }
             "Namespace" | "Class" | "Struct" => {
                 if symbol.detail.as_deref() == Some("type alias") {
@@ -258,25 +264,69 @@ fn from_server(path: &Path, source: &Source<'_>, header: bool, member: bool, sym
     result
 }
 
-fn has_static(prefix: &str) -> bool {
-    let contains_static = |s| TOKEN.find_iter(s).any(|token| token.as_str() == "static");
+#[derive(Default)]
+struct Qualifiers {
+    is_static: bool,
+    is_constexpr: bool,
+    base_const: bool,
+    indirect: bool,
+    declarator_const: bool,
+}
+
+impl Qualifiers {
+    fn observe(&mut self, token: &str) {
+        match token {
+            "static" => self.is_static = true,
+            "constexpr" => self.is_constexpr = true,
+            "const" if self.indirect => self.declarator_const = true,
+            "const" => self.base_const = true,
+            "*" | "&" => {
+                self.indirect = true;
+                self.declarator_const = false;
+            }
+            "," => {
+                self.indirect = false;
+                self.declarator_const = false;
+            }
+            _ => {}
+        }
+    }
+
+    fn is_constant(&self) -> bool {
+        self.is_constexpr || if self.indirect { self.declarator_const } else { self.base_const }
+    }
+
+    fn detail(&self) -> Option<String> {
+        self.is_static.then(|| "static".to_owned())
+    }
+}
+
+fn declaration_qualifiers(prefix: &str) -> Qualifiers {
+    let mut tokens = Vec::new();
     let mut end = 0;
     for (start, part) in special_parts(prefix) {
-        if contains_static(&prefix[end..start]) {
-            return true;
-        }
+        tokenize(prefix, end, start, &mut tokens);
         end = start + part.len();
     }
-    contains_static(&prefix[end..])
+    tokenize(prefix, end, prefix.len(), &mut tokens);
+    pair_delimiters(&mut tokens);
+    let mut qualifiers = Qualifiers::default();
+    let mut angles = 0usize;
+    let mut i = 0;
+    while let Some(token) = tokens.get(i) {
+        match token.text {
+            "<" => angles += 1,
+            ">" => angles = angles.saturating_sub(1),
+            _ if angles == 0 => qualifiers.observe(token.text),
+            _ => {}
+        }
+        i = token.close.max(i) + 1;
+    }
+    qualifiers
 }
 
 fn merge_macros(mut symbols: Vec<Symbol>, macros: &mut Peekable<impl Iterator<Item = Symbol>>, end: usize) -> Vec<Symbol> {
-    symbols.sort_by_key(|row| {
-        let col = match &row.cols {
-            Columns::Chars(cols) | Columns::Utf16(cols) => cols.start,
-        };
-        (row.line, col)
-    });
+    symbols.sort_by_key(Symbol::position);
     let mut rows = Vec::new();
     for mut symbol in symbols {
         let container = matches!(symbol.kind.as_str(), "Class" | "Namespace");
@@ -424,7 +474,7 @@ impl Fallback<'_> {
         if start == end || matches!(self.tokens[start].text, "typedef" | "using" | "static_assert" | "return" | "@") {
             return false;
         }
-        let mut static_decl = false;
+        let mut qualifiers = Qualifiers::default();
         let mut begin = start;
         let mut name: Option<Token<'_>> = None;
         let mut names = 0;
@@ -440,7 +490,7 @@ impl Fallback<'_> {
                         continue;
                     }
                 }
-                "static" if !initializer && begin == start => static_decl = true,
+                "static" if !initializer && begin == start => qualifiers.observe(token.text),
                 "{" if i < end && !initializer && container(&self.tokens[begin..i]).is_some() => {
                     name = None;
                     names = 1; // A declarator after the type's closing brace needs only a name.
@@ -452,6 +502,11 @@ impl Fallback<'_> {
                             .iter()
                             .copied()
                             .find(|part| part.word() && !matches!(part.text, "const" | "volatile" | "restrict"));
+                        if let Some(name) = name {
+                            for part in self.tokens[i + 1..token.close].iter().take_while(|part| part.offset < name.offset) {
+                                qualifiers.observe(part.text);
+                            }
+                        }
                         names = 2;
                     } else if let Some(candidate) = name
                         && (names >= 2 || begin != start || class == Some(candidate.text))
@@ -493,23 +548,27 @@ impl Fallback<'_> {
                             .windows(2)
                             .any(|pair| pair[0].text == "::" && pair[1].offset == name.offset)
                     {
-                        let mut row = self.row(name, "Variable", begin, i);
-                        row.detail = static_decl.then(|| "static".to_owned());
+                        let kind = if qualifiers.is_constant() { "Constant" } else { "Variable" };
+                        let mut row = self.row(name, kind, begin, i);
+                        row.detail = qualifiers.detail();
                         rows.push(row);
                     }
                     if body {
                         return function.is_some();
                     }
                     begin = i + 1;
+                    qualifiers.observe(",");
                     initializer = false;
                     function = None;
                     names = 0;
                     name = None;
                 }
                 _ if !initializer && token.word() => {
+                    qualifiers.observe(token.text);
                     name = Some(token);
                     names += 1;
                 }
+                _ if !initializer => qualifiers.observe(token.text),
                 _ => {}
             }
             i = if token.close > i { token.close + 1 } else { i + 1 };
@@ -649,6 +708,31 @@ if (parameter) { int nested; }
     }
 
     #[test]
+    fn outline_distinguishes_macros_constants_and_static_variables() {
+        let path = Path::new("sample.hpp");
+        let text = "#define FLAG\n#define LIMIT 42\nstatic int counter;\nstatic const int size = 8;\nconstexpr int width = 4;\nconst int *ptr;\nint *const fixed = nullptr;\n";
+        let expected = [
+            ("FLAG", "Macro", None),
+            ("LIMIT", "Macro", Some("42")),
+            ("counter", "Variable", Some("static")),
+            ("size", "Constant", Some("static")),
+            ("width", "Constant", None),
+            ("ptr", "Variable", None),
+            ("fixed", "Constant", None),
+        ];
+        assert_eq!(rows(&document(path, text, true, None)), expected);
+        let server = expected[2..]
+            .iter()
+            .enumerate()
+            .map(|(i, &(name, _, _))| {
+                let line = i + 2;
+                lsp_symbol(path, text, name, "Variable", line, line, line)
+            })
+            .collect();
+        assert_eq!(rows(&document(path, text, true, Some(server))), expected);
+    }
+
+    #[test]
     fn fallback_outline_keeps_nonempty_cpp_containers() {
         let text = r##"
 namespace empty { class Fields { int member; }; }
@@ -699,15 +783,15 @@ int initialized(42);
             [("Reader", "Constructor", None), ("get", "Method", None)]
         );
         let mut tree = crate::outline::Tree::new(symbols);
-        let method = tree.selected(7).unwrap();
+        let method = tree.selected(7).unwrap().symbol_index();
         assert_eq!(tree.rows[method].symbol.name, "get");
-        let class = tree.selected(4).unwrap();
+        let class = tree.selected(4).unwrap().symbol_index();
         assert_eq!(tree.rows[class].symbol.name, "Reader");
         tree.toggle(class);
-        assert_eq!(tree.selected(7), Some(class));
+        assert_eq!(tree.selected(7), Some(crate::outline::VisibleRow::Symbol(class)));
         let mut refreshed = crate::outline::Tree::new(document(path, &format!("\n{text}"), true, None));
         refreshed.restore_collapsed(&mut tree);
-        assert_eq!(refreshed.selected(8), Some(class));
+        assert_eq!(refreshed.selected(8), Some(crate::outline::VisibleRow::Symbol(class)));
     }
 
     fn lsp_symbol(path: &Path, text: &str, name: &str, kind: &'static str, start: usize, line: usize, end: usize) -> lsp::Symbol {
@@ -752,9 +836,9 @@ int initialized(42);
         let symbols = document(path, C_HEADER, true, Some(raw));
         assert_eq!(rows(&symbols), EXPECTED_C);
         let mut tree = crate::outline::Tree::new(symbols);
-        let continued = tree.selected(9).unwrap();
+        let continued = tree.selected(9).unwrap().symbol_index();
         assert_eq!(tree.rows[continued].symbol.name, "TWO");
-        let inside_fn = tree.selected(25).unwrap();
+        let inside_fn = tree.selected(25).unwrap().symbol_index();
         assert_eq!(tree.rows[inside_fn].symbol.name, "run");
     }
 
