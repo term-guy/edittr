@@ -171,6 +171,7 @@ pub fn spawn(
                 return;
             }
         };
+        let literal = !opts.regex;
         let mut total = 0;
         let mut searched = 0;
         let send = |rel: String, mut hits: Vec<Hit>, total: &mut usize| -> bool {
@@ -188,7 +189,7 @@ pub fn spawn(
                 continue;
             }
             searched += 1;
-            if total < MAX_HITS && re.is_match(&text) {
+            if total < MAX_HITS && (!literal || re.is_match(&text)) {
                 let hits = search_text(&re, &text, MAX_HITS_PER_FILE);
                 if !hits.is_empty() && !send(rel, hits, &mut total) {
                     return;
@@ -214,7 +215,7 @@ pub fn spawn(
                         }
                         let i = next.fetch_add(1, Ordering::Relaxed);
                         let Some(rel) = files.get(i) else { return };
-                        let result = search_file(&base.join(rel), re);
+                        let result = search_file(&base.join(rel), re, literal);
                         if wtx.send((i, result)).is_err() {
                             return;
                         }
@@ -260,31 +261,40 @@ pub fn spawn(
 
 /// `None`: skipped (unreadable, too big or binary). Opens the file once: on Windows
 /// every open is expensive (antivirus filters), so no separate metadata call.
-fn search_file(path: &Path, re: &Regex) -> Option<Vec<Hit>> {
-    let mut f = File::open(path).ok()?;
-    let len = f.metadata().ok()?.len();
-    if len > MAX_FILE_BYTES {
-        return None;
-    }
-    let mut bytes = Vec::with_capacity(len as usize + 1);
-    f.read_to_end(&mut bytes).ok()?;
-    if bytes[..bytes.len().min(8000)].contains(&0) {
-        return None; // binary
-    }
+fn search_file(path: &Path, re: &Regex, literal: bool) -> Option<Vec<Hit>> {
+    let bytes = read_searchable(path)?;
     let text = String::from_utf8_lossy(&bytes);
-    // Most files don't match: one pass over the whole buffer rejects them, instead
-    // of running the regex line by line. Sound because the regex is multi-line with
-    // CRLF-aware anchors, so any per-line match is also a whole-text match.
-    if !re.is_match(&text) {
+    // Literal searches can reject nonmatching files in one pass. Regexes may
+    // use line-local anchors such as \A, which would change on the whole buffer.
+    if literal && !re.is_match(&text) {
         return Some(Vec::new());
     }
     Some(search_text(re, &text, MAX_HITS_PER_FILE))
 }
 
+pub fn read_searchable(path: &Path) -> Option<Vec<u8>> {
+    let f = File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    if len > MAX_FILE_BYTES {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(len as usize + 1);
+    f.take(MAX_FILE_BYTES + 1).read_to_end(&mut bytes).ok()?;
+    if bytes.len() as u64 > MAX_FILE_BYTES || bytes[..bytes.len().min(8000)].contains(&0) {
+        return None; // binary
+    }
+    Some(bytes)
+}
+
+pub fn line_body(line: &str) -> &str {
+    let line = line.strip_suffix('\n').unwrap_or(line);
+    line.strip_suffix('\r').unwrap_or(line)
+}
+
 fn search_text(re: &Regex, text: &str, limit: usize) -> Vec<Hit> {
     let mut hits = Vec::new();
-    for (line_no, line) in text.split('\n').enumerate() {
-        let line = line.strip_suffix('\r').unwrap_or(line);
+    for (line_no, line) in text.split_inclusive('\n').enumerate() {
+        let line = line_body(line);
         for m in re.find_iter(line) {
             if m.start() == m.end() {
                 continue;

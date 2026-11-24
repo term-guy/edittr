@@ -13,6 +13,7 @@ mod highlight;
 mod icons;
 mod installer;
 mod lsp;
+mod replace;
 mod search;
 mod settings;
 mod svn;

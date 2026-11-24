@@ -27,6 +27,7 @@ const STEPS: &[&str] = &[
     "editor",
     "go-to-file",
     "search-in-files",
+    "find-replace",
     "source-control",
     "source-control-tree",
     "diff-side-by-side",
@@ -204,6 +205,13 @@ impl Tour {
                 app.search.show_filters = true;
                 app.ignored = vec!["target".into()];
                 app.start_search(ctx);
+            }
+            "find-replace" => {
+                if let Some(i) = app.tabs.iter().position(|t| matches!(t, Tab::File(_))) {
+                    app.active = i;
+                }
+                app.show_find(true);
+                app.find.set_query_for_tour("lane");
             }
             "source-control" => {
                 app.side = Side::Changes;

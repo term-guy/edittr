@@ -1,4 +1,6 @@
+mod find;
 mod problems;
+mod search_replace;
 #[cfg(feature = "tour")]
 mod tour;
 
@@ -23,6 +25,9 @@ use std::time::{Duration, Instant};
 const SAVE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::S);
 const QUICK_OPEN: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::P);
 const CLOSE_TAB: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::W);
+const FIND: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::F);
+const REPLACE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::H);
+const REPLACE_ALT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::ALT), Key::F);
 const FIND_IN_FILES: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::F);
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(250);
 const GOTO_DEF: KeyboardShortcut = KeyboardShortcut::new(Modifiers::NONE, Key::F12);
@@ -334,6 +339,8 @@ pub struct App {
     open_folder_requested: bool,
     open_folder: Option<String>,
     search: SearchState,
+    find: find::Find,
+    search_replace: search_replace::SearchReplace,
 
     lsp: problems::LanguageServers,
     problems: problems::Problems,
@@ -408,6 +415,8 @@ impl App {
             search: SearchState::default(),
             lsp: problems::LanguageServers::default(),
             problems: problems::Problems::default(),
+            find: find::Find::default(),
+            search_replace: search_replace::SearchReplace::default(),
             goto_rx: None,
             nav_back: Vec::new(),
             install: None,
@@ -495,6 +504,7 @@ impl App {
             || self.confirm.is_some()
             || self.install_prompt.is_some()
             || self.open_folder.is_some()
+            || self.search_replace.confirming()
         {
             return;
         }
@@ -717,6 +727,8 @@ impl App {
         self.poll_goto();
         self.poll_problems();
         self.poll_search(ctx);
+        self.poll_project_replace(ctx);
+        self.poll_find_edit();
         if let Some(err) = self.settings_writer.errors.try_iter().last() {
             self.message = format!("Could not save settings: {err}");
         }
@@ -884,6 +896,10 @@ impl App {
             self.active = i;
             return;
         }
+        if self.search_replace.is_writing(path) {
+            self.message = "Wait for replacements to finish before opening this file".into();
+            return;
+        }
         let text = match read_doc_text(path) {
             Ok(Some(text)) => text,
             Ok(None) => {
@@ -1017,6 +1033,9 @@ impl App {
     // ----------------------------------------------------------- shortcuts
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
+        if self.search_replace.confirming() {
+            return;
+        }
         if ctx.input_mut(|i| i.consume_shortcut(&SAVE)) {
             self.save_active();
         }
@@ -1046,6 +1065,11 @@ impl App {
                 self.search.opts.query = if self.search.opts.regex { regex::escape(&sel) } else { sel };
                 self.start_search(ctx);
             }
+        }
+        if ctx.input_mut(|i| i.consume_shortcut(&REPLACE) || i.consume_shortcut(&REPLACE_ALT)) {
+            self.show_find(true);
+        } else if ctx.input_mut(|i| i.consume_shortcut(&FIND)) {
+            self.show_find(false);
         }
     }
 
@@ -1319,8 +1343,21 @@ impl App {
             r.request_focus();
         }
         let enter = r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+        if self.search_replace.shown {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.search_replace.text)
+                    .hint_text("Replace in files")
+                    .desired_width(f32::INFINITY),
+            );
+        }
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
+            let caret = if self.search_replace.shown {
+                ic::CARET_DOWN
+            } else {
+                ic::CARET_RIGHT
+            };
+            toggle(ui, &mut self.search_replace.shown, caret, "Toggle replace");
             toggle(ui, &mut st.opts.match_case, "Aa", "Match case");
             toggle(ui, &mut st.opts.whole_word, "ab", "Match whole word");
             toggle(ui, &mut st.opts.regex, ".*", "Use regular expression");
@@ -1372,6 +1409,10 @@ impl App {
                 self.ignored_changed(ui.ctx());
             }
         }
+        let show_replace = self.search_replace.shown;
+        let can_replace = self.can_replace_in_files();
+        let replace_all = show_replace && ui.add_enabled(can_replace, egui::Button::new("Replace all")).clicked();
+        self.search_replace.status(ui);
         let st = &mut self.search;
         if let Some(e) = &st.error {
             ui.colored_label(ui.visuals().error_fg_color, e);
@@ -1400,6 +1441,7 @@ impl App {
             }
         }
         let mut toggle_file = None;
+        let mut replace_file = None;
         let mut open = None;
         let mut ignore = None;
         let row_h = 20.0;
@@ -1407,7 +1449,21 @@ impl App {
             .auto_shrink([false, false])
             .show_rows(ui, row_h, rows.len(), |ui, range| {
                 for row in &rows[range] {
-                    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), row_h), egui::Sense::click());
+                    let (mut rect, row_response) = ui.allocate_exact_size(egui::vec2(ui.available_width(), row_h), egui::Sense::hover());
+                    if show_replace && let SearchRow::File(fi) = *row {
+                        let mut button_rect = rect;
+                        button_rect.set_left(rect.right() - 58.0);
+                        rect.set_right(button_rect.left() - 2.0);
+                        let mut buttons = ui.new_child(egui::UiBuilder::new().id_salt(row_response.id).max_rect(button_rect));
+                        if buttons
+                            .add_enabled(can_replace, egui::Button::new("Replace").small())
+                            .on_hover_text("Replace all matches in this file")
+                            .clicked()
+                        {
+                            replace_file = Some(st.results[fi].rel.clone());
+                        }
+                    }
+                    let resp = ui.interact(rect, row_response.id.with("content"), egui::Sense::click());
                     let painter = ui.painter_at(rect);
                     let vis = ui.visuals();
                     if resp.hovered() {
@@ -1497,6 +1553,11 @@ impl App {
         }
         if let Some(rel) = ignore {
             self.ignore_folder(rel, ui.ctx());
+        }
+        if replace_all {
+            self.start_project_replace(None);
+        } else if let Some(rel) = replace_file {
+            self.start_project_replace(Some(rel));
         }
     }
 
@@ -2049,8 +2110,15 @@ impl App {
             }
             _ => Vec::new(),
         };
+        let marks: Vec<std::ops::Range<usize>> = self.find_matches().map(<[_]>::to_vec).unwrap_or_default();
         match &mut self.tabs[active] {
             Tab::File(doc) => {
+                let dialog_open = self.quick_open.is_some()
+                    || self.confirm.is_some()
+                    || self.install_prompt.is_some()
+                    || self.open_folder.is_some()
+                    || self.search_replace.confirming();
+                self.find.bar(ui, doc, dialog_open);
                 let fresh = match self.vcs {
                     Some(Vcs::Svn) => doc.blame_version.is_some() && !doc.dirty(),
                     _ => doc.blame_version == Some(doc.version),
@@ -2061,9 +2129,10 @@ impl App {
                 } else {
                     None
                 };
-                if let Some(idx) = editor(ui, doc, self.settings, inline, &diags) {
+                if let Some(idx) = editor(ui, doc, self.settings, inline, &diags, &marks) {
                     goto_at = Some(idx);
                 }
+                self.find.after_editor(ui, doc);
             }
             Tab::Diff(d) => {
                 ui.horizontal(|ui| {
@@ -2488,6 +2557,7 @@ impl eframe::App for App {
         self.open_requested_folder(frame);
         self.dialogs(&ctx);
         self.sync_active_document();
+        self.project_replace_modal(&ctx);
         #[cfg(feature = "tour")]
         if let Some(mut t) = self.tour.take() {
             t.tick(self, &ctx);
@@ -2601,6 +2671,7 @@ fn editor(
     settings: Settings,
     inline: Option<String>,
     diags: &[(usize, usize, usize, usize, Color32)],
+    find_marks: &[std::ops::Range<usize>],
 ) -> Option<usize> {
     let id = ui.make_persistent_id(("editor", doc.id));
     // A pending selection from elsewhere (search hit, go to definition): char range.
@@ -2634,9 +2705,19 @@ fn editor(
             .map(|&(l0, c0, l1, c1, color)| (at(l0, c0)..at(l1, c1), color))
             .collect()
     };
+    // Find matches (char ranges) to bytes.
+    let marks: Vec<std::ops::Range<usize>> = {
+        let ix = doc.ed.index(&doc.text, doc.version);
+        find_marks
+            .iter()
+            .take(10_000)
+            .map(|r| ix.char_to_byte(&doc.text, r.start)..ix.char_to_byte(&doc.text, r.end))
+            .collect()
+    };
     let extras = editor::Extras {
         inline: inline.as_deref(),
         squiggles: &squiggles,
+        marks: &marks,
         ..Default::default()
     };
     let before = doc.version;
