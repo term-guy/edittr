@@ -1,7 +1,7 @@
 #[cfg(feature = "tour")]
 mod tour;
 
-use crate::column::{self, ColumnSel};
+use crate::editor;
 use crate::graph::Graph;
 use crate::icons as ic;
 use crate::search::{self, FileHits};
@@ -48,11 +48,11 @@ struct Doc {
     cursor: usize,
     /// Other end of the selection (== cursor when nothing is selected).
     anchor: usize,
-    /// Column (box) selection made with a middle-button drag; edits apply to every line.
-    column: Option<ColumnSel>,
-    column_drag: bool,
-    /// The text edit's widget id (last frame), to know whether it has keyboard focus.
-    editor_id: Option<egui::Id>,
+    /// Editor widget state: selections (multi-cursor), undo history.
+    ed: editor::State,
+    /// Text Tab inserts (detected from the file), and the line comment token.
+    indent: String,
+    comment: Option<&'static str>,
     /// Bumped on every edit; `edited_at` is when the last one happened.
     version: u64,
     edited_at: Option<Instant>,
@@ -65,8 +65,6 @@ struct Doc {
     /// Per-frame values cached by `version` (they are O(file size) to compute).
     dirty_cache: std::cell::Cell<(u64, bool)>,
     line_col_cache: std::cell::Cell<(u64, usize, (usize, usize))>,
-    /// Line numbers for the gutter, for (version, text length).
-    gutter: (u64, usize, String),
 }
 
 impl Doc {
@@ -133,25 +131,14 @@ impl Doc {
     }
 
     /// Replace a clean buffer with the latest text from disk.
-    fn reload(&mut self, text: String, ctx: &egui::Context) {
-        use egui::text::{CCursor, CCursorRange};
+    fn reload(&mut self, text: String, _ctx: &egui::Context) {
         let len = text.chars().count();
         self.cursor = self.cursor.min(len);
         self.anchor = self.anchor.min(len);
         self.goto = self.goto.map(|(a, b)| (a.min(len), b.min(len)));
-        self.column = None;
-        self.column_drag = false;
-        if let Some(id) = self.editor_id
-            && let Some(mut state) = egui::TextEdit::load_state(ctx, id)
-        {
-            state
-                .cursor
-                .set_char_range(Some(CCursorRange::two(CCursor::new(self.cursor), CCursor::new(self.anchor))));
-            state.store(ctx, id);
-        }
         self.saved = text.clone();
         self.text = text;
-        self.version += 1;
+        self.version += 1; // the editor clamps its selections to the new text
         self.clear_blame();
     }
 
@@ -910,6 +897,8 @@ impl App {
             .or_else(|| path.file_name())
             .map(|e| e.to_string_lossy().into_owned())
             .unwrap_or_default();
+        let indent = editor::detect_indent(&text);
+        let comment = editor::comment_token(&lang.to_lowercase());
         self.tabs.push(Tab::File(Doc {
             id: self.next_doc_id,
             path: path.to_path_buf(),
@@ -919,9 +908,9 @@ impl App {
             goto: None,
             cursor: 0,
             anchor: 0,
-            column: None,
-            column_drag: false,
-            editor_id: None,
+            ed: Default::default(),
+            indent,
+            comment,
             version: 0,
             edited_at: None,
             blame: None,
@@ -930,7 +919,6 @@ impl App {
             hl: Default::default(),
             dirty_cache: Default::default(),
             line_col_cache: std::cell::Cell::new((u64::MAX, 0, (0, 0))),
-            gutter: (u64::MAX, 0, String::new()),
         }));
         self.next_doc_id += 1;
         // Warm up the language server so the first go-to-definition is fast.
@@ -2633,355 +2621,39 @@ mod folder_picker {
 // -------------------------------------------------------------- widgets
 
 /// Draws the editor. Returns a char index when the user Ctrl/Cmd+clicked a symbol.
+/// Draws the editor. Returns a char index when the user Ctrl/Cmd+clicked a symbol.
 fn editor(ui: &mut egui::Ui, doc: &mut Doc, settings: Settings, inline: Option<String>) -> Option<usize> {
-    let mut goto_request = None;
-    let highlight = doc.text.len() <= HIGHLIGHT_LIMIT;
-    let lang = doc.lang.clone();
-    // Taken out of `doc` while the editor (which also needs `doc`) is shown; put back below.
-    let mut hl = std::mem::take(&mut doc.hl);
-    let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, _wrap: f32| hl.layout(ui, buf.as_str(), &lang, highlight);
-    if doc.gutter.0 != doc.version || doc.gutter.1 != doc.text.len() {
-        let lines = doc.text.split('\n').count();
-        doc.gutter = (doc.version, doc.text.len(), (1..=lines).map(|n| format!("{n:>4}\n")).collect());
+    let id = ui.make_persistent_id(("editor", doc.id));
+    // A pending selection from elsewhere (search hit, go to definition): char range.
+    if let Some((a, b)) = doc.goto.take() {
+        let ix = doc.ed.index(&doc.text, doc.version);
+        let (a, b) = (ix.char_to_byte(&doc.text, a), ix.char_to_byte(&doc.text, b));
+        doc.ed.select(a..b);
+        ui.memory_mut(|m| m.request_focus(id));
     }
-    egui::ScrollArea::both()
-        .id_salt(&doc.path)
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            ui.horizontal_top(|ui| {
-                let line_slot = settings.highlight_line.then(|| ui.painter().add(egui::Shape::Noop));
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(doc.gutter.2.as_str())
-                            .monospace()
-                            .color(ui.visuals().weak_text_color()),
-                    )
-                    .selectable(false),
-                );
-                // Column mode takes the keys it handles before the text edit sees them.
-                let focused = doc.editor_id.is_some_and(|id| ui.memory(|m| m.has_focus(id)));
-                if focused && doc.column.is_some() {
-                    column_input(ui, doc);
-                }
-                let out = egui::TextEdit::multiline(&mut doc.text)
-                    .code_editor()
-                    .frame(egui::Frame::NONE)
-                    .lock_focus(true)
-                    .desired_width(f32::INFINITY)
-                    .desired_rows(40)
-                    .layouter(&mut layouter)
-                    .show(ui);
-                paint_current_line(ui, line_slot, &out);
-                if out.response.changed() {
-                    doc.version += 1;
-                    doc.edited_at = Some(Instant::now());
-                }
-                if let Some(text) = inline
-                    && doc.column.is_none()
-                {
-                    paint_inline_blame(ui, &out, &text);
-                }
-                if settings.show_whitespace {
-                    paint_whitespace(ui, &out);
-                }
-
-                if let Some((a, b)) = doc.goto.take() {
-                    use egui::text::{CCursor, CCursorRange};
-                    let mut state = out.state.clone();
-                    state
-                        .cursor
-                        .set_char_range(Some(CCursorRange::two(CCursor::new(a), CCursor::new(b))));
-                    state.store(ui.ctx(), out.response.id);
-                    out.response.request_focus();
-                    let rect = out.galley.pos_from_cursor(CCursor::new(a)).translate(out.galley_pos.to_vec2());
-                    ui.scroll_to_rect(rect.expand(40.0), Some(egui::Align::Center));
-                } else if let Some(r) = out.cursor_range {
-                    doc.cursor = r.primary.index.0;
-                    doc.anchor = r.secondary.index.0;
-                }
-                doc.editor_id = Some(out.response.id);
-                column_mouse(ui, doc, &out);
-
-                // Ctrl/Cmd + hover underlines the symbol; Ctrl/Cmd + click jumps to it.
-                let mods = ui.input(|i| i.modifiers);
-                if (mods.command || mods.ctrl)
-                    && let Some(pos) = out.response.hover_pos()
-                {
-                    let idx = out.galley.cursor_from_pos(pos - out.galley_pos).index.0;
-                    if let Some((range, _)) = goto::word_at(&doc.text, idx) {
-                        use egui::text::CCursor;
-                        let a = out
-                            .galley
-                            .pos_from_cursor(CCursor::new(range.start))
-                            .translate(out.galley_pos.to_vec2());
-                        let b = out
-                            .galley
-                            .pos_from_cursor(CCursor::new(range.end))
-                            .translate(out.galley_pos.to_vec2());
-                        let color = ui.visuals().hyperlink_color;
-                        ui.painter()
-                            .line_segment([a.left_bottom(), b.left_bottom()], egui::Stroke::new(1.0, color));
-                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                        if out.response.clicked() {
-                            goto_request = Some(idx);
-                        }
-                    }
-                }
-            });
-        });
-    doc.hl = hl;
-    goto_request
-}
-
-/// Line and (virtual, may be past the line end) column under `pos`.
-fn column_pos(ui: &egui::Ui, text: &str, out: &egui::text_edit::TextEditOutput, pos: egui::Pos2) -> (usize, usize) {
-    let idx = out.galley.cursor_from_pos(pos - out.galley_pos).index.0;
-    let starts = column::line_starts(text);
-    let line = starts.partition_point(|&s| s <= idx).saturating_sub(1);
-    let font = egui::TextStyle::Monospace.resolve(ui.style());
-    let cw = ui.fonts_mut(|f| f.glyph_width(&font, 'x')).max(1.0);
-    let col = ((pos.x - out.galley_pos.x) / cw).round().max(0.0) as usize;
-    (line, col)
-}
-
-/// Middle-button drag makes a column selection; a primary click ends it. Also paints it.
-fn column_mouse(ui: &egui::Ui, doc: &mut Doc, out: &egui::text_edit::TextEditOutput) {
-    use egui::PointerButton::{Middle, Primary};
-    let (pressed_mid, down_mid, pressed_primary, pos) = ui.input(|i| {
-        (
-            i.pointer.button_pressed(Middle),
-            i.pointer.button_down(Middle),
-            i.pointer.button_pressed(Primary),
-            i.pointer.interact_pos(),
-        )
-    });
-    let inside = pos.is_some_and(|p| out.response.rect.contains(p) && ui.clip_rect().contains(p));
-    if pressed_mid && inside {
-        let (line, col) = column_pos(ui, &doc.text, out, pos.unwrap());
-        doc.column = Some(ColumnSel {
-            anchor_line: line,
-            anchor_col: col,
-            head_line: line,
-            head_col: col,
-        });
-        doc.column_drag = true;
-        out.response.request_focus();
-    } else if doc.column_drag {
-        if down_mid {
-            if let (Some(p), Some(sel)) = (pos, doc.column.as_mut()) {
-                (sel.head_line, sel.head_col) = column_pos(ui, &doc.text, out, p);
-                ui.scroll_to_rect(egui::Rect::from_center_size(p, egui::vec2(1.0, 1.0)), None);
-            }
-        } else {
-            doc.column_drag = false;
-        }
-    } else if pressed_primary && inside {
-        doc.column = None;
-    }
-    let Some(sel) = doc.column else { return };
-    if !ui.memory(|m| m.has_focus(out.response.id)) && !doc.column_drag {
-        // Focus moved elsewhere (another tab, a panel): drop the column selection.
-        if ui.memory(|m| m.focused().is_some()) {
-            doc.column = None;
-        }
-        return;
-    }
-
-    // Keep the text edit's own cursor on the head line so it lines up with the column carets.
-    use egui::text::{CCursor, CCursorRange};
-    let starts = column::line_starts(&doc.text);
-    let lens = column::line_lens(&doc.text);
-    let lines = sel.lines();
-    let lines = lines.start.min(starts.len())..lines.end.min(starts.len());
-    if let (Some(&hs), Some(&hl)) = (starts.get(sel.head_line), lens.get(sel.head_line)) {
-        let c = hs + sel.caret_in(hl);
-        let mut state = out.state.clone();
-        state.cursor.set_char_range(Some(CCursorRange::one(CCursor::new(c))));
-        state.store(ui.ctx(), out.response.id);
-        doc.cursor = c;
-        doc.anchor = c;
-    }
-    let painter = ui.painter_at(ui.clip_rect());
-    let at = |c: usize| out.galley.pos_from_cursor(CCursor::new(c)).translate(out.galley_pos.to_vec2());
-    let sel_color = ui.visuals().selection.bg_fill.gamma_multiply(0.5);
-    let caret = egui::Stroke::new(1.5, ui.visuals().text_cursor.stroke.color);
-    for l in lines {
-        let r = sel.range_in(lens[l]);
-        let (a, b) = (at(starts[l] + r.start), at(starts[l] + r.end));
-        if r.start < r.end {
-            painter.rect_filled(egui::Rect::from_min_max(a.min, egui::pos2(b.min.x, a.max.y)), 0.0, sel_color);
-        }
-        let x = at(starts[l] + sel.caret_in(lens[l])).min.x;
-        painter.line_segment([egui::pos2(x, a.min.y), egui::pos2(x, a.max.y)], caret);
-    }
-}
-
-/// Keyboard input while a column selection is active: edits apply to every selected line.
-fn column_input(ui: &mut egui::Ui, doc: &mut Doc) {
-    use column::Edit;
-    let Some(mut sel) = doc.column else { return };
-    let mut edited = false;
-    let mut copied = None;
-    let mut exit = false;
-    let events = ui.input_mut(|i| std::mem::take(&mut i.events));
-    let mut rest = Vec::new();
-    for ev in events {
-        if exit {
-            rest.push(ev);
-            continue;
-        }
-        match &ev {
-            egui::Event::Text(t) if !t.contains('\n') => {
-                edited = true;
-                column::apply(&mut doc.text, &mut sel, Edit::Insert(t))
-            }
-            egui::Event::Copy | egui::Event::Cut => {
-                copied = Some(column::selected_text(&doc.text, &sel));
-                if matches!(ev, egui::Event::Cut) && !sel.is_empty() {
-                    edited = true;
-                    column::apply(&mut doc.text, &mut sel, Edit::Delete);
-                }
-            }
-            egui::Event::Paste(p) => {
-                let pieces: Vec<&str> = p.lines().collect();
-                if !p.contains('\n') {
-                    edited = true;
-                    column::apply(&mut doc.text, &mut sel, Edit::Insert(p));
-                } else if pieces.len() == sel.lines().len() {
-                    edited = true;
-                    column::apply(&mut doc.text, &mut sel, Edit::InsertPerLine(pieces));
-                } else {
-                    exit = true;
-                    rest.push(ev);
-                }
-            }
-            egui::Event::Key {
-                key,
-                pressed: true,
-                modifiers,
-                ..
-            } => {
-                let shift = modifiers.shift;
-                match key {
-                    Key::Backspace => {
-                        edited = true;
-                        column::apply(&mut doc.text, &mut sel, Edit::Backspace)
-                    }
-                    Key::Delete => {
-                        edited = true;
-                        column::apply(&mut doc.text, &mut sel, Edit::Delete)
-                    }
-                    Key::Tab if !shift => {
-                        edited = true;
-                        column::apply(&mut doc.text, &mut sel, Edit::Insert("\t"))
-                    }
-                    Key::ArrowLeft if !modifiers.command && !modifiers.alt => sel.move_by(-1, shift, &doc.text),
-                    Key::ArrowRight if !modifiers.command && !modifiers.alt => sel.move_by(1, shift, &doc.text),
-                    Key::Home => sel.home_end(false, shift),
-                    Key::End => sel.home_end(true, shift),
-                    Key::ArrowLeft if modifiers.command => sel.home_end(false, shift), // macOS Cmd+Left
-                    Key::ArrowRight if modifiers.command => sel.home_end(true, shift),
-                    // Copy/cut/paste arrive as their own events too (handled above).
-                    Key::C | Key::X | Key::V if modifiers.command => rest.push(ev),
-                    // Shortcuts (save, undo, select all, ...) and anything else end column mode.
-                    Key::Escape => exit = true,
-                    _ => {
-                        exit = true;
-                        rest.push(ev);
-                    }
-                }
-            }
-            // Key releases and the like: keep for other widgets.
-            egui::Event::Key { .. } | egui::Event::PointerMoved(_) | egui::Event::PointerButton { .. } => rest.push(ev),
-            egui::Event::Text(_) => {
-                exit = true;
-                rest.push(ev);
-            }
-            _ => rest.push(ev),
-        }
-    }
-    ui.input_mut(|i| i.events = rest);
-    if edited {
-        doc.version += 1;
+    let opts = editor::Options {
+        lang: &doc.lang,
+        highlight: doc.text.len() <= HIGHLIGHT_LIMIT,
+        whitespace: settings.show_whitespace,
+        current_line: settings.highlight_line,
+        indent: &doc.indent,
+        comment: doc.comment,
+    };
+    let extras = editor::Extras {
+        inline: inline.as_deref(),
+        ..Default::default()
+    };
+    let before = doc.version;
+    let out = editor::show(ui, id, &mut doc.ed, &mut doc.text, &mut doc.version, &mut doc.hl, &opts, &extras);
+    if doc.version != before {
         doc.edited_at = Some(Instant::now());
     }
-    if let Some(t) = copied {
-        ui.ctx().copy_text(t);
-    }
-    doc.column = (!exit).then_some(sel);
-}
-
-/// Dimmed blame text after the end of the cursor's line (single-line selection only).
-fn paint_inline_blame(ui: &egui::Ui, out: &egui::text_edit::TextEditOutput, text: &str) {
-    let Some(range) = out.state.cursor.char_range() else { return };
-    let cursor = out.galley.layout_from_cursor(range.primary);
-    if !range.is_empty() && cursor.row != out.galley.layout_from_cursor(range.secondary).row {
-        return;
-    }
-    let Some(row) = out.galley.rows.get(cursor.row) else { return };
-    let rect = row.rect().translate(out.galley_pos.to_vec2());
-    let font = egui::TextStyle::Monospace.resolve(ui.style());
-    let color = ui.visuals().weak_text_color().gamma_multiply(0.8);
-    ui.painter().text(
-        egui::pos2(rect.max.x + 32.0, rect.center().y),
-        egui::Align2::LEFT_CENTER,
-        text,
-        font,
-        color,
-    );
-}
-
-/// Middle dots for spaces and arrows for tabs, on the visible rows only.
-fn paint_whitespace(ui: &egui::Ui, out: &egui::text_edit::TextEditOutput) {
-    let clip = ui.clip_rect();
-    let origin = out.galley_pos.to_vec2();
-    let rows = &out.galley.rows;
-    let first = rows.partition_point(|r| r.max_y() + origin.y < clip.min.y);
-    let color = ui.visuals().weak_text_color().gamma_multiply(0.6);
-    let stroke = egui::Stroke::new(1.0, color);
-    let painter = ui.painter();
-    for row in rows[first..].iter().take_while(|r| r.min_y() + origin.y <= clip.max.y) {
-        let y = row.rect().center().y + origin.y;
-        for g in &row.row.glyphs {
-            if g.chr != ' ' && g.chr != '\t' {
-                continue;
-            }
-            let x0 = row.pos.x + g.pos.x + origin.x;
-            let x1 = x0 + g.advance_width;
-            if x1 < clip.min.x || x0 > clip.max.x {
-                continue;
-            }
-            if g.chr == ' ' {
-                painter.circle_filled(egui::pos2((x0 + x1) / 2.0, y), 1.0, color);
-            } else {
-                let (a, b) = (x0 + 2.0, (x1 - 2.0).max(x0 + 6.0));
-                painter.line_segment([egui::pos2(a, y), egui::pos2(b, y)], stroke);
-                painter.line_segment([egui::pos2(b - 3.0, y - 3.0), egui::pos2(b, y)], stroke);
-                painter.line_segment([egui::pos2(b - 3.0, y + 3.0), egui::pos2(b, y)], stroke);
-            }
-        }
-    }
-}
-
-fn paint_current_line(ui: &egui::Ui, slot: Option<egui::layers::ShapeIdx>, out: &egui::text_edit::TextEditOutput) {
-    let (Some(slot), Some(selection)) = (slot, out.state.cursor.char_range()) else {
-        return;
-    };
-    // Shown even while another panel has focus, like VS Code.
-    let cursor = out.galley.layout_from_cursor(selection.primary);
-    if !selection.is_empty() && cursor.row != out.galley.layout_from_cursor(selection.secondary).row {
-        return;
-    }
-
-    let mut row = out.galley.pos_from_layout_cursor(&cursor).translate(out.galley_pos.to_vec2());
-    if row.height() == 0.0 {
-        row.max.y += ui.text_style_height(&egui::TextStyle::Monospace);
-    }
-    let clip = ui.clip_rect();
-    row.min.x = clip.min.x;
-    row.max.x = clip.max.x;
-    let color = ui.visuals().text_color().gamma_multiply(0.08);
-    ui.painter().set(slot, egui::Shape::rect_filled(row, 0.0, color));
+    // Mirror the primary selection as char indices for the rest of the app.
+    let p = doc.ed.primary();
+    let ix = doc.ed.index(&doc.text, doc.version);
+    doc.cursor = ix.byte_to_char(&doc.text, p.head);
+    doc.anchor = ix.byte_to_char(&doc.text, p.anchor);
+    out.goto.map(|b| ix.byte_to_char(&doc.text, b))
 }
 
 fn diff_view(ui: &mut egui::Ui, lines: &[String], id: &str) {

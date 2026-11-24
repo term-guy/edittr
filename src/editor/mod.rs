@@ -1,0 +1,1360 @@
+//! The code editor widget. Unlike `egui::TextEdit` it lays out and paints only the
+//! visible lines (each line is its own small galley, cached by egui), so frame cost
+//! doesn't grow with file size, and it supports multiple cursors natively.
+//!
+//! The text stays a plain `String` owned by the caller (the rest of the app reads it);
+//! positions are byte offsets (see [`buffer`]).
+
+pub mod buffer;
+
+use crate::highlight;
+use buffer::{History, Kind, LineIndex, Sel};
+use eframe::egui::{self, Color32, Event, Key, Pos2, Rect, Sense, Stroke, Vec2, text::CCursor, text::LayoutJob};
+use std::ops::Range;
+use std::sync::Arc;
+
+#[derive(Clone, Copy, PartialEq)]
+enum Unit {
+    Char,
+    Word,
+    Line,
+}
+
+enum Drag {
+    /// Primary-button selection; `origin` is the word/line first clicked (for word/line snapping).
+    Select { origin: Range<usize>, unit: Unit },
+    /// Middle-button box selection: anchor line and x (content coordinates).
+    Column { line: usize, x: f32 },
+}
+
+/// Editor state for one document (selections, undo history, scroll requests).
+#[derive(Default)]
+pub struct State {
+    /// Selections; the last one is the primary (it scrolls into view, gets the IME).
+    pub sels: Vec<Sel>,
+    pub history: History,
+    index: LineIndex,
+    index_version: Option<u64>,
+    /// x the caret tries to keep while moving up/down.
+    preferred_x: Option<f32>,
+    drag: Option<Drag>,
+    /// Cmd/Ctrl was held on press: a click (without dragging) goes to the definition.
+    goto_press: Option<usize>,
+    last_press: Option<(f64, Pos2, u8)>,
+    preedit: Option<String>,
+    /// Scroll the primary caret into view next frame (true: centered).
+    reveal: Option<bool>,
+    /// Where the pointer rests (byte, since when), for hover requests.
+    rest: Option<(usize, f64)>,
+}
+
+impl State {
+    pub fn primary(&self) -> Sel {
+        self.sels.last().copied().unwrap_or(Sel::caret(0))
+    }
+
+    /// Line index for `text` at `version` (rebuilt after any change).
+    pub fn index(&mut self, text: &str, version: u64) -> &LineIndex {
+        if self.index_version != Some(version) {
+            self.index = LineIndex::new(text);
+            self.index_version = Some(version);
+            // The text may have been changed elsewhere (reload, replace): keep selections valid.
+            let fix = |mut b: usize| {
+                b = b.min(text.len());
+                while !text.is_char_boundary(b) {
+                    b -= 1;
+                }
+                b
+            };
+            for s in &mut self.sels {
+                s.anchor = fix(s.anchor);
+                s.head = fix(s.head);
+            }
+        }
+        &self.index
+    }
+
+    /// Select a range (byte offsets) and scroll it to the center.
+    pub fn select(&mut self, range: Range<usize>) {
+        self.sels = vec![Sel {
+            anchor: range.start,
+            head: range.end,
+        }];
+        self.reveal = Some(true);
+        self.preferred_x = None;
+        self.history.seal();
+    }
+}
+
+pub struct Options<'a> {
+    pub lang: &'a str,
+    pub highlight: bool,
+    pub whitespace: bool,
+    pub current_line: bool,
+    /// Text inserted by Tab (e.g. four spaces or "\t").
+    pub indent: &'a str,
+    /// Line comment token for Cmd+/ (None: no toggle).
+    pub comment: Option<&'a str>,
+}
+
+/// Decorations supplied by the app.
+#[derive(Default)]
+pub struct Extras<'a> {
+    /// Dimmed text after the end of the primary caret's line (inline blame).
+    pub inline: Option<&'a str>,
+    /// Squiggly underlines (byte ranges), e.g. diagnostics.
+    pub squiggles: &'a [(Range<usize>, Color32)],
+    /// Background marks (byte ranges), e.g. find matches.
+    pub marks: &'a [Range<usize>],
+    /// Gutter markers per line (e.g. added / modified lines vs. git).
+    pub gutter: &'a [(usize, Color32)],
+}
+
+#[derive(Default)]
+pub struct Output {
+    pub changed: bool,
+    /// Cmd/Ctrl+click on a symbol: go to its definition (byte offset).
+    pub goto: Option<usize>,
+    /// The pointer has rested on this byte offset for a while (hover info).
+    pub hover: Option<(usize, Pos2)>,
+    /// Screen position of the primary caret (for popups such as completion).
+    pub caret_rect: Option<Rect>,
+    pub focused: bool,
+}
+
+struct Layout {
+    row_h: f32,
+    /// Screen x where text starts (after the gutter), at the current horizontal scroll.
+    text_x: f32,
+    /// Screen y of line 0.
+    top: f32,
+}
+
+impl Layout {
+    fn line_y(&self, l: usize) -> f32 {
+        self.top + l as f32 * self.row_h
+    }
+}
+
+fn line_job(text: &str, ix: &LineIndex, l: usize, spans: Option<&[highlight::Line]>, font: &egui::FontId, color: Color32) -> LayoutJob {
+    let range = ix.line_range(text, l);
+    let line = &text[range.clone()];
+    let mut job = LayoutJob::default();
+    job.wrap.max_width = f32::INFINITY;
+    let spans = spans.and_then(|s| s.get(l)).map(|l| l.spans.as_slice()).unwrap_or_default();
+    let mut pos = 0;
+    for s in spans {
+        let (a, b) = (s.range.start.min(line.len()), s.range.end.min(line.len()));
+        if a >= b || a < pos {
+            continue;
+        }
+        if a > pos {
+            job.append(&line[pos..a], 0.0, egui::TextFormat::simple(font.clone(), color));
+        }
+        job.append(
+            &line[a..b],
+            0.0,
+            egui::TextFormat {
+                font_id: font.clone(),
+                color: s.color,
+                italics: s.italics,
+                underline: if s.underline { Stroke::new(1.0, s.color) } else { Stroke::NONE },
+                ..Default::default()
+            },
+        );
+        pos = b;
+    }
+    if pos < line.len() || line.is_empty() {
+        job.append(&line[pos..], 0.0, egui::TextFormat::simple(font.clone(), color));
+    }
+    job
+}
+
+/// Lays out lines on demand (egui caches galleys between frames).
+struct Lines<'a> {
+    ui: &'a egui::Ui,
+    text: &'a str,
+    ix: &'a LineIndex,
+    spans: Option<&'a [highlight::Line]>,
+    font: egui::FontId,
+    color: Color32,
+}
+
+impl Lines<'_> {
+    fn galley(&self, l: usize) -> Arc<egui::Galley> {
+        let job = line_job(self.text, self.ix, l, self.spans, &self.font, self.color);
+        self.ui.fonts_mut(|f| f.layout_job(job))
+    }
+
+    /// x (relative to text start) of byte offset `b`.
+    fn x_of(&self, b: usize) -> f32 {
+        let (l, col) = self.ix.line_col(b);
+        let range = self.ix.line_range(self.text, l);
+        let col = col.min(range.len());
+        let chars = self.text[range.start..range.start + col].chars().count();
+        self.galley(l).pos_from_cursor(CCursor::new(chars)).min.x
+    }
+
+    /// Byte offset on line `l` closest to x (relative to text start).
+    fn byte_at_x(&self, l: usize, x: f32) -> usize {
+        let range = self.ix.line_range(self.text, l);
+        let g = self.galley(l);
+        let c = g.cursor_from_pos(Vec2::new(x, 0.0)).index.0;
+        let line = &self.text[range.clone()];
+        range.start + line.char_indices().nth(c).map_or(line.len(), |(i, _)| i)
+    }
+}
+
+/// Show the editor. `version` is bumped when the text changes.
+#[allow(clippy::too_many_arguments)]
+pub fn show(
+    ui: &mut egui::Ui,
+    id_salt: egui::Id,
+    st: &mut State,
+    text: &mut String,
+    version: &mut u64,
+    hl: &mut highlight::Cache,
+    opts: &Options,
+    extras: &Extras,
+) -> Output {
+    let mut out = Output::default();
+    let id = id_salt;
+    if st.sels.is_empty() {
+        st.sels.push(Sel::caret(0));
+    }
+    let font = egui::TextStyle::Monospace.resolve(ui.style());
+    let (row_h, char_w) = ui.fonts_mut(|f| (f.row_height(&font), f.glyph_width(&font, 'x')));
+    let is_mac = ui.ctx().os() == egui::os::OperatingSystem::Mac;
+    let focused = ui.memory(|m| m.has_focus(id));
+    out.focused = focused;
+
+    // ---- keyboard (before layout, so this frame shows the result)
+    if focused {
+        ui.memory_mut(|m| {
+            m.set_focus_lock_filter(
+                id,
+                egui::EventFilter {
+                    tab: true,
+                    horizontal_arrows: true,
+                    vertical_arrows: true,
+                    // Esc collapses multiple cursors; the editor keeps focus (like VS Code).
+                    escape: true,
+                },
+            )
+        });
+        let viewport_rows = (ui.available_height() / row_h).max(1.0) as usize;
+        let events = ui.input(|i| i.events.clone());
+        let ctx = KeyCtx {
+            font: &font,
+            is_mac,
+            viewport_rows,
+            opts,
+        };
+        for ev in events {
+            if handle_event(ui, st, text, version, &ctx, &ev) {
+                out.changed = true;
+            }
+        }
+    }
+
+    // ---- layout
+    let ix = st.index(text, *version).clone();
+    let spans = if opts.highlight {
+        hl.spans(ui.ctx(), *version, text, opts.lang, ui.visuals().dark_mode)
+    } else {
+        None
+    };
+    let digits = ix.lines().to_string().len().max(3);
+    let gutter_w = (digits as f32 + 2.5) * char_w;
+    let content = Vec2::new(
+        gutter_w + (ix.max_line_bytes as f32 + 8.0) * char_w + 200.0,
+        // Let the last line scroll up to the middle of the view.
+        (ix.lines() as f32) * row_h + ui.available_height() * 0.5,
+    );
+    let text_color = ui.visuals().text_color();
+
+    let scroll = egui::ScrollArea::both()
+        .id_salt(id.with("scroll"))
+        .auto_shrink([false, false])
+        .show_viewport(ui, |ui, vp| {
+            let (rect, _) = ui.allocate_exact_size(content, Sense::hover());
+            let resp = ui.interact(rect, id, Sense::click_and_drag());
+            let lay = Layout {
+                row_h,
+                text_x: rect.min.x + gutter_w,
+                top: rect.min.y,
+            };
+            let lines = Lines {
+                ui,
+                text,
+                ix: &ix,
+                spans,
+                font: font.clone(),
+                color: text_color,
+            };
+            let visible = (vp.min.y / row_h).floor().max(0.0) as usize..((vp.max.y / row_h).ceil() as usize + 1).min(ix.lines());
+            let clip = Rect::from_min_max(
+                Pos2::new(rect.min.x + vp.min.x + gutter_w, rect.min.y + vp.min.y),
+                rect.min + vp.max.to_vec2(),
+            );
+
+            // ---- mouse
+            let ptr = mouse(ui, st, &resp, &lines, &lay, is_mac, &mut out);
+
+            // ---- paint
+            let painter = ui.painter().with_clip_rect(clip);
+            let primary = st.primary();
+            let (pl, _) = ix.line_col(primary.head);
+            let single_line = ix.line_of_byte(primary.anchor) == pl;
+            let galleys: Vec<(usize, Arc<egui::Galley>)> = visible.clone().map(|l| (l, lines.galley(l))).collect();
+
+            if opts.current_line && single_line && st.sels.len() == 1 && visible.contains(&pl) {
+                let y = lay.line_y(pl);
+                let band = Rect::from_min_max(Pos2::new(clip.min.x - gutter_w, y), Pos2::new(clip.max.x, y + row_h));
+                ui.painter()
+                    .with_clip_rect(ui.clip_rect())
+                    .rect_filled(band, 0.0, text_color.gamma_multiply(0.06));
+            }
+            let x_in = |l: usize, g: &egui::Galley, b: usize| {
+                let range = ix.line_range(text, l);
+                let b = b.clamp(range.start, range.end);
+                lay.text_x + g.pos_from_cursor(CCursor::new(text[range.start..b].chars().count())).min.x
+            };
+            // Marks (find matches), then selections.
+            let paint_ranges = |ranges: &mut dyn Iterator<Item = Range<usize>>, color: Color32, extend_eol: bool| {
+                for r in ranges {
+                    if r.is_empty() {
+                        continue;
+                    }
+                    let (l0, l1) = (ix.line_of_byte(r.start), ix.line_of_byte(r.end));
+                    for (l, g) in &galleys {
+                        if *l < l0 || *l > l1 {
+                            continue;
+                        }
+                        let lr = ix.line_range(text, *l);
+                        let a = x_in(*l, g, r.start.max(lr.start));
+                        let mut b = x_in(*l, g, r.end.min(lr.end));
+                        if extend_eol && r.end > lr.end {
+                            b += char_w * 0.6;
+                        }
+                        let y = lay.line_y(*l);
+                        painter.rect_filled(Rect::from_min_max(Pos2::new(a, y), Pos2::new(b, y + row_h)), 2.0, color);
+                    }
+                }
+            };
+            let mark = ui.visuals().warn_fg_color.gamma_multiply(0.25);
+            paint_ranges(&mut extras.marks.iter().cloned(), mark, false);
+            let sel_color = ui.visuals().selection.bg_fill.gamma_multiply(if focused { 0.7 } else { 0.4 });
+            paint_ranges(&mut st.sels.iter().map(|s| s.range()), sel_color, true);
+
+            // Text.
+            for (l, g) in &galleys {
+                painter.galley(Pos2::new(lay.text_x, lay.line_y(*l)), g.clone(), text_color);
+            }
+            if opts.whitespace {
+                let color = ui.visuals().weak_text_color().gamma_multiply(0.6);
+                for (l, g) in &galleys {
+                    paint_whitespace(&painter, g, Pos2::new(lay.text_x, lay.line_y(*l)), color);
+                }
+            }
+            // Squiggles.
+            for (r, color) in extras.squiggles {
+                let (l0, l1) = (ix.line_of_byte(r.start), ix.line_of_byte(r.end));
+                for (l, g) in &galleys {
+                    if *l < l0 || *l > l1 {
+                        continue;
+                    }
+                    let lr = ix.line_range(text, *l);
+                    let a = x_in(*l, g, r.start.max(lr.start));
+                    let b = x_in(*l, g, r.end.min(lr.end)).max(a + char_w);
+                    squiggle(&painter, a, b, lay.line_y(*l) + row_h - 1.5, *color);
+                }
+            }
+            // Inline blame after the primary line.
+            if let Some(inline) = extras.inline
+                && single_line
+                && let Some((_, g)) = galleys.iter().find(|(l, _)| *l == pl)
+            {
+                let color = ui.visuals().weak_text_color().gamma_multiply(0.8);
+                let p = Pos2::new(lay.text_x + g.size().x + 4.0 * char_w, lay.line_y(pl) + row_h / 2.0);
+                painter.text(p, egui::Align2::LEFT_CENTER, inline, font.clone(), color);
+            }
+            // Carets (solid, no blinking: blinking would need a repaint twice a second).
+            let caret_color = ui.visuals().text_cursor.stroke.color;
+            for s in &st.sels {
+                let (l, _) = ix.line_col(s.head);
+                if let Some((_, g)) = galleys.iter().find(|(gl, _)| *gl == l) {
+                    let x = x_in(l, g, s.head);
+                    let y = lay.line_y(l);
+                    if focused || st.sels.len() > 1 {
+                        painter.line_segment([Pos2::new(x, y), Pos2::new(x, y + row_h)], Stroke::new(2.0, caret_color));
+                    }
+                }
+            }
+            // IME pre-edit text at the caret.
+            let caret_x = lines.x_of(primary.head);
+            let caret_rect = Rect::from_min_size(Pos2::new(lay.text_x + caret_x, lay.line_y(pl)), Vec2::new(2.0, row_h));
+            if let Some(pre) = &st.preedit {
+                let g = ui.fonts_mut(|f| f.layout_no_wrap(pre.clone(), font.clone(), text_color));
+                let r = Rect::from_min_size(caret_rect.min, g.size());
+                painter.rect_filled(r, 0.0, ui.visuals().extreme_bg_color);
+                painter.galley(r.min, g, text_color);
+                painter.line_segment([r.left_bottom(), r.right_bottom()], Stroke::new(1.0, text_color));
+            }
+            out.caret_rect = Some(caret_rect);
+
+            // Gutter (fixed while scrolling horizontally).
+            let gx = rect.min.x + vp.min.x;
+            let gutter_clip = Rect::from_min_max(Pos2::new(gx, clip.min.y), Pos2::new(gx + gutter_w, clip.max.y));
+            let gp = ui.painter().with_clip_rect(gutter_clip);
+            gp.rect_filled(gutter_clip, 0.0, ui.visuals().panel_fill);
+            let weak = ui.visuals().weak_text_color();
+            let strong = ui.visuals().strong_text_color();
+            for l in visible.clone() {
+                let y = lay.line_y(l);
+                let color = if l == pl { strong } else { weak };
+                gp.text(
+                    Pos2::new(gx + gutter_w - 1.5 * char_w, y),
+                    egui::Align2::RIGHT_TOP,
+                    (l + 1).to_string(),
+                    font.clone(),
+                    color,
+                );
+            }
+            for &(l, color) in extras.gutter {
+                if visible.contains(&l) {
+                    let y = lay.line_y(l);
+                    gp.rect_filled(
+                        Rect::from_min_size(Pos2::new(gx + gutter_w - 0.9 * char_w, y), Vec2::new(3.0, row_h)),
+                        0.0,
+                        color,
+                    );
+                }
+            }
+
+            // Scroll requests.
+            if let Some(center) = st.reveal.take() {
+                let r = caret_rect.expand2(Vec2::new(4.0 * char_w, row_h));
+                let r = r.translate(Vec2::new(-gutter_w, 0.0)).union(r); // keep the gutter from covering it
+                ui.scroll_to_rect(r, if center { Some(egui::Align::Center) } else { None });
+            }
+            ptr
+        });
+
+    // IME: report where the caret is, so the candidate window opens next to it.
+    if focused && let Some(caret) = out.caret_rect {
+        let to_global = ui.ctx().layer_transform_to_global(ui.layer_id()).unwrap_or_default();
+        let rect = scroll.inner_rect;
+        ui.output_mut(|o| {
+            o.ime = Some(egui::output::IMEOutput {
+                purpose: egui::IMEPurpose::Normal,
+                rect: to_global * rect,
+                cursor_rect: to_global * caret,
+                should_interrupt_composition: false,
+            })
+        });
+    }
+    if let Some((b, pos)) = scroll.inner {
+        // Hover: pointer resting on the same byte for 0.6 s.
+        let now = ui.input(|i| i.time);
+        match st.rest {
+            Some((rb, since)) if rb == b => {
+                if now - since > 0.6 {
+                    out.hover = Some((b, pos));
+                } else {
+                    ui.ctx()
+                        .request_repaint_after(std::time::Duration::from_secs_f64(0.6 - (now - since) + 0.01));
+                }
+            }
+            _ => {
+                st.rest = Some((b, now));
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(610));
+            }
+        }
+    } else {
+        st.rest = None;
+    }
+    out
+}
+
+fn squiggle(p: &egui::Painter, a: f32, b: f32, y: f32, color: Color32) {
+    let mut pts = Vec::new();
+    let mut x = a;
+    let mut up = true;
+    while x <= b {
+        pts.push(Pos2::new(x, if up { y - 1.5 } else { y + 1.0 }));
+        x += 2.5;
+        up = !up;
+    }
+    if pts.len() > 1 {
+        p.add(egui::Shape::line(pts, Stroke::new(1.0, color)));
+    }
+}
+
+fn paint_whitespace(p: &egui::Painter, g: &egui::Galley, origin: Pos2, color: Color32) {
+    let stroke = Stroke::new(1.0, color);
+    for row in &g.rows {
+        let y = origin.y + row.rect().center().y;
+        for gl in &row.row.glyphs {
+            if gl.chr != ' ' && gl.chr != '\t' {
+                continue;
+            }
+            let x0 = origin.x + row.pos.x + gl.pos.x;
+            let x1 = x0 + gl.advance_width;
+            if gl.chr == ' ' {
+                p.circle_filled(Pos2::new((x0 + x1) / 2.0, y), 1.0, color);
+            } else {
+                let (a, b) = (x0 + 2.0, (x1 - 2.0).max(x0 + 6.0));
+                p.line_segment([Pos2::new(a, y), Pos2::new(b, y)], stroke);
+                p.line_segment([Pos2::new(b - 3.0, y - 3.0), Pos2::new(b, y)], stroke);
+                p.line_segment([Pos2::new(b - 3.0, y + 3.0), Pos2::new(b, y)], stroke);
+            }
+        }
+    }
+}
+
+// ------------------------------------------------------------------ mouse
+
+/// Handles clicks and drags; returns the byte under a resting pointer (for hover).
+fn mouse(
+    ui: &egui::Ui,
+    st: &mut State,
+    resp: &egui::Response,
+    lines: &Lines,
+    lay: &Layout,
+    is_mac: bool,
+    out: &mut Output,
+) -> Option<(usize, Pos2)> {
+    use egui::PointerButton::{Middle, Primary};
+    let (pos, pressed, down, released, mid_pressed, mid_down, mods, time) = ui.input(|i| {
+        (
+            i.pointer.interact_pos(),
+            i.pointer.button_pressed(Primary),
+            i.pointer.button_down(Primary),
+            i.pointer.button_released(Primary),
+            i.pointer.button_pressed(Middle),
+            i.pointer.button_down(Middle),
+            i.modifiers,
+            i.time,
+        )
+    });
+    let ix = lines.ix;
+    let text = lines.text;
+    let to_line = |p: Pos2| (((p.y - lay.top) / lay.row_h).floor().max(0.0) as usize).min(ix.lines() - 1);
+    let to_byte = |p: Pos2| lines.byte_at_x(to_line(p), p.x - lay.text_x);
+    let hovered = resp.hovered();
+    if hovered && !mods.command {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
+    }
+
+    // Cmd/Ctrl + hover: underline the symbol (the click goes to its definition).
+    let mut hover_byte = None;
+    if hovered && let Some(p) = resp.hover_pos() {
+        let b = to_byte(p);
+        hover_byte = Some((b, p));
+        if mods.command {
+            let l = to_line(p);
+            let range = ix.line_range(text, l);
+            if b < range.end {
+                let w = buffer::word_at(text, range, b);
+                if w.end > w.start && text[w.clone()].chars().all(|c| c.is_alphanumeric() || c == '_') {
+                    let (a, z) = (lines.x_of(w.start), lines.x_of(w.end));
+                    let y = lay.line_y(l) + lay.row_h - 1.0;
+                    let color = ui.visuals().hyperlink_color;
+                    ui.painter().line_segment(
+                        [Pos2::new(lay.text_x + a, y), Pos2::new(lay.text_x + z, y)],
+                        Stroke::new(1.0, color),
+                    );
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+            }
+        }
+    }
+
+    if pressed
+        && hovered
+        && let Some(p) = pos
+    {
+        resp.request_focus();
+        st.history.seal();
+        st.preferred_x = None;
+        let b = to_byte(p);
+        // Click count (double/triple click), from our own press history.
+        let count = match st.last_press {
+            Some((t, lp, n)) if time - t < 0.4 && lp.distance(p) < 4.0 => (n % 3) + 1,
+            _ => 1,
+        };
+        st.last_press = Some((time, p, count));
+        let l = to_line(p);
+        let line_range = ix.line_range(text, l);
+        let full_line = ix.line_start(l)..ix.line_start((l + 1).min(ix.lines() - 1)).max(line_range.end);
+        if mods.command {
+            st.goto_press = Some(b);
+            st.sels = vec![Sel::caret(b)];
+        } else if mods.alt {
+            // Alt+click adds a cursor.
+            st.sels.push(Sel::caret(b));
+        } else if mods.shift {
+            let mut s = st.primary();
+            s.head = b;
+            st.sels = vec![s];
+            st.drag = Some(Drag::Select {
+                origin: s.anchor..s.anchor,
+                unit: Unit::Char,
+            });
+        } else {
+            let (origin, unit) = match count {
+                2 => (buffer::word_at(text, line_range, b), Unit::Word),
+                3 => (full_line, Unit::Line),
+                _ => (b..b, Unit::Char),
+            };
+            st.sels = vec![Sel {
+                anchor: origin.start,
+                head: origin.end,
+            }];
+            st.drag = Some(Drag::Select { origin, unit });
+        }
+    } else if down && let (Some(p), Some(Drag::Select { origin, unit })) = (pos, &st.drag) {
+        let b = to_byte(p);
+        let l = to_line(p);
+        let range = match unit {
+            Unit::Char => b..b,
+            Unit::Word => buffer::word_at(text, ix.line_range(text, l), b),
+            Unit::Line => ix.line_start(l)..if l + 1 < ix.lines() { ix.line_start(l + 1) } else { text.len() },
+        };
+        let sel = if range.start < origin.start {
+            Sel {
+                anchor: origin.end,
+                head: range.start,
+            }
+        } else {
+            Sel {
+                anchor: origin.start,
+                head: range.end.max(origin.end),
+            }
+        };
+        if let Some(last) = st.sels.last_mut() {
+            *last = sel;
+        }
+        if b != origin.start {
+            st.goto_press = None;
+        }
+        ui.scroll_to_rect(Rect::from_center_size(p, Vec2::splat(lay.row_h)), None);
+    }
+    if released {
+        if let Some(b) = st.goto_press.take()
+            && resp.clicked()
+        {
+            out.goto = Some(b);
+        }
+        st.drag = None;
+    }
+
+    // Middle-button drag: box selection, one cursor per line.
+    if mid_pressed
+        && hovered
+        && let Some(p) = pos
+    {
+        resp.request_focus();
+        st.history.seal();
+        st.drag = Some(Drag::Column {
+            line: to_line(p),
+            x: p.x - lay.text_x,
+        });
+    }
+    if let (Some(Drag::Column { line, x }), Some(p)) = (&st.drag, pos) {
+        if mid_down {
+            let (l1, x1) = (to_line(p), p.x - lay.text_x);
+            let (lo, hi) = ((*line).min(l1), (*line).max(l1));
+            let mut sels: Vec<Sel> = (lo..=hi)
+                .map(|l| Sel {
+                    anchor: lines.byte_at_x(l, *x),
+                    head: lines.byte_at_x(l, x1),
+                })
+                .collect();
+            if l1 < *line {
+                sels.reverse(); // the primary is the line under the pointer
+            }
+            st.sels = sels;
+            ui.scroll_to_rect(Rect::from_center_size(p, Vec2::splat(lay.row_h)), None);
+        } else {
+            st.drag = None;
+        }
+    }
+    let _ = is_mac;
+    if down || mid_down { None } else { hover_byte }
+}
+
+// ------------------------------------------------------------------ keyboard
+
+struct KeyCtx<'a> {
+    font: &'a egui::FontId,
+    is_mac: bool,
+    viewport_rows: usize,
+    opts: &'a Options<'a>,
+}
+
+fn closer(c: char) -> Option<char> {
+    match c {
+        '{' => Some('}'),
+        '(' => Some(')'),
+        '[' => Some(']'),
+        _ => None,
+    }
+}
+
+/// Returns true when the text changed.
+fn handle_event(ui: &egui::Ui, st: &mut State, text: &mut String, version: &mut u64, k: &KeyCtx, ev: &Event) -> bool {
+    let changed = match ev {
+        Event::Text(t) if !t.is_empty() => {
+            insert(st, text, t, Kind::Typing);
+            true
+        }
+        Event::Ime(egui::ImeEvent::Preedit { text: pre, .. }) => {
+            st.preedit = (!pre.is_empty()).then(|| pre.clone());
+            false
+        }
+        Event::Ime(egui::ImeEvent::Commit(t)) => {
+            st.preedit = None;
+            if t.is_empty() {
+                false
+            } else {
+                insert(st, text, t, Kind::Typing);
+                true
+            }
+        }
+        Event::Copy | Event::Cut => {
+            let ix = st.index(text, *version).clone();
+            let whole_lines = st.sels.iter().all(|s| s.is_empty());
+            let ranges: Vec<Range<usize>> = if whole_lines {
+                st.sels.iter().map(|s| full_line(&ix, text, ix.line_of_byte(s.head))).collect()
+            } else {
+                st.sels.iter().map(|s| s.range()).collect()
+            };
+            let mut sorted = ranges.clone();
+            sorted.sort_by_key(|r| r.start);
+            sorted.dedup();
+            let copied: Vec<&str> = sorted.iter().map(|r| &text[r.clone()]).collect();
+            let joined = if whole_lines { copied.concat() } else { copied.join("\n") };
+            ui.ctx().copy_text(joined);
+            if matches!(ev, Event::Cut) {
+                let before = st.sels.clone();
+                st.sels = buffer::edit(
+                    text,
+                    &mut st.history,
+                    &before,
+                    sorted.into_iter().map(|r| (r, String::new())).collect(),
+                    Kind::Other,
+                );
+                true
+            } else {
+                false
+            }
+        }
+        Event::Paste(p) => {
+            let pieces: Vec<&str> = p.lines().collect();
+            let before = st.sels.clone();
+            if st.sels.len() > 1 && pieces.len() == st.sels.len() {
+                let mut order: Vec<usize> = (0..before.len()).collect();
+                order.sort_by_key(|&i| before[i].range().start);
+                let edits = order
+                    .iter()
+                    .enumerate()
+                    .map(|(n, &i)| (before[i].range(), pieces[n].to_string()))
+                    .collect();
+                st.sels = buffer::edit(text, &mut st.history, &before, edits, Kind::Other);
+            } else {
+                let p = p.replace("\r\n", "\n");
+                st.sels = buffer::edit(
+                    text,
+                    &mut st.history,
+                    &before,
+                    before.iter().map(|s| (s.range(), p.clone())).collect(),
+                    Kind::Other,
+                );
+            }
+            true
+        }
+        Event::Key {
+            key,
+            pressed: true,
+            modifiers: m,
+            ..
+        } => key_press(ui, st, text, version, k, *key, *m),
+        _ => false,
+    };
+    if changed {
+        *version += 1;
+        st.reveal.get_or_insert(false);
+        st.preferred_x = None;
+    }
+    changed
+}
+
+fn full_line(ix: &LineIndex, text: &str, l: usize) -> Range<usize> {
+    let start = ix.line_start(l);
+    let end = if l + 1 < ix.lines() { ix.line_start(l + 1) } else { text.len() };
+    start..end
+}
+
+fn insert(st: &mut State, text: &mut String, t: &str, kind: Kind) {
+    let before = st.sels.clone();
+    st.sels = buffer::edit(
+        text,
+        &mut st.history,
+        &before,
+        before.iter().map(|s| (s.range(), t.to_string())).collect(),
+        kind,
+    );
+}
+
+fn key_press(ui: &egui::Ui, st: &mut State, text: &mut String, version: &mut u64, k: &KeyCtx, key: Key, m: egui::Modifiers) -> bool {
+    let ix = st.index(text, *version).clone();
+    let word = if k.is_mac { m.alt } else { m.ctrl };
+    let line_mod = k.is_mac && m.mac_cmd;
+    let shift = m.shift;
+    let before = st.sels.clone();
+    let lines = Lines {
+        ui,
+        text,
+        ix: &ix,
+        spans: None,
+        font: k.font.clone(),
+        color: Color32::WHITE,
+    };
+    // Move every caret with `f`; Shift extends.
+    let moved = |st: &mut State, f: &dyn Fn(Sel) -> usize, keep_x: bool| {
+        for s in &mut st.sels {
+            let h = f(*s);
+            *s = if shift { Sel { anchor: s.anchor, head: h } } else { Sel::caret(h) };
+        }
+        dedup(&mut st.sels);
+        if !keep_x {
+            st.preferred_x = None;
+        }
+        st.history.seal();
+        st.reveal = Some(false);
+        false
+    };
+    let line_home = |b: usize| {
+        let l = ix.line_of_byte(b);
+        let r = ix.line_range(text, l);
+        let first = r.start + buffer::indent_of(&text[r.clone()]).len();
+        if b == first { r.start } else { first }
+    };
+    let line_end = |b: usize| ix.line_range(text, ix.line_of_byte(b)).end;
+    let vertical = |st: &mut State, rows: isize| {
+        let px = st.preferred_x;
+        let mut new_x = None;
+        let mut f = |s: Sel| {
+            let (l, _) = ix.line_col(s.head);
+            let x = px.unwrap_or_else(|| lines.x_of(s.head));
+            new_x = Some(x);
+            let target = l as isize + rows;
+            if target < 0 {
+                0
+            } else if target as usize >= ix.lines() {
+                text.len()
+            } else {
+                lines.byte_at_x(target as usize, x)
+            }
+        };
+        let heads: Vec<usize> = st.sels.iter().map(|s| f(*s)).collect();
+        for (s, h) in st.sels.iter_mut().zip(heads) {
+            *s = if shift { Sel { anchor: s.anchor, head: h } } else { Sel::caret(h) };
+        }
+        dedup(&mut st.sels);
+        st.preferred_x = px.or(new_x);
+        st.history.seal();
+        st.reveal = Some(false);
+        false
+    };
+    match key {
+        Key::ArrowLeft if line_mod => moved(st, &|s| line_home(s.head), false),
+        Key::ArrowRight if line_mod => moved(st, &|s| line_end(s.head), false),
+        Key::ArrowLeft if word => moved(st, &|s| buffer::prev_word(text, s.head), false),
+        Key::ArrowRight if word => moved(st, &|s| buffer::next_word(text, s.head), false),
+        Key::ArrowLeft => moved(
+            st,
+            &|s| {
+                if !shift && !s.is_empty() {
+                    s.range().start
+                } else {
+                    buffer::prev_char(text, s.head)
+                }
+            },
+            false,
+        ),
+        Key::ArrowRight => moved(
+            st,
+            &|s| {
+                if !shift && !s.is_empty() {
+                    s.range().end
+                } else {
+                    buffer::next_char(text, s.head)
+                }
+            },
+            false,
+        ),
+        Key::ArrowUp if line_mod => moved(st, &|_| 0, false),
+        Key::ArrowDown if line_mod => moved(st, &|_| text.len(), false),
+        Key::ArrowUp => vertical(st, -1),
+        Key::ArrowDown => vertical(st, 1),
+        Key::PageUp => vertical(st, -(k.viewport_rows as isize)),
+        Key::PageDown => vertical(st, k.viewport_rows as isize),
+        Key::Home if m.command => moved(st, &|_| 0, false),
+        Key::End if m.command => moved(st, &|_| text.len(), false),
+        Key::Home => moved(st, &|s| line_home(s.head), false),
+        Key::End => moved(st, &|s| line_end(s.head), false),
+        Key::A if m.command => {
+            st.sels = vec![Sel {
+                anchor: 0,
+                head: text.len(),
+            }];
+            false
+        }
+        Key::Z if m.command && !shift => undo_redo(st, text, false),
+        Key::Z if m.command && shift => undo_redo(st, text, true),
+        Key::Y if m.command && !k.is_mac => undo_redo(st, text, true),
+        Key::D if m.command => {
+            add_next_occurrence(st, text, &ix);
+            false
+        }
+        Key::Slash if m.command => match k.opts.comment {
+            Some(token) => toggle_comment(st, text, &ix, token),
+            None => false,
+        },
+        Key::Escape if st.sels.len() > 1 || !st.primary().is_empty() => {
+            let p = st.primary();
+            st.sels = vec![Sel::caret(p.head)];
+            false
+        }
+        Key::Backspace | Key::Delete => {
+            let back = key == Key::Backspace;
+            let unit = k.opts.indent;
+            let edits = before
+                .iter()
+                .map(|s| {
+                    if !s.is_empty() {
+                        return (s.range(), String::new());
+                    }
+                    let h = s.head;
+                    let to = if back {
+                        if line_mod {
+                            ix.line_start(ix.line_of_byte(h))
+                        } else if word {
+                            buffer::prev_word(text, h)
+                        } else {
+                            soft_tab_back(text, &ix, h, unit).unwrap_or_else(|| buffer::prev_char(text, h))
+                        }
+                    } else if line_mod {
+                        line_end(h)
+                    } else if word {
+                        buffer::next_word(text, h)
+                    } else {
+                        buffer::next_char(text, h)
+                    };
+                    (h.min(to)..h.max(to), String::new())
+                })
+                .collect();
+            st.sels = buffer::edit(text, &mut st.history, &before, edits, Kind::Deleting);
+            true
+        }
+        Key::Enter if !m.command => {
+            let unit = k.opts.indent;
+            let edits = before
+                .iter()
+                .map(|s| {
+                    let r = s.range();
+                    let l = ix.line_of_byte(r.start);
+                    let lr = ix.line_range(text, l);
+                    let indent = buffer::indent_of(&text[lr.clone()]).to_string();
+                    let prev = text[lr.start..r.start].trim_end().chars().next_back();
+                    let next = text[r.end..lr.end.max(r.end)].chars().next();
+                    let opens = prev.is_some_and(|c| matches!(c, '{' | '(' | '[' | ':'));
+                    if let (Some(p), Some(n)) = (prev, next)
+                        && closer(p) == Some(n)
+                    {
+                        // Between brackets: put the closer on its own line.
+                        let first = format!("\n{indent}{unit}");
+                        let caret = first.len();
+                        (r, format!("{first}\n{indent}"), caret)
+                    } else {
+                        let s = format!("\n{indent}{}", if opens { unit } else { "" });
+                        let n = s.len();
+                        (r, s, n)
+                    }
+                })
+                .collect();
+            st.sels = buffer::edit_carets(text, &mut st.history, &before, edits, Kind::Other);
+            true
+        }
+        Key::Tab => {
+            let multi_line = before.iter().any(|s| ix.line_of_byte(s.anchor) != ix.line_of_byte(s.head));
+            if shift || multi_line {
+                indent_lines(st, text, &ix, k.opts.indent, !shift)
+            } else {
+                insert(st, text, k.opts.indent, Kind::Typing);
+                true
+            }
+        }
+        _ => false,
+    }
+}
+
+fn dedup(sels: &mut Vec<Sel>) {
+    let mut seen = std::collections::HashSet::new();
+    // Keep the last (primary) occurrence of each caret position.
+    let mut out: Vec<Sel> = sels.iter().rev().filter(|s| seen.insert(s.head)).copied().collect();
+    out.reverse();
+    *sels = out;
+}
+
+/// Backspace inside leading spaces deletes back to the previous indent stop.
+fn soft_tab_back(text: &str, ix: &LineIndex, h: usize, unit: &str) -> Option<usize> {
+    if unit.contains('\t') || unit.is_empty() {
+        return None;
+    }
+    let (l, col) = ix.line_col(h);
+    let start = ix.line_start(l);
+    if col == 0 || !text[start..h].bytes().all(|b| b == b' ') {
+        return None;
+    }
+    let w = unit.len();
+    Some(start + (col - 1) / w * w)
+}
+
+fn undo_redo(st: &mut State, text: &mut String, redo: bool) -> bool {
+    let sels = if redo { st.history.redo(text) } else { st.history.undo(text) };
+    match sels {
+        Some(s) => {
+            st.sels = s;
+            true
+        }
+        None => false,
+    }
+}
+
+fn add_next_occurrence(st: &mut State, text: &str, ix: &LineIndex) {
+    let p = st.primary();
+    if p.is_empty() {
+        let l = ix.line_of_byte(p.head);
+        let w = buffer::word_at(text, ix.line_range(text, l), p.head);
+        if !w.is_empty() {
+            *st.sels.last_mut().unwrap() = Sel {
+                anchor: w.start,
+                head: w.end,
+            };
+        }
+        return;
+    }
+    let needle = &text[p.range()];
+    let from = st.sels.iter().map(|s| s.range().end).max().unwrap_or(0);
+    let found = text[from..].find(needle).map(|i| from + i).or_else(|| text.find(needle));
+    if let Some(i) = found
+        && !st.sels.iter().any(|s| s.range().start == i)
+    {
+        st.sels.push(Sel {
+            anchor: i,
+            head: i + needle.len(),
+        });
+        st.reveal = Some(false);
+    }
+}
+
+fn selected_lines(st: &State, ix: &LineIndex) -> Vec<usize> {
+    let mut lines: Vec<usize> = st
+        .sels
+        .iter()
+        .flat_map(|s| {
+            let r = s.range();
+            let (a, b) = (ix.line_of_byte(r.start), ix.line_of_byte(r.end));
+            // A selection ending at column 0 doesn't include that line.
+            let b = if b > a && ix.line_start(b) == r.end { b - 1 } else { b };
+            a..=b
+        })
+        .collect();
+    lines.sort_unstable();
+    lines.dedup();
+    lines
+}
+
+fn indent_lines(st: &mut State, text: &mut String, ix: &LineIndex, unit: &str, indent: bool) -> bool {
+    let edits: Vec<(Range<usize>, String)> = selected_lines(st, ix)
+        .into_iter()
+        .filter_map(|l| {
+            let r = ix.line_range(text, l);
+            let start = r.start;
+            if indent {
+                (!r.is_empty()).then(|| (start..start, unit.to_string()))
+            } else {
+                let ws = buffer::indent_of(&text[r]);
+                let n = if ws.starts_with('\t') { 1 } else { ws.len().min(unit.len().max(1)) };
+                (n > 0).then(|| (start..start + n, String::new()))
+            }
+        })
+        .collect();
+    if edits.is_empty() {
+        return false;
+    }
+    let before = st.sels.clone();
+    st.sels = buffer::edit_keep(text, &mut st.history, &before, edits);
+    true
+}
+
+fn toggle_comment(st: &mut State, text: &mut String, ix: &LineIndex, token: &str) -> bool {
+    let lines: Vec<usize> = selected_lines(st, ix)
+        .into_iter()
+        .filter(|&l| !text[ix.line_range(text, l)].trim().is_empty())
+        .collect();
+    if lines.is_empty() {
+        return false;
+    }
+    let all_commented = lines.iter().all(|&l| text[ix.line_range(text, l)].trim_start().starts_with(token));
+    let min_indent = lines
+        .iter()
+        .map(|&l| buffer::indent_of(&text[ix.line_range(text, l)]).len())
+        .min()
+        .unwrap_or(0);
+    let edits = lines
+        .iter()
+        .map(|&l| {
+            let r = ix.line_range(text, l);
+            let line = &text[r.clone()];
+            if all_commented {
+                let at = r.start + buffer::indent_of(line).len();
+                let mut end = at + token.len();
+                if text[end..].starts_with(' ') {
+                    end += 1;
+                }
+                (at..end, String::new())
+            } else {
+                (r.start + min_indent..r.start + min_indent, format!("{token} "))
+            }
+        })
+        .collect();
+    let before = st.sels.clone();
+    st.sels = buffer::edit_keep(text, &mut st.history, &before, edits);
+    true
+}
+
+/// Line comment token for a file extension.
+pub fn comment_token(ext: &str) -> Option<&'static str> {
+    Some(match ext {
+        "rs" | "c" | "h" | "cc" | "cpp" | "cxx" | "hpp" | "hh" | "js" | "jsx" | "mjs" | "cjs" | "ts" | "tsx" | "mts" | "go" | "java"
+        | "cs" | "swift" | "kt" | "kts" | "scala" | "dart" | "zig" | "php" | "jsonc" | "proto" | "glsl" | "wgsl" => "//",
+        "py" | "pyi" | "sh" | "bash" | "zsh" | "fish" | "rb" | "toml" | "yaml" | "yml" | "pl" | "r" | "cmake" | "mk" | "conf" | "ini"
+        | "dockerfile" | "nix" | "ex" | "exs" | "jl" | "ps1" => "#",
+        "lua" | "sql" | "hs" | "elm" | "ada" => "--",
+        "lisp" | "clj" | "el" | "scm" => ";",
+        "tex" | "erl" => "%",
+        "vim" => "\"",
+        _ => return None,
+    })
+}
+
+/// Indent unit for a text: a tab if most indented lines start with a tab, otherwise
+/// the most common small step of leading spaces (2 or 4; default 4).
+pub fn detect_indent(text: &str) -> String {
+    let (mut tabs, mut spaces) = (0, 0);
+    let mut steps = [0usize; 9];
+    let mut prev = 0usize;
+    for line in text.lines().take(2000) {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if line.starts_with('\t') {
+            tabs += 1;
+            continue;
+        }
+        let n = line.len() - line.trim_start_matches(' ').len();
+        if n > 0 {
+            spaces += 1;
+        }
+        let d = n.abs_diff(prev);
+        if (2..=8).contains(&d) {
+            steps[d] += 1;
+        }
+        prev = n;
+    }
+    if tabs > spaces {
+        return "\t".into();
+    }
+    let best = if steps[2] > steps[4] { 2 } else { 4 };
+    " ".repeat(best)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Runs the real widget headlessly: one frame per batch of events.
+    struct Harness {
+        ctx: egui::Context,
+        st: State,
+        text: String,
+        version: u64,
+        hl: highlight::Cache,
+        id: egui::Id,
+        clipboard: Option<String>,
+    }
+
+    impl Harness {
+        fn new(text: &str) -> Self {
+            let mut h = Self {
+                ctx: egui::Context::default(),
+                st: State::default(),
+                text: text.to_string(),
+                version: 0,
+                hl: Default::default(),
+                id: egui::Id::NULL.with("test-editor"),
+                clipboard: None,
+            };
+            let id = h.id;
+            h.ctx.memory_mut(|m| m.request_focus(id));
+            h.frame(vec![]);
+            h.frame(vec![]);
+            h
+        }
+
+        fn frame(&mut self, events: Vec<Event>) -> Output {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0))),
+                events,
+                ..Default::default()
+            };
+            let mut out = Output::default();
+            let (st, text, version, hl, id) = (&mut self.st, &mut self.text, &mut self.version, &mut self.hl, self.id);
+            let full = self.ctx.run_ui(input, |ui| {
+                let opts = Options {
+                    lang: "rs",
+                    highlight: false,
+                    whitespace: false,
+                    current_line: true,
+                    indent: "    ",
+                    comment: Some("//"),
+                };
+                out = show(ui, id, st, text, version, hl, &opts, &Extras::default());
+            });
+            for cmd in full.platform_output.commands {
+                if let egui::OutputCommand::CopyText(t) = cmd {
+                    self.clipboard = Some(t);
+                }
+            }
+            out
+        }
+
+        fn key(&mut self, key: Key, modifiers: egui::Modifiers) {
+            self.frame(vec![Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            }]);
+        }
+
+        fn typ(&mut self, t: &str) {
+            self.frame(vec![Event::Text(t.into())]);
+        }
+    }
+
+    const NONE: egui::Modifiers = egui::Modifiers::NONE;
+
+    #[test]
+    fn typing_navigation_and_undo() {
+        let mut h = Harness::new("fn main() {}\nlet x = 1;");
+        assert!(h.ctx.memory(|m| m.has_focus(h.id)));
+        h.typ("// ");
+        assert_eq!(h.text, "// fn main() {}\nlet x = 1;");
+        h.key(Key::End, NONE);
+        h.key(Key::ArrowLeft, NONE);
+        h.key(Key::Enter, NONE);
+        // Enter between braces: indented line, closer on its own line.
+        assert_eq!(h.text, "// fn main() {\n    \n}\nlet x = 1;");
+        h.typ("a");
+        assert_eq!(h.text, "// fn main() {\n    a\n}\nlet x = 1;");
+        h.key(Key::ArrowDown, NONE);
+        h.key(Key::ArrowDown, NONE);
+        h.key(Key::Home, NONE);
+        h.key(Key::End, egui::Modifiers::SHIFT);
+        h.frame(vec![Event::Copy]);
+        assert_eq!(h.clipboard.as_deref(), Some("let x = 1;"));
+        h.key(Key::Backspace, NONE);
+        assert_eq!(h.text, "// fn main() {\n    a\n}\n");
+        h.key(Key::Z, egui::Modifiers::COMMAND);
+        assert_eq!(h.text, "// fn main() {\n    a\n}\nlet x = 1;");
+        h.key(Key::Z, egui::Modifiers::COMMAND);
+        h.key(Key::Z, egui::Modifiers::COMMAND);
+        h.key(Key::Z, egui::Modifiers::COMMAND);
+        assert_eq!(h.text, "fn main() {}\nlet x = 1;");
+        assert!(h.version > 0);
+    }
+
+    #[test]
+    fn multi_cursor_add_next_occurrence_and_paste() {
+        let mut h = Harness::new("foo bar foo baz foo");
+        h.key(Key::D, egui::Modifiers::COMMAND); // select word under caret
+        h.key(Key::D, egui::Modifiers::COMMAND);
+        h.key(Key::D, egui::Modifiers::COMMAND);
+        assert_eq!(h.st.sels.len(), 3);
+        h.typ("x");
+        assert_eq!(h.text, "x bar x baz x");
+        h.frame(vec![Event::Paste("1\n2\n3".into())]);
+        assert_eq!(h.text, "x1 bar x2 baz x3");
+        h.key(Key::Escape, NONE);
+        assert_eq!(h.st.sels.len(), 1);
+        h.key(Key::Slash, egui::Modifiers::COMMAND);
+        assert_eq!(h.text, "// x1 bar x2 baz x3");
+    }
+
+    #[test]
+    fn ime_commit_inserts_text_and_reports_caret() {
+        let mut h = Harness::new("");
+        h.frame(vec![Event::Ime(egui::ImeEvent::Preedit {
+            text: "ni".into(),
+            active_range_chars: None,
+        })]);
+        assert_eq!(h.st.preedit.as_deref(), Some("ni"));
+        let out = h.frame(vec![Event::Ime(egui::ImeEvent::Commit("你好".into()))]);
+        assert_eq!(h.text, "你好");
+        assert!(h.st.preedit.is_none() && out.caret_rect.is_some());
+        h.key(Key::ArrowLeft, NONE);
+        h.key(Key::Backspace, NONE);
+        assert_eq!(h.text, "好");
+    }
+
+    #[test]
+    fn indent_detection_and_comment_tokens() {
+        assert_eq!(detect_indent("fn a() {\n  b();\n  if x {\n    c();\n  }\n}"), "  ");
+        assert_eq!(detect_indent("fn a() {\n    b();\n}"), "    ");
+        assert_eq!(detect_indent("a:\n\tb\n\tc"), "\t");
+        assert_eq!(comment_token("rs"), Some("//"));
+        assert_eq!(comment_token("py"), Some("#"));
+        assert_eq!(comment_token("md"), None);
+    }
+
+    #[test]
+    fn toggle_comment_and_indent_lines() {
+        let mut text = String::from("fn a() {\n    b();\n    c();\n}");
+        let mut st = State::default();
+        let ix = LineIndex::new(&text);
+        st.sels = vec![Sel { anchor: 13, head: 25 }];
+        assert!(toggle_comment(&mut st, &mut text, &ix, "//"));
+        assert_eq!(text, "fn a() {\n    // b();\n    // c();\n}");
+        let ix = LineIndex::new(&text);
+        assert!(toggle_comment(&mut st, &mut text, &ix, "//"));
+        assert_eq!(text, "fn a() {\n    b();\n    c();\n}");
+        let ix = LineIndex::new(&text);
+        st.sels = vec![Sel {
+            anchor: 0,
+            head: text.len(),
+        }];
+        assert!(indent_lines(&mut st, &mut text, &ix, "  ", true));
+        assert_eq!(text, "  fn a() {\n      b();\n      c();\n  }");
+        let ix = LineIndex::new(&text);
+        assert!(indent_lines(&mut st, &mut text, &ix, "  ", false));
+        assert_eq!(text, "fn a() {\n    b();\n    c();\n}");
+        assert_eq!(soft_tab_back("        x", &LineIndex::new("        x"), 6, "    "), Some(4));
+    }
+}

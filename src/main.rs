@@ -3,8 +3,8 @@
 mod app;
 mod blame;
 mod bundled;
-mod column;
 mod diff;
+mod editor;
 mod git;
 mod goto;
 mod graph;

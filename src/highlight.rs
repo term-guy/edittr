@@ -6,10 +6,10 @@
 //! changed line only until the state matches the cached one again (usually one
 //! line), and the laid-out galley is reused while the text doesn't change.
 
-use eframe::egui::{self, Color32, Stroke, text::LayoutJob, text::LayoutSection, text::TextFormat};
+use eframe::egui::{self, Color32};
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 use syntect::highlighting::{FontStyle, HighlightIterator, HighlightState, Highlighter, Theme, ThemeSet};
 use syntect::parsing::{ParseState, ScopeStack, SyntaxReference, SyntaxSet};
 
@@ -39,16 +39,16 @@ fn theme(dark: bool) -> &'static Theme {
 }
 
 #[derive(Clone)]
-struct Span {
-    range: Range<usize>, // bytes, within the line
-    color: Color32,
-    italics: bool,
-    underline: bool,
+pub struct Span {
+    pub range: Range<usize>, // bytes, within the line
+    pub color: Color32,
+    pub italics: bool,
+    pub underline: bool,
 }
 
-struct Line {
+pub struct Line {
     hash: u64,
-    spans: Vec<Span>,
+    pub spans: Vec<Span>,
     /// Parser + highlighter state after this line.
     end: (ParseState, HighlightState),
 }
@@ -63,8 +63,8 @@ pub struct Cache {
     lines: Vec<Line>,
     /// A background full highlight in progress, for `key`.
     pending: Option<std::sync::mpsc::Receiver<Vec<Line>>>,
-    /// Galley of the last layout, reused while text, theme and font are unchanged.
-    galley: Option<(u64, egui::FontId, bool, Arc<egui::Galley>)>,
+    /// Document version the lines were last brought up to date with (`spans`).
+    version: Option<u64>,
 }
 
 fn hash_str(s: &str) -> u64 {
@@ -79,47 +79,8 @@ fn syntax(lang: &str) -> Option<&'static SyntaxReference> {
 }
 
 impl Cache {
-    /// Lay out `text`, highlighted as `lang` (a syntect name or file extension).
-    /// `highlight: false` (huge files) lays out plain text.
-    pub fn layout(&mut self, ui: &egui::Ui, text: &str, lang: &str, highlight: bool) -> Arc<egui::Galley> {
-        let font = egui::TextStyle::Monospace.resolve(ui.style());
-        let dark = ui.visuals().dark_mode;
-        let text_hash = hash_str(text);
-        if let Some((h, f, d, g)) = &self.galley
-            && *h == text_hash
-            && *f == font
-            && *d == dark
-        {
-            return g.clone();
-        }
-        let job = if highlight && let Some(syntax) = syntax(lang) {
-            match self.job(ui, text, syntax, lang, dark, &font) {
-                Some(job) => job,
-                // Highlighting in the background: plain text for now (not cached as final).
-                None => {
-                    let job = LayoutJob::simple(text.to_string(), font.clone(), ui.visuals().text_color(), f32::INFINITY);
-                    return ui.fonts_mut(|f| f.layout_job(job));
-                }
-            }
-        } else {
-            LayoutJob::simple(text.to_string(), font.clone(), ui.visuals().text_color(), f32::INFINITY)
-        };
-        let mut job = job;
-        job.wrap.max_width = f32::INFINITY;
-        let galley = ui.fonts_mut(|f| f.layout_job(job));
-        self.galley = Some((text_hash, font, dark, galley.clone()));
-        galley
-    }
-
-    fn job(
-        &mut self,
-        ui: &egui::Ui,
-        text: &str,
-        syntax: &'static SyntaxReference,
-        lang: &str,
-        dark: bool,
-        font: &egui::FontId,
-    ) -> Option<LayoutJob> {
+    /// Start or collect the background first pass; false while it runs.
+    fn ensure(&mut self, ctx: &egui::Context, text: &str, syntax: &'static SyntaxReference, lang: &str, dark: bool) -> bool {
         let key = (lang.to_string(), dark);
         if self.key.as_ref() != Some(&key) {
             self.lines.clear();
@@ -132,12 +93,12 @@ impl Cache {
                     self.lines = lines;
                     self.pending = None;
                 }
-                Err(std::sync::mpsc::TryRecvError::Empty) => return None,
+                Err(std::sync::mpsc::TryRecvError::Empty) => return false,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => self.pending = None,
             }
         } else if self.lines.is_empty() && text.bytes().filter(|&b| b == b'\n').count() > BACKGROUND_LINES {
             let (tx, rx) = std::sync::mpsc::channel();
-            let (text, ctx) = (text.to_string(), ui.ctx().clone());
+            let (text, ctx) = (text.to_string(), ctx.clone());
             std::thread::spawn(move || {
                 let mut c = Cache::default();
                 c.update(&text, syntax, dark);
@@ -145,32 +106,26 @@ impl Cache {
                 ctx.request_repaint();
             });
             self.pending = Some(rx);
+            return false;
+        }
+        true
+    }
+
+    /// Highlighted spans per line of `text` (version `version` of the document), updated
+    /// incrementally; None while a big file's first pass runs in the background or when
+    /// `lang` has no grammar.
+    pub fn spans(&mut self, ctx: &egui::Context, version: u64, text: &str, lang: &str, dark: bool) -> Option<&[Line]> {
+        let syntax = syntax(lang)?;
+        let key = (lang.to_string(), dark);
+        if self.version == Some(version) && self.key.as_ref() == Some(&key) && self.pending.is_none() {
+            return Some(&self.lines);
+        }
+        if !self.ensure(ctx, text, syntax, lang, dark) {
             return None;
         }
-        // Also brings lines highlighted in the background up to date with edits made meanwhile.
         self.update(text, syntax, dark);
-        let mut job = LayoutJob {
-            text: text.to_string(),
-            ..Default::default()
-        };
-        let mut offset = 0;
-        for (line, cached) in text.split_inclusive('\n').zip(&self.lines) {
-            for s in &cached.spans {
-                job.sections.push(LayoutSection {
-                    leading_space: 0.0,
-                    byte_range: egui::text::ByteIndex(offset + s.range.start)..egui::text::ByteIndex(offset + s.range.end),
-                    format: TextFormat {
-                        font_id: font.clone(),
-                        color: s.color,
-                        italics: s.italics,
-                        underline: if s.underline { Stroke::new(1.0, s.color) } else { Stroke::NONE },
-                        ..Default::default()
-                    },
-                });
-            }
-            offset += line.len();
-        }
-        Some(job)
+        self.version = Some(version);
+        Some(&self.lines)
     }
 
     /// Bring `self.lines` in sync with `text`, re-highlighting as little as possible.
