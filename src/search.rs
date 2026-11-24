@@ -23,6 +23,84 @@ pub struct Options {
     pub match_case: bool,
     pub whole_word: bool,
     pub regex: bool,
+    /// Comma-separated globs, e.g. "*.c, *.h" or "src/**". Empty: every file.
+    pub include: String,
+    /// Comma-separated globs of files or folders to skip, e.g. "*.min.js, vendor".
+    pub exclude: String,
+}
+
+/// Which files a search covers, from [`Options::include`] / [`Options::exclude`].
+///
+/// A glob without `/` matches the file name or any folder name in the path
+/// (`*.c`, `node_modules`); one with `/` matches from the project root
+/// (`src/*.rs`, `src/**/test`), and a folder pattern covers everything inside it.
+/// `*` and `?` stay within one path segment, `**` crosses them. Case-insensitive.
+pub struct PathFilter {
+    include: Option<Regex>,
+    exclude: Option<Regex>,
+}
+
+impl PathFilter {
+    pub fn new(opts: &Options) -> Result<Self, String> {
+        Ok(Self {
+            include: globs_regex(&opts.include)?,
+            exclude: globs_regex(&opts.exclude)?,
+        })
+    }
+
+    /// `rel`: path relative to the project root, with `/` separators.
+    pub fn allows(&self, rel: &str) -> bool {
+        self.include.as_ref().is_none_or(|re| re.is_match(rel)) && !self.exclude.as_ref().is_some_and(|re| re.is_match(rel))
+    }
+}
+
+fn globs_regex(list: &str) -> Result<Option<Regex>, String> {
+    let parts: Vec<String> = list
+        .split(',')
+        .map(|g| g.trim().replace('\\', "/"))
+        .filter(|g| !g.is_empty())
+        .map(|g| {
+            let g = g.trim_start_matches("./");
+            let anchored = g.trim_end_matches('/').contains('/');
+            let g = g.trim_start_matches('/').trim_end_matches('/');
+            let body = glob_to_regex(g);
+            if anchored {
+                format!("^{body}(?:/|$)")
+            } else {
+                format!("(?:^|/){body}(?:/|$)")
+            }
+        })
+        .collect();
+    if parts.is_empty() {
+        return Ok(None);
+    }
+    RegexBuilder::new(&parts.join("|"))
+        .case_insensitive(true)
+        .build()
+        .map(Some)
+        .map_err(|e| format!("bad file pattern: {e}"))
+}
+
+fn glob_to_regex(glob: &str) -> String {
+    let mut out = String::new();
+    let mut chars = glob.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '*' if chars.peek() == Some(&'*') => {
+                chars.next();
+                if chars.peek() == Some(&'/') {
+                    chars.next();
+                    out.push_str("(?:.*/)?"); // "**/" also matches zero folders
+                } else {
+                    out.push_str(".*");
+                }
+            }
+            '*' => out.push_str("[^/]*"),
+            '?' => out.push_str("[^/]"),
+            c => out.push_str(&regex::escape(c.encode_utf8(&mut [0; 4]))),
+        }
+    }
+    out
 }
 
 pub struct Hit {
@@ -85,6 +163,14 @@ pub fn spawn(
                 return;
             }
         };
+        let filter = match PathFilter::new(&opts) {
+            Ok(f) => f,
+            Err(e) => {
+                let _ = tx.send(Msg::Error(e));
+                ctx.request_repaint();
+                return;
+            }
+        };
         let mut total = 0;
         let mut searched = 0;
         let send = |rel: String, mut hits: Vec<Hit>, total: &mut usize| -> bool {
@@ -98,7 +184,7 @@ pub fn spawn(
         // 1. Open files, from memory: instant results for what the user is working on.
         let mut seen = HashSet::new();
         for (rel, text) in open {
-            if !seen.insert(rel.clone()) {
+            if !filter.allows(&rel) || !seen.insert(rel.clone()) {
                 continue;
             }
             searched += 1;
@@ -111,7 +197,7 @@ pub fn spawn(
         }
 
         // 2. The rest of the project, in parallel.
-        let files: Vec<String> = files().into_iter().filter(|f| !seen.contains(f)).collect();
+        let files: Vec<String> = files().into_iter().filter(|f| !seen.contains(f) && filter.allows(f)).collect();
         let next = AtomicUsize::new(0);
         let stop = AtomicBool::new(false);
         let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(1, 12);
@@ -294,6 +380,36 @@ mod tests {
         let hits = search_text(&re, text, 10);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].line, 1);
+    }
+
+    fn filter(include: &str, exclude: &str) -> PathFilter {
+        PathFilter::new(&Options {
+            include: include.into(),
+            exclude: exclude.into(),
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn include_and_exclude_globs() {
+        let f = filter("*.c, *.H", "");
+        assert!(f.allows("main.c") && f.allows("src/x/util.h"));
+        assert!(!f.allows("main.cpp") && !f.allows("c/readme.md"));
+
+        let f = filter("", "vendor, *.min.js");
+        assert!(f.allows("src/app.js") && f.allows("vendored/a.c"));
+        assert!(!f.allows("vendor/a.c") && !f.allows("web/vendor/a.c") && !f.allows("x/app.min.js"));
+
+        let f = filter("src/**/*.rs", "src/gen/");
+        assert!(f.allows("src/main.rs") && f.allows("src/a/b/c.rs"));
+        assert!(!f.allows("tests/main.rs") && !f.allows("src/gen/x.rs") && !f.allows("lib/src/main.rs"));
+
+        let f = filter("src", "");
+        assert!(f.allows("src/a/b.txt") && f.allows("lib/src/x") && !f.allows("srcs/x"));
+        let f = filter("a?.txt", "");
+        assert!(f.allows("ab.txt") && !f.allows("a/.txt") && !f.allows("abc.txt"));
+        assert!(filter("", "").allows("anything"));
     }
 
     #[test]

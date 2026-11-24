@@ -160,6 +160,8 @@ struct SearchState {
     summary: String,
     error: Option<String>,
     focus: bool,
+    /// The "files to include / exclude" fields are shown.
+    show_filters: bool,
 }
 
 enum SearchRow {
@@ -844,11 +846,28 @@ impl App {
             toggle(ui, &mut st.opts.match_case, "Aa", "Match case");
             toggle(ui, &mut st.opts.whole_word, "ab", "Match whole word");
             toggle(ui, &mut st.opts.regex, ".*", "Use regular expression");
+            let filtered = !st.opts.include.trim().is_empty() || !st.opts.exclude.trim().is_empty();
+            let label = if filtered && !st.show_filters { "...*" } else { "..." };
+            toggle(ui, &mut st.show_filters, label, "Files to include / exclude");
             if st.rx.is_some() {
                 ui.add_space(6.0);
                 ui.spinner();
             }
         });
+        let mut filter_enter = false;
+        if st.show_filters {
+            for (text, hint) in [
+                (&mut st.opts.include, "files to include, e.g. *.c, *.h, src/**"),
+                (&mut st.opts.exclude, "files to exclude, e.g. *.min.js, vendor"),
+            ] {
+                let r = ui.add(egui::TextEdit::singleline(text).hint_text(hint).desired_width(f32::INFINITY));
+                filter_enter |= r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+            }
+        }
+        if filter_enter {
+            self.start_search(ui.ctx());
+        }
+        let st = &mut self.search;
         if st.opts != st.searched && st.edited.is_none() {
             st.edited = Some(Instant::now());
         }
