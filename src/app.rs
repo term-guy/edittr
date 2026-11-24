@@ -2508,19 +2508,31 @@ impl App {
         }
     }
 
+    /// The editor area with no tabs: the start page, or a hint when a folder is open.
+    fn empty_editor(&mut self, ui: &mut egui::Ui) {
+        if self.root.is_none() {
+            self.start_page(ui);
+        } else {
+            ui.centered_and_justified(|ui| {
+                ui.weak("Open a file from the Explorer, or press Ctrl/Cmd+P");
+            });
+        }
+    }
+
     fn central(&mut self, ui: &mut egui::Ui) {
         if self.tabs.is_empty() {
-            if self.root.is_none() {
-                self.start_page(ui);
-            } else {
-                ui.centered_and_justified(|ui| {
-                    ui.weak("Open a file from the Explorer, or press Ctrl/Cmd+P");
-                });
-            }
+            self.empty_editor(ui);
             return;
         }
         self.tab_strip(ui);
         ui.separator();
+        // The tab strip may have just closed tabs (its x buttons, its menu): the last
+        // one, or the active one at the end. Never index a tab that is gone.
+        if self.tabs.is_empty() {
+            self.empty_editor(ui);
+            return;
+        }
+        self.active = self.active.min(self.tabs.len() - 1);
         let active = self.active;
         let mut open_path = None;
         let mut goto_at = None;
