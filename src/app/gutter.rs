@@ -91,7 +91,11 @@ impl App {
             if m.base_rx.is_none() {
                 let Ok(rel) = doc.path.strip_prefix(&root) else { return };
                 let rel = rel.to_string_lossy().replace('\\', "/");
-                m.base_rx = Some(background(&ctx, move || vcs.base_text(&root, &rel)));
+                // The editor keeps LF text (CRLF files too): compare like with like, or a
+                // CRLF file would show every line as modified.
+                m.base_rx = Some(background(&ctx, move || {
+                    vcs.base_text(&root, &rel).map(|t| t.replace("\r\n", "\n"))
+                }));
             }
             return;
         }

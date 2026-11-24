@@ -73,6 +73,17 @@ pub fn now() -> i64 {
         .map_or(0, |d| d.as_secs() as i64)
 }
 
+/// Like `git`, for editor text that had CRLF line endings on disk (the editor keeps
+/// LF): git compares the given contents byte for byte with the committed file, so
+/// CRLF must be restored or every line reads "Not committed yet".
+pub fn git_with_endings(repo: &Path, rel: &str, text: &str, crlf: bool) -> Result<Blame, String> {
+    if crlf {
+        git(repo, rel, &text.replace('\n', "\r\n"))
+    } else {
+        git(repo, rel, text)
+    }
+}
+
 /// Blame `rel` (relative to `repo`) as it is in `text` (the editor buffer).
 pub fn git(repo: &Path, rel: &str, text: &str) -> Result<Blame, String> {
     let mut child = crate::git::cmd(repo)
@@ -340,5 +351,25 @@ filename a.rs
         assert_eq!(ago(7200), "2 hours ago");
         assert_eq!(ago(40 * 86_400), "1 month ago");
         assert_eq!(ago(800 * 86_400), "2 years ago");
+    }
+
+    #[test]
+    fn blames_crlf_files_from_lf_editor_text() {
+        let repo = std::env::temp_dir().join(format!("edittr-blame-crlf-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&repo);
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| crate::git::run(&repo, args).unwrap();
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "Tester"]);
+        git(&["config", "core.autocrlf", "false"]);
+        std::fs::write(repo.join("a.c"), "int a;\r\nint b;\r\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "init"]);
+        // The editor holds LF text and remembers the file was CRLF.
+        let blame = super::git_with_endings(&repo, "a.c", "int a;\nint b;\n", true).unwrap();
+        assert!(blame.commits.iter().all(|c| !c.uncommitted()), "every line should be committed");
+        assert_eq!(blame.line(0).unwrap().author, "Tester");
+        std::fs::remove_dir_all(&repo).ok();
     }
 }
