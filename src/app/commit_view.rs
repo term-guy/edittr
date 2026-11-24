@@ -148,6 +148,12 @@ pub(super) struct CommitView {
 }
 
 impl CommitView {
+    /// The file list or a file's diff is still loading.
+    #[cfg(feature = "tour")]
+    pub(super) fn loading(&self) -> bool {
+        self.list_rx.is_some() || self.diff_rx.is_some()
+    }
+
     pub(super) fn clear_selection(&mut self) {
         self.hash.clear();
         self.files = None;

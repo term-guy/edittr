@@ -181,7 +181,7 @@ impl Tour {
             }
         }
         if name == "git-graph" && app.graph_sel.is_none() {
-            app.load_graph_detail(1);
+            app.graph_sel = Some(1);
         }
         if name == "search-in-files" && self.frames == 5 {
             for pressed in [true, false] {
@@ -216,7 +216,7 @@ impl Tour {
             && app.status_rx.is_none()
             && app.diff_rx.is_none()
             && app.graph_rx.is_none()
-            && app.graph_detail_rx.is_none()
+            && !app.graph_detail.loading()
             && app.quick_open.as_ref().is_none_or(|q| q.files_rx.is_none());
         let elapsed = self.started.elapsed();
         let min_frames = match name {
