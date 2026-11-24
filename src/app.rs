@@ -2893,6 +2893,14 @@ impl App {
                 .anchor(egui::Align2::CENTER_TOP, [0.0, 60.0])
                 .fixed_size([520.0, 360.0])
                 .show(ctx, |ui| {
+                    // Up/Down move through the list. Take them before the text box sees
+                    // them, or it jumps its cursor to the start / end of the query.
+                    let (up, down) = ui.input_mut(|i| {
+                        (
+                            i.consume_key(Modifiers::NONE, Key::ArrowUp),
+                            i.consume_key(Modifiers::NONE, Key::ArrowDown),
+                        )
+                    });
                     let r = ui.add(
                         egui::TextEdit::singleline(&mut q.query)
                             .hint_text("Type to search files…")
@@ -2910,15 +2918,15 @@ impl App {
                         q.matched_query = Some(q.query.clone());
                     }
                     let mut moved = false;
+                    if down {
+                        q.selected = (q.selected + 1).min(q.matches.len().saturating_sub(1));
+                        moved = true;
+                    }
+                    if up {
+                        q.selected = q.selected.saturating_sub(1);
+                        moved = true;
+                    }
                     ui.input(|i| {
-                        if i.key_pressed(Key::ArrowDown) {
-                            q.selected = (q.selected + 1).min(q.matches.len().saturating_sub(1));
-                            moved = true;
-                        }
-                        if i.key_pressed(Key::ArrowUp) {
-                            q.selected = q.selected.saturating_sub(1);
-                            moved = true;
-                        }
                         // `:183` alone goes to a line in the current file, not the first file.
                         if i.key_pressed(Key::Enter) && !goto_line::split_line_target(&q.query).0.is_empty() {
                             chosen = q.matches.get(q.selected).map(|&i| q.files[i].clone());
