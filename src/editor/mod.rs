@@ -6,10 +6,12 @@
 //! positions are byte offsets (see [`buffer`]).
 
 pub mod buffer;
+pub mod fold;
 
 use crate::highlight;
 use buffer::{History, Kind, LineIndex, Sel};
 use eframe::egui::{self, Color32, Event, Key, Pos2, Rect, Sense, Stroke, Vec2, text::CCursor, text::LayoutJob};
+use std::collections::BTreeSet;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -46,6 +48,15 @@ pub struct State {
     reveal: Option<bool>,
     /// Where the pointer rests (byte, since when), for hover requests.
     rest: Option<(usize, f64)>,
+    /// Folded regions, by header line.
+    pub folded: BTreeSet<usize>,
+    regions: Vec<Range<usize>>,
+    view: fold::View,
+    /// (version, folded) the regions/view were computed for.
+    view_key: Option<(u64, Vec<usize>)>,
+    /// Vertical scroll offset to apply next frame (minimap clicks).
+    scroll_to: Option<f32>,
+    minimap_drag: bool,
 }
 
 impl State {
@@ -74,6 +85,61 @@ impl State {
         &self.index
     }
 
+    /// Fold regions and the row view for the current text (recomputed after edits or fold changes).
+    fn update_view(&mut self, text: &str, version: u64) {
+        let folded: Vec<usize> = self.folded.iter().copied().collect();
+        if self.view_key.as_ref().is_some_and(|(v, f)| *v == version && *f == folded) {
+            return;
+        }
+        let ix = self.index(text, version).clone();
+        if self.view_key.as_ref().is_none_or(|(v, _)| *v != version) {
+            self.regions = fold::regions(text, &ix);
+            let starts: BTreeSet<usize> = self.regions.iter().map(|r| r.start).collect();
+            self.folded.retain(|l| starts.contains(l));
+        }
+        self.view = fold::View::new(ix.lines(), &self.regions, &self.folded);
+        let folded: Vec<usize> = self.folded.iter().copied().collect();
+        self.view_key = Some((version, folded));
+    }
+
+    /// Unfold any region hiding a caret (after moves, edits or jumps).
+    fn unfold_carets(&mut self) {
+        if self.folded.is_empty() {
+            return;
+        }
+        let lines: Vec<usize> = self.sels.iter().map(|s| self.index.line_of_byte(s.head)).collect();
+        let regions = &self.regions;
+        self.folded.retain(|&start| {
+            let Some(r) = regions.iter().find(|r| r.start == start) else {
+                return false;
+            };
+            !lines.iter().any(|&l| l > r.start && l < r.end)
+        });
+    }
+
+    /// Fold (or unfold) the innermost region containing the primary caret's line.
+    fn fold_at_caret(&mut self, fold: bool) {
+        let l = self.index.line_of_byte(self.primary().head);
+        let region = self
+            .regions
+            .iter()
+            .filter(|r| r.start <= l && l < r.end)
+            .max_by_key(|r| r.start)
+            .cloned();
+        if let Some(r) = region {
+            if fold {
+                self.folded.insert(r.start);
+                // Keep the caret visible: move it to the header line.
+                let head = self.index.line_start(r.start);
+                if l != r.start {
+                    self.sels = vec![Sel::caret(head)];
+                }
+            } else {
+                self.folded.remove(&r.start);
+            }
+        }
+    }
+
     /// Select a range (byte offsets) and scroll it to the center.
     pub fn select(&mut self, range: Range<usize>) {
         self.sels = vec![Sel {
@@ -95,6 +161,7 @@ pub struct Options<'a> {
     pub indent: &'a str,
     /// Line comment token for Cmd+/ (None: no toggle).
     pub comment: Option<&'a str>,
+    pub minimap: bool,
 }
 
 /// Decorations supplied by the app.
@@ -123,7 +190,8 @@ pub struct Output {
     pub focused: bool,
 }
 
-struct Layout {
+struct Layout<'a> {
+    view: &'a fold::View,
     row_h: f32,
     /// Screen x where text starts (after the gutter), at the current horizontal scroll.
     text_x: f32,
@@ -131,9 +199,9 @@ struct Layout {
     top: f32,
 }
 
-impl Layout {
+impl Layout<'_> {
     fn line_y(&self, l: usize) -> f32 {
-        self.top + l as f32 * self.row_h
+        self.top + self.view.row(l) as f32 * self.row_h
     }
 }
 
@@ -259,107 +327,91 @@ pub fn show(
     }
 
     // ---- layout
+    st.index(text, *version);
+    st.update_view(text, *version);
+    st.unfold_carets();
+    st.update_view(text, *version);
     let ix = st.index(text, *version).clone();
+    let view = st.view.clone();
     let spans = if opts.highlight {
         hl.spans(ui.ctx(), *version, text, opts.lang, ui.visuals().dark_mode)
     } else {
         None
     };
     let digits = ix.lines().to_string().len().max(3);
-    let gutter_w = (digits as f32 + 2.5) * char_w;
+    // Fold arrows, line numbers, change markers.
+    let fold_w = 1.6 * char_w;
+    let gutter_w = fold_w + (digits as f32 + 2.5) * char_w;
     let content = Vec2::new(
         gutter_w + (ix.max_line_bytes as f32 + 8.0) * char_w + 200.0,
         // Let the last line scroll up to the middle of the view.
-        (ix.lines() as f32) * row_h + ui.available_height() * 0.5,
+        (view.count() as f32) * row_h + ui.available_height() * 0.5,
     );
     let text_color = ui.visuals().text_color();
 
-    let scroll = egui::ScrollArea::both()
-        .id_salt(id.with("scroll"))
-        .auto_shrink([false, false])
-        .show_viewport(ui, |ui, vp| {
-            let (rect, _) = ui.allocate_exact_size(content, Sense::hover());
-            let resp = ui.interact(rect, id, Sense::click_and_drag());
-            let lay = Layout {
-                row_h,
-                text_x: rect.min.x + gutter_w,
-                top: rect.min.y,
-            };
-            let lines = Lines {
-                ui,
-                text,
-                ix: &ix,
-                spans,
-                font: font.clone(),
-                color: text_color,
-            };
-            let visible = (vp.min.y / row_h).floor().max(0.0) as usize..((vp.max.y / row_h).ceil() as usize + 1).min(ix.lines());
-            let clip = Rect::from_min_max(
-                Pos2::new(rect.min.x + vp.min.x + gutter_w, rect.min.y + vp.min.y),
-                rect.min + vp.max.to_vec2(),
-            );
+    // The minimap takes a strip on the right.
+    let full = ui.available_rect_before_wrap();
+    let mini_w = if opts.minimap && full.width() > 400.0 { 80.0 } else { 0.0 };
+    let main_rect = Rect::from_min_max(full.min, Pos2::new(full.max.x - mini_w, full.max.y));
+    let mini_rect = Rect::from_min_max(Pos2::new(full.max.x - mini_w, full.min.y), full.max);
+    let mut main_ui = ui.new_child(egui::UiBuilder::new().max_rect(main_rect));
+    let mut area = egui::ScrollArea::both().id_salt(id.with("scroll")).auto_shrink([false, false]);
+    if let Some(y) = st.scroll_to.take() {
+        area = area.vertical_scroll_offset(y.max(0.0));
+    }
+    let scroll = area.show_viewport(&mut main_ui, |ui, vp| {
+        let (rect, _) = ui.allocate_exact_size(content, Sense::hover());
+        let resp = ui.interact(rect, id, Sense::click_and_drag());
+        let lay = Layout {
+            view: &view,
+            row_h,
+            text_x: rect.min.x + gutter_w,
+            top: rect.min.y,
+        };
+        let lines = Lines {
+            ui,
+            text,
+            ix: &ix,
+            spans,
+            font: font.clone(),
+            color: text_color,
+        };
+        let visible_rows = (vp.min.y / row_h).floor().max(0.0) as usize..((vp.max.y / row_h).ceil() as usize + 1).min(view.count());
+        let vis_lines: Vec<usize> = visible_rows.clone().map(|r| view.line(r)).collect();
+        let shown = |l: usize| !view.is_hidden(l) && visible_rows.contains(&view.row(l));
+        let clip = Rect::from_min_max(
+            Pos2::new(rect.min.x + vp.min.x + gutter_w, rect.min.y + vp.min.y),
+            rect.min + vp.max.to_vec2(),
+        );
 
-            // ---- mouse
-            let ptr = mouse(ui, st, &resp, &lines, &lay, is_mac, &mut out);
+        // ---- mouse
+        let ptr = mouse(ui, st, &resp, &lines, &lay, &mut out, rect.min.x + vp.min.x + fold_w);
 
-            // ---- paint
-            let painter = ui.painter().with_clip_rect(clip);
-            let primary = st.primary();
-            let (pl, _) = ix.line_col(primary.head);
-            let single_line = ix.line_of_byte(primary.anchor) == pl;
-            let galleys: Vec<(usize, Arc<egui::Galley>)> = visible.clone().map(|l| (l, lines.galley(l))).collect();
+        // ---- paint
+        let painter = ui.painter().with_clip_rect(clip);
+        let primary = st.primary();
+        let (pl, _) = ix.line_col(primary.head);
+        let single_line = ix.line_of_byte(primary.anchor) == pl;
+        let galleys: Vec<(usize, Arc<egui::Galley>)> = vis_lines.iter().map(|&l| (l, lines.galley(l))).collect();
 
-            if opts.current_line && single_line && st.sels.len() == 1 && visible.contains(&pl) {
-                let y = lay.line_y(pl);
-                let band = Rect::from_min_max(Pos2::new(clip.min.x - gutter_w, y), Pos2::new(clip.max.x, y + row_h));
-                ui.painter()
-                    .with_clip_rect(ui.clip_rect())
-                    .rect_filled(band, 0.0, text_color.gamma_multiply(0.06));
-            }
-            let x_in = |l: usize, g: &egui::Galley, b: usize| {
-                let range = ix.line_range(text, l);
-                let b = b.clamp(range.start, range.end);
-                lay.text_x + g.pos_from_cursor(CCursor::new(text[range.start..b].chars().count())).min.x
-            };
-            // Marks (find matches), then selections.
-            let paint_ranges = |ranges: &mut dyn Iterator<Item = Range<usize>>, color: Color32, extend_eol: bool| {
-                for r in ranges {
-                    if r.is_empty() {
-                        continue;
-                    }
-                    let (l0, l1) = (ix.line_of_byte(r.start), ix.line_of_byte(r.end));
-                    for (l, g) in &galleys {
-                        if *l < l0 || *l > l1 {
-                            continue;
-                        }
-                        let lr = ix.line_range(text, *l);
-                        let a = x_in(*l, g, r.start.max(lr.start));
-                        let mut b = x_in(*l, g, r.end.min(lr.end));
-                        if extend_eol && r.end > lr.end {
-                            b += char_w * 0.6;
-                        }
-                        let y = lay.line_y(*l);
-                        painter.rect_filled(Rect::from_min_max(Pos2::new(a, y), Pos2::new(b, y + row_h)), 2.0, color);
-                    }
+        if opts.current_line && single_line && st.sels.len() == 1 && shown(pl) {
+            let y = lay.line_y(pl);
+            let band = Rect::from_min_max(Pos2::new(clip.min.x - gutter_w, y), Pos2::new(clip.max.x, y + row_h));
+            ui.painter()
+                .with_clip_rect(ui.clip_rect())
+                .rect_filled(band, 0.0, text_color.gamma_multiply(0.06));
+        }
+        let x_in = |l: usize, g: &egui::Galley, b: usize| {
+            let range = ix.line_range(text, l);
+            let b = b.clamp(range.start, range.end);
+            lay.text_x + g.pos_from_cursor(CCursor::new(text[range.start..b].chars().count())).min.x
+        };
+        // Marks (find matches), then selections.
+        let paint_ranges = |ranges: &mut dyn Iterator<Item = Range<usize>>, color: Color32, extend_eol: bool| {
+            for r in ranges {
+                if r.is_empty() {
+                    continue;
                 }
-            };
-            let mark = ui.visuals().warn_fg_color.gamma_multiply(0.25);
-            paint_ranges(&mut extras.marks.iter().cloned(), mark, false);
-            let sel_color = ui.visuals().selection.bg_fill.gamma_multiply(if focused { 0.7 } else { 0.4 });
-            paint_ranges(&mut st.sels.iter().map(|s| s.range()), sel_color, true);
-
-            // Text.
-            for (l, g) in &galleys {
-                painter.galley(Pos2::new(lay.text_x, lay.line_y(*l)), g.clone(), text_color);
-            }
-            if opts.whitespace {
-                let color = ui.visuals().weak_text_color().gamma_multiply(0.6);
-                for (l, g) in &galleys {
-                    paint_whitespace(&painter, g, Pos2::new(lay.text_x, lay.line_y(*l)), color);
-                }
-            }
-            // Squiggles.
-            for (r, color) in extras.squiggles {
                 let (l0, l1) = (ix.line_of_byte(r.start), ix.line_of_byte(r.end));
                 for (l, g) in &galleys {
                     if *l < l0 || *l > l1 {
@@ -367,83 +419,151 @@ pub fn show(
                     }
                     let lr = ix.line_range(text, *l);
                     let a = x_in(*l, g, r.start.max(lr.start));
-                    let b = x_in(*l, g, r.end.min(lr.end)).max(a + char_w);
-                    squiggle(&painter, a, b, lay.line_y(*l) + row_h - 1.5, *color);
-                }
-            }
-            // Inline blame after the primary line.
-            if let Some(inline) = extras.inline
-                && single_line
-                && let Some((_, g)) = galleys.iter().find(|(l, _)| *l == pl)
-            {
-                let color = ui.visuals().weak_text_color().gamma_multiply(0.8);
-                let p = Pos2::new(lay.text_x + g.size().x + 4.0 * char_w, lay.line_y(pl) + row_h / 2.0);
-                painter.text(p, egui::Align2::LEFT_CENTER, inline, font.clone(), color);
-            }
-            // Carets (solid, no blinking: blinking would need a repaint twice a second).
-            let caret_color = ui.visuals().text_cursor.stroke.color;
-            for s in &st.sels {
-                let (l, _) = ix.line_col(s.head);
-                if let Some((_, g)) = galleys.iter().find(|(gl, _)| *gl == l) {
-                    let x = x_in(l, g, s.head);
-                    let y = lay.line_y(l);
-                    if focused || st.sels.len() > 1 {
-                        painter.line_segment([Pos2::new(x, y), Pos2::new(x, y + row_h)], Stroke::new(2.0, caret_color));
+                    let mut b = x_in(*l, g, r.end.min(lr.end));
+                    if extend_eol && r.end > lr.end {
+                        b += char_w * 0.6;
                     }
+                    let y = lay.line_y(*l);
+                    painter.rect_filled(Rect::from_min_max(Pos2::new(a, y), Pos2::new(b, y + row_h)), 2.0, color);
                 }
             }
-            // IME pre-edit text at the caret.
-            let caret_x = lines.x_of(primary.head);
-            let caret_rect = Rect::from_min_size(Pos2::new(lay.text_x + caret_x, lay.line_y(pl)), Vec2::new(2.0, row_h));
-            if let Some(pre) = &st.preedit {
-                let g = ui.fonts_mut(|f| f.layout_no_wrap(pre.clone(), font.clone(), text_color));
-                let r = Rect::from_min_size(caret_rect.min, g.size());
-                painter.rect_filled(r, 0.0, ui.visuals().extreme_bg_color);
-                painter.galley(r.min, g, text_color);
-                painter.line_segment([r.left_bottom(), r.right_bottom()], Stroke::new(1.0, text_color));
-            }
-            out.caret_rect = Some(caret_rect);
+        };
+        let mark = ui.visuals().warn_fg_color.gamma_multiply(0.25);
+        paint_ranges(&mut extras.marks.iter().cloned(), mark, false);
+        let sel_color = ui.visuals().selection.bg_fill.gamma_multiply(if focused { 0.7 } else { 0.4 });
+        paint_ranges(&mut st.sels.iter().map(|s| s.range()), sel_color, true);
 
-            // Gutter (fixed while scrolling horizontally).
-            let gx = rect.min.x + vp.min.x;
-            let gutter_clip = Rect::from_min_max(Pos2::new(gx, clip.min.y), Pos2::new(gx + gutter_w, clip.max.y));
-            let gp = ui.painter().with_clip_rect(gutter_clip);
-            gp.rect_filled(gutter_clip, 0.0, ui.visuals().panel_fill);
-            let weak = ui.visuals().weak_text_color();
-            let strong = ui.visuals().strong_text_color();
-            for l in visible.clone() {
-                let y = lay.line_y(l);
-                let color = if l == pl { strong } else { weak };
-                gp.text(
-                    Pos2::new(gx + gutter_w - 1.5 * char_w, y),
-                    egui::Align2::RIGHT_TOP,
-                    (l + 1).to_string(),
+        // Text.
+        for (l, g) in &galleys {
+            painter.galley(Pos2::new(lay.text_x, lay.line_y(*l)), g.clone(), text_color);
+        }
+        if opts.whitespace {
+            let color = ui.visuals().weak_text_color().gamma_multiply(0.6);
+            for (l, g) in &galleys {
+                paint_whitespace(&painter, g, Pos2::new(lay.text_x, lay.line_y(*l)), color);
+            }
+        }
+        // Folded regions: a "⋯" chip after the header line.
+        for (l, g) in &galleys {
+            if st.folded.contains(l) {
+                let x = lay.text_x + g.size().x + char_w;
+                let r = Rect::from_min_size(Pos2::new(x, lay.line_y(*l) + 2.0), Vec2::new(3.0 * char_w, row_h - 4.0));
+                painter.rect_filled(r, 3.0, ui.visuals().widgets.inactive.weak_bg_fill);
+                painter.text(
+                    r.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "...",
                     font.clone(),
-                    color,
+                    ui.visuals().weak_text_color(),
                 );
             }
-            for &(l, color, deleted) in extras.gutter {
-                if !visible.contains(&l) && !(deleted && visible.contains(&l.saturating_sub(1))) {
+        }
+        // Squiggles.
+        for (r, color) in extras.squiggles {
+            let (l0, l1) = (ix.line_of_byte(r.start), ix.line_of_byte(r.end));
+            for (l, g) in &galleys {
+                if *l < l0 || *l > l1 {
                     continue;
                 }
-                let x = gx + gutter_w - 0.9 * char_w;
+                let lr = ix.line_range(text, *l);
+                let a = x_in(*l, g, r.start.max(lr.start));
+                let b = x_in(*l, g, r.end.min(lr.end)).max(a + char_w);
+                squiggle(&painter, a, b, lay.line_y(*l) + row_h - 1.5, *color);
+            }
+        }
+        // Inline blame after the primary line.
+        if let Some(inline) = extras.inline
+            && single_line
+            && let Some((_, g)) = galleys.iter().find(|(l, _)| *l == pl)
+        {
+            let color = ui.visuals().weak_text_color().gamma_multiply(0.8);
+            let p = Pos2::new(lay.text_x + g.size().x + 4.0 * char_w, lay.line_y(pl) + row_h / 2.0);
+            painter.text(p, egui::Align2::LEFT_CENTER, inline, font.clone(), color);
+        }
+        // Carets (solid, no blinking: blinking would need a repaint twice a second).
+        let caret_color = ui.visuals().text_cursor.stroke.color;
+        for s in &st.sels {
+            let (l, _) = ix.line_col(s.head);
+            if let Some((_, g)) = galleys.iter().find(|(gl, _)| *gl == l) {
+                let x = x_in(l, g, s.head);
                 let y = lay.line_y(l);
-                if deleted {
-                    let tri = vec![Pos2::new(x, y - 4.0), Pos2::new(x + 5.0, y), Pos2::new(x, y + 4.0)];
-                    gp.add(egui::Shape::convex_polygon(tri, color, Stroke::NONE));
-                } else {
-                    gp.rect_filled(Rect::from_min_size(Pos2::new(x, y), Vec2::new(3.0, row_h)), 0.0, color);
+                if focused || st.sels.len() > 1 {
+                    painter.line_segment([Pos2::new(x, y), Pos2::new(x, y + row_h)], Stroke::new(2.0, caret_color));
                 }
             }
+        }
+        // IME pre-edit text at the caret.
+        let caret_x = lines.x_of(primary.head);
+        let caret_rect = Rect::from_min_size(Pos2::new(lay.text_x + caret_x, lay.line_y(pl)), Vec2::new(2.0, row_h));
+        if let Some(pre) = &st.preedit {
+            let g = ui.fonts_mut(|f| f.layout_no_wrap(pre.clone(), font.clone(), text_color));
+            let r = Rect::from_min_size(caret_rect.min, g.size());
+            painter.rect_filled(r, 0.0, ui.visuals().extreme_bg_color);
+            painter.galley(r.min, g, text_color);
+            painter.line_segment([r.left_bottom(), r.right_bottom()], Stroke::new(1.0, text_color));
+        }
+        out.caret_rect = Some(caret_rect);
 
-            // Scroll requests.
-            if let Some(center) = st.reveal.take() {
-                let r = caret_rect.expand2(Vec2::new(4.0 * char_w, row_h));
-                let r = r.translate(Vec2::new(-gutter_w, 0.0)).union(r); // keep the gutter from covering it
-                ui.scroll_to_rect(r, if center { Some(egui::Align::Center) } else { None });
+        // Gutter (fixed while scrolling horizontally).
+        let gx = rect.min.x + vp.min.x;
+        let gutter_clip = Rect::from_min_max(Pos2::new(gx, clip.min.y), Pos2::new(gx + gutter_w, clip.max.y));
+        let gp = ui.painter().with_clip_rect(gutter_clip);
+        gp.rect_filled(gutter_clip, 0.0, ui.visuals().panel_fill);
+        let weak = ui.visuals().weak_text_color();
+        let strong = ui.visuals().strong_text_color();
+        let gutter_hover = resp.hover_pos().is_some_and(|p| p.x < gx + gutter_w);
+        for &l in &vis_lines {
+            let y = lay.line_y(l);
+            let folded = st.folded.contains(&l);
+            if folded || (gutter_hover && st.regions.iter().any(|r| r.start == l)) {
+                let icon = if folded {
+                    crate::icons::CARET_RIGHT
+                } else {
+                    crate::icons::CARET_DOWN
+                };
+                gp.text(
+                    Pos2::new(gx + 0.3 * char_w, y + row_h / 2.0),
+                    egui::Align2::LEFT_CENTER,
+                    icon,
+                    font.clone(),
+                    weak,
+                );
             }
-            ptr
-        });
+            let color = if l == pl { strong } else { weak };
+            gp.text(
+                Pos2::new(gx + gutter_w - 1.5 * char_w, y),
+                egui::Align2::RIGHT_TOP,
+                (l + 1).to_string(),
+                font.clone(),
+                color,
+            );
+        }
+        for &(l, color, deleted) in extras.gutter {
+            if !shown(l) && !(deleted && shown(l.saturating_sub(1))) {
+                continue;
+            }
+            let x = gx + gutter_w - 0.9 * char_w;
+            let y = lay.line_y(l);
+            if deleted {
+                let tri = vec![Pos2::new(x, y - 4.0), Pos2::new(x + 5.0, y), Pos2::new(x, y + 4.0)];
+                gp.add(egui::Shape::convex_polygon(tri, color, Stroke::NONE));
+            } else {
+                gp.rect_filled(Rect::from_min_size(Pos2::new(x, y), Vec2::new(3.0, row_h)), 0.0, color);
+            }
+        }
+
+        // Scroll requests.
+        if let Some(center) = st.reveal.take() {
+            let r = caret_rect.expand2(Vec2::new(4.0 * char_w, row_h));
+            let r = r.translate(Vec2::new(-gutter_w, 0.0)).union(r); // keep the gutter from covering it
+            ui.scroll_to_rect(r, if center { Some(egui::Align::Center) } else { None });
+        }
+        ptr
+    });
+    ui.allocate_rect(full, Sense::hover());
+    if mini_w > 0.0 {
+        minimap(ui, id, st, text, &ix, &view, spans, mini_rect, &scroll, row_h);
+    }
 
     // IME: report where the caret is, so the candidate window opens next to it.
     if focused && let Some(caret) = out.caret_rect {
@@ -479,6 +599,91 @@ pub fn show(
         st.rest = None;
     }
     out
+}
+
+/// Overview of the file on the right: 2 px per row, colored by syntax; drag to scroll.
+#[allow(clippy::too_many_arguments)]
+fn minimap(
+    ui: &egui::Ui,
+    id: egui::Id,
+    st: &mut State,
+    text: &str,
+    ix: &LineIndex,
+    view: &fold::View,
+    spans: Option<&[highlight::Line]>,
+    rect: Rect,
+    scroll: &egui::scroll_area::ScrollAreaOutput<Option<(usize, Pos2)>>,
+    row_h: f32,
+) {
+    const ROW: f32 = 2.0;
+    const CHAR: f32 = 1.0;
+    let rows = view.count();
+    let capacity = ((rect.height() / ROW) as usize).max(1);
+    let vis_rows = scroll.inner_rect.height() / row_h;
+    let offset_rows = scroll.state.clamped_offset().y / row_h;
+    // Scroll the minimap proportionally when the file is longer than it can show.
+    let max_top = rows.saturating_sub(capacity) as f32;
+    let scrollable = (rows as f32 - vis_rows).max(1.0);
+    let top = if rows <= capacity {
+        0.0
+    } else {
+        (offset_rows / scrollable * max_top).clamp(0.0, max_top)
+    };
+    let top_row = top as usize;
+    let painter = ui.painter().with_clip_rect(rect);
+    painter.rect_filled(rect, 0.0, ui.visuals().panel_fill);
+    let weak = ui.visuals().text_color().gamma_multiply(0.45);
+    for (i, row) in (top_row..rows.min(top_row + capacity)).enumerate() {
+        let l = view.line(row);
+        let y = rect.min.y + i as f32 * ROW;
+        let lr = ix.line_range(text, l);
+        let line = &text[lr];
+        let draw = |range: Range<usize>, color: Color32| {
+            let piece = &line[range.start.min(line.len())..range.end.min(line.len())];
+            let lead = piece.len() - piece.trim_start().len();
+            let body = piece.trim();
+            if body.is_empty() {
+                return;
+            }
+            let x = rect.min.x + 4.0 + (range.start + lead) as f32 * CHAR;
+            if x > rect.max.x {
+                return;
+            }
+            let w = (body.len() as f32 * CHAR).min(rect.max.x - x);
+            painter.rect_filled(
+                Rect::from_min_size(Pos2::new(x, y), Vec2::new(w, ROW * 0.8)),
+                0.0,
+                color.gamma_multiply(0.7),
+            );
+        };
+        match spans.and_then(|s| s.get(l)) {
+            Some(hl) => {
+                for sp in &hl.spans {
+                    draw(sp.range.clone(), sp.color);
+                }
+            }
+            None => draw(0..line.len(), weak),
+        }
+    }
+    // The visible part.
+    let vy = rect.min.y + (offset_rows - top) * ROW;
+    let vr = Rect::from_min_size(Pos2::new(rect.min.x, vy), Vec2::new(rect.width(), vis_rows * ROW));
+    painter.rect_filled(vr, 0.0, ui.visuals().text_color().gamma_multiply(0.08));
+
+    let resp = ui.interact(rect, id.with("minimap"), Sense::click_and_drag());
+    if resp.drag_started() || resp.clicked() {
+        st.minimap_drag = true;
+    }
+    if ((st.minimap_drag && resp.dragged()) || resp.clicked())
+        && let Some(p) = resp.interact_pointer_pos()
+    {
+        let row = top + (p.y - rect.min.y) / ROW;
+        st.scroll_to = Some((row - vis_rows / 2.0) * row_h);
+        ui.ctx().request_repaint();
+    }
+    if resp.drag_stopped() {
+        st.minimap_drag = false;
+    }
 }
 
 fn squiggle(p: &egui::Painter, a: f32, b: f32, y: f32, color: Color32) {
@@ -526,8 +731,8 @@ fn mouse(
     resp: &egui::Response,
     lines: &Lines,
     lay: &Layout,
-    is_mac: bool,
     out: &mut Output,
+    fold_x: f32,
 ) -> Option<(usize, Pos2)> {
     use egui::PointerButton::{Middle, Primary};
     let (pos, pressed, down, released, mid_pressed, mid_down, mods, time) = ui.input(|i| {
@@ -544,7 +749,7 @@ fn mouse(
     });
     let ix = lines.ix;
     let text = lines.text;
-    let to_line = |p: Pos2| (((p.y - lay.top) / lay.row_h).floor().max(0.0) as usize).min(ix.lines() - 1);
+    let to_line = |p: Pos2| lay.view.line(((p.y - lay.top) / lay.row_h).floor().max(0.0) as usize);
     let to_byte = |p: Pos2| lines.byte_at_x(to_line(p), p.x - lay.text_x);
     let hovered = resp.hovered();
     if hovered && !mods.command {
@@ -575,6 +780,20 @@ fn mouse(
         }
     }
 
+    // Click on a fold arrow (left edge of the gutter): fold / unfold that region.
+    if pressed
+        && hovered
+        && let Some(p) = pos
+        && p.x < fold_x
+    {
+        let l = to_line(p);
+        if st.regions.iter().any(|r| r.start == l) {
+            if !st.folded.remove(&l) {
+                st.folded.insert(l);
+            }
+            return None;
+        }
+    }
     if pressed
         && hovered
         && let Some(p) = pos
@@ -685,7 +904,6 @@ fn mouse(
             st.drag = None;
         }
     }
-    let _ = is_mac;
     if down || mid_down { None } else { hover_byte }
 }
 
@@ -818,6 +1036,7 @@ fn key_press(ui: &egui::Ui, st: &mut State, text: &mut String, version: &mut u64
     let line_mod = k.is_mac && m.mac_cmd;
     let shift = m.shift;
     let before = st.sels.clone();
+    let view = st.view.clone();
     let lines = Lines {
         ui,
         text,
@@ -854,13 +1073,13 @@ fn key_press(ui: &egui::Ui, st: &mut State, text: &mut String, version: &mut u64
             let (l, _) = ix.line_col(s.head);
             let x = px.unwrap_or_else(|| lines.x_of(s.head));
             new_x = Some(x);
-            let target = l as isize + rows;
+            let target = view.row(l) as isize + rows;
             if target < 0 {
                 0
-            } else if target as usize >= ix.lines() {
+            } else if target as usize >= view.count() {
                 text.len()
             } else {
-                lines.byte_at_x(target as usize, x)
+                lines.byte_at_x(view.line(target as usize), x)
             }
         };
         let heads: Vec<usize> = st.sels.iter().map(|s| f(*s)).collect();
@@ -910,6 +1129,14 @@ fn key_press(ui: &egui::Ui, st: &mut State, text: &mut String, version: &mut u64
         Key::End if m.command => moved(st, &|_| text.len(), false),
         Key::Home => moved(st, &|s| line_home(s.head), false),
         Key::End => moved(st, &|s| line_end(s.head), false),
+        Key::OpenBracket if m.command && m.alt => {
+            st.fold_at_caret(true);
+            false
+        }
+        Key::CloseBracket if m.command && m.alt => {
+            st.fold_at_caret(false);
+            false
+        }
         Key::A if m.command => {
             st.sels = vec![Sel {
                 anchor: 0,
@@ -1237,6 +1464,7 @@ mod tests {
                     current_line: true,
                     indent: "    ",
                     comment: Some("//"),
+                    minimap: false,
                 };
                 out = show(ui, id, st, text, version, hl, &opts, &Extras::default());
             });

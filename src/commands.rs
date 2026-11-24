@@ -35,6 +35,7 @@ pub(crate) enum Setting {
     ChangesTree,
     RestoreSession,
     FormatOnSave,
+    Minimap,
 }
 
 impl Setting {
@@ -46,6 +47,7 @@ impl Setting {
             Self::ChangesTree => "Source Control: view as tree",
             Self::RestoreSession => "Restore previous session",
             Self::FormatOnSave => "Format on save",
+            Self::Minimap => "Show minimap",
         }
     }
 
@@ -57,6 +59,7 @@ impl Setting {
             Self::ChangesTree => &mut settings.changes_tree,
             Self::RestoreSession => &mut settings.restore_previous_session,
             Self::FormatOnSave => &mut settings.format_on_save,
+            Self::Minimap => &mut settings.minimap,
         }
     }
 }
@@ -139,6 +142,7 @@ pub(crate) const COMMANDS: &[Entry] = &[
     Entry::new(ToggleSetting(Setting::ChangesTree), "Toggle source control tree view", &[]),
     Entry::new(ToggleSetting(Setting::RestoreSession), "Toggle restoring the previous session", &[]),
     Entry::new(ToggleSetting(Setting::FormatOnSave), "Toggle format on save", &[]),
+    Entry::new(ToggleSetting(Setting::Minimap), "Toggle minimap", &[]),
     Entry::new(
         FormatDocument,
         "Format document",

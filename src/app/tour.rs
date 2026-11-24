@@ -27,6 +27,7 @@ const STEPS: &[&str] = &[
     "editor",
     "go-to-file",
     "search-in-files",
+    "folding",
     "find-replace",
     "command-palette",
     "source-control",
@@ -207,7 +208,17 @@ impl Tour {
                 app.ignored = vec!["target".into()];
                 app.start_search(ctx);
             }
+            "folding" => {
+                // Fold `pub struct Row {` and `const PALETTE` (0-based lines 5 and 18).
+                if let Some(Tab::File(d)) = app.tabs.iter_mut().find(|t| matches!(t, Tab::File(_))) {
+                    d.ed.folded.insert(5);
+                    d.ed.folded.insert(18);
+                }
+            }
             "find-replace" => {
+                if let Some(Tab::File(d)) = app.tabs.iter_mut().find(|t| matches!(t, Tab::File(_))) {
+                    d.ed.folded.clear();
+                }
                 if let Some(i) = app.tabs.iter().position(|t| matches!(t, Tab::File(_))) {
                     app.active = i;
                 }
