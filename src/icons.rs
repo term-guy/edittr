@@ -64,12 +64,13 @@ mod tests {
         );
         fonts.families.insert(FontFamily::Proportional, vec!["phosphor".into()]);
         ctx.set_fonts(fonts);
-        let _ = ctx.run_ui(Default::default(), |ui| {
+        let mut full = ctx.run_ui(Default::default(), |ui| {
             ui.fonts_mut(|fonts| {
                 for icon in [INFO, LIGHTBULB, WARNING, X_CIRCLE] {
                     assert!(fonts.has_glyphs(&FontId::proportional(14.0), icon), "missing glyph {icon:?}");
                 }
             });
         });
+        full.textures_delta.clear(); // no renderer here (epaint asserts on dropped deltas in debug)
     }
 }

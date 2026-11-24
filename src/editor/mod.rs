@@ -1561,7 +1561,7 @@ mod tests {
             };
             let mut out = Output::default();
             let (st, text, version, hl, id) = (&mut self.st, &mut self.text, &mut self.version, &mut self.hl, self.id);
-            let full = self.ctx.run_ui(input, |ui| {
+            let mut full = self.ctx.run_ui(input, |ui| {
                 let opts = Options {
                     lang: "rs",
                     highlight: false,
@@ -1574,6 +1574,7 @@ mod tests {
                 };
                 out = show(ui, id, st, text, version, hl, &opts, &Extras::default());
             });
+            full.textures_delta.clear(); // no renderer here (epaint asserts on dropped deltas in debug)
             for cmd in full.platform_output.commands {
                 if let egui::OutputCommand::CopyText(t) = cmd {
                     self.clipboard = Some(t);

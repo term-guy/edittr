@@ -10,7 +10,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Commands
 
-- Build/test: `cargo build --release`, `cargo test --release`.
+- Build/test: `cargo build --release`, `cargo test --release`. CI's lint job runs `cargo test --locked` in debug, which enables extra egui/epaint debug asserts: run it too before pushing.
 - Real-network / real-server tests are `#[ignore]`d. Run them with a throwaway servers dir, never the real one: `EDITTR_SERVERS_DIR=<tmp dir> cargo test --release -- --ignored` (downloads rust-analyzer and clangd; `lsp_round_trip_c` needs `clangd` on PATH).
 - App icon assets are generated: `python3 packaging/make_icon.py` (rewrites `assets/icon*` and `packaging/macos/edittr.icns`).
 - Formatting/lint: `rustfmt.toml` sets `max_width = 140` (a hook formats edited `.rs` files). CI fails on `cargo fmt --check` or `cargo clippy --all-targets -- -D warnings`; run both before pushing.
@@ -39,7 +39,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Gotchas
 
-- The editor is a custom widget (`src/editor/`: `buffer.rs` text model + undo, `fold.rs`, `mod.rs` widget) that lays out only visible lines; don't reintroduce `egui::TextEdit` for code. Its keyboard behavior is covered by headless widget tests in `src/editor/mod.rs` (drive the real widget with injected events).
+- The editor is a custom widget (`src/editor/`: `buffer.rs` text model + undo, `fold.rs`, `mod.rs` widget) that lays out only visible lines; don't reintroduce `egui::TextEdit` for code. Its keyboard behavior is covered by headless widget tests in `src/editor/mod.rs` (drive the real widget with injected events). Headless `ctx.run_ui` calls must `textures_delta.clear()` the output, or epaint panics in debug builds.
 - Editor text changes must bump `Doc::version` (use `Doc::reload` / `Doc::mark_saved`): highlighting, blame, dirty state and the gutter are cached per version. Syntax highlighting is incremental (`src/highlight.rs`), not egui_extras' whole-buffer highlighter.
 - VCS calls go through `src/vcs.rs` (Git or Subversion) on background workers; refreshes are driven by the file watcher (`src/watch.rs`), not a timer. `svn` is not installed on the dev Mac: svn code is only unit-tested against sample XML.
 - To measure frame times, time `App::ui` temporarily and run the tour against a demo repo containing a ~20k-line file; remove the timer afterwards.
