@@ -170,10 +170,10 @@ impl Tour {
             }
             "source-control" => {
                 app.side = Side::Changes;
-                app.changes_tree = false;
+                app.settings.changes_tree = false;
                 app.refresh_git();
             }
-            "source-control-tree" => app.changes_tree = true,
+            "source-control-tree" => app.settings.changes_tree = true,
             "diff-side-by-side" => {
                 if let Some(c) = app.status.unstaged.iter().find(|c| c.path == "a.rs").cloned() {
                     app.open_diff(&c, false);

@@ -5,6 +5,7 @@ use crate::git::{self, FileChange, Status};
 use crate::graph::Graph;
 use crate::icons as ic;
 use crate::search::{self, FileHits};
+use crate::settings::Settings;
 use crate::{goto, installer, lsp};
 use eframe::egui::{self, Color32, Key, KeyboardShortcut, Modifiers, RichText};
 use egui_extras::syntax_highlighting::{self, CodeTheme};
@@ -218,7 +219,7 @@ pub struct App {
     install: Option<InstallJob>,
     install_prompt: Option<&'static str>,
     install_declined: HashSet<&'static str>,
-    changes_tree: bool,
+    settings: Settings,
     /// Collapsed folders in the Changes tree, keyed "S:<path>" (staged) or "U:<path>".
     changes_collapsed: HashSet<String>,
     #[cfg(feature = "tour")]
@@ -264,7 +265,7 @@ impl App {
             install: None,
             install_prompt: None,
             install_declined: HashSet::new(),
-            changes_tree: false,
+            settings: Settings::load(),
             changes_collapsed: HashSet::new(),
             #[cfg(feature = "tour")]
             tour: tour::Tour::from_env(),
@@ -1202,13 +1203,16 @@ impl App {
             if icon_button(ui, ic::ARROWS_CLOCKWISE).on_hover_text("Refresh").clicked() {
                 self.refresh_git();
             }
-            let (icon, tip) = if self.changes_tree {
+            let (icon, tip) = if self.settings.changes_tree {
                 (ic::LIST, "View as list")
             } else {
                 (ic::TREE_VIEW, "View as tree (grouped by folder)")
             };
             if icon_button(ui, icon).on_hover_text(tip).clicked() {
-                self.changes_tree = !self.changes_tree;
+                self.settings.changes_tree = !self.settings.changes_tree;
+                if let Err(err) = self.settings.save() {
+                    self.message = format!("Could not save settings: {err}");
+                }
             }
             if icon_button(ui, ic::TREE_STRUCTURE).on_hover_text("Git graph").clicked() {
                 self.open_graph();
@@ -1250,7 +1254,7 @@ impl App {
                     }
                 });
             });
-            if let Some(a) = change_section(ui, &staged, true, self.changes_tree, &self.changes_collapsed) {
+            if let Some(a) = change_section(ui, &staged, true, self.settings.changes_tree, &self.changes_collapsed) {
                 actions.push(a);
             }
             ui.add_space(8.0);
@@ -1263,7 +1267,7 @@ impl App {
                     }
                 });
             });
-            if let Some(a) = change_section(ui, &unstaged, false, self.changes_tree, &self.changes_collapsed) {
+            if let Some(a) = change_section(ui, &unstaged, false, self.settings.changes_tree, &self.changes_collapsed) {
                 actions.push(a);
             }
         });

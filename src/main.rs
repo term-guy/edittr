@@ -10,6 +10,7 @@ mod icons;
 mod installer;
 mod lsp;
 mod search;
+mod settings;
 mod tree;
 
 use std::path::PathBuf;
