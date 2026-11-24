@@ -44,8 +44,13 @@ impl Progress {
     fn stage(&self, s: impl Into<String>) {
         *self.stage.lock().unwrap() = s.into();
     }
-    pub fn describe(&self) -> String {
-        let stage = self.stage.lock().unwrap().clone();
+    pub fn describe(&self, command: &str) -> String {
+        let stage = self
+            .stage
+            .try_lock()
+            .ok()
+            .filter(|stage| !stage.is_empty())
+            .map_or_else(|| format!("Installing {command}…"), |stage| stage.clone());
         let (done, total) = (self.done.load(Ordering::Relaxed), self.total.load(Ordering::Relaxed));
         if total > 0 && done < total {
             format!("{stage} {}%", done * 100 / total)

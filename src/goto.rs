@@ -383,7 +383,7 @@ mod tests {
             .into_iter()
             .find(|s| lsp::resolve(s.command).is_some())
             .expect("server not installed");
-        let client = lsp::Client::start(&spec, &dir, &[]).unwrap();
+        let client = lsp::Client::start(&spec, &dir, &[], None).unwrap();
         let text = std::fs::read_to_string(dir.join(main)).unwrap();
         let idx = text.find(symbol).map(|b| text[..b].chars().count()).unwrap() + 1;
         // Indexing can take a moment: retry until the server answers with a location.

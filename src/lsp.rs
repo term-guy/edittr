@@ -117,17 +117,72 @@ struct Synced {
     text_hash: u64,
 }
 
+#[derive(Eq, Hash, PartialEq)]
+enum ProgressToken {
+    Number(i64),
+    String(String),
+}
+
+#[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
+pub struct Progress {
+    pub title: String,
+    pub message: Option<String>,
+    pub percentage: Option<u64>,
+}
+
+fn update_progress(active: &mut HashMap<ProgressToken, Progress>, params: &Value) -> bool {
+    let token = &params["token"];
+    let token = if let Some(number) = token.as_i64() {
+        ProgressToken::Number(number)
+    } else if let Some(string) = token.as_str() {
+        ProgressToken::String(string.to_owned())
+    } else {
+        return false;
+    };
+    let value = &params["value"];
+    let message = value["message"].as_str();
+    let percentage = value["percentage"].as_u64();
+    match value["kind"].as_str() {
+        Some("begin") => {
+            let Some(title) = value["title"].as_str() else { return false };
+            active.insert(
+                token,
+                Progress {
+                    title: title.to_owned(),
+                    message: message.map(str::to_owned),
+                    percentage,
+                },
+            );
+            true
+        }
+        Some("report") => {
+            let Some(progress) = active.get_mut(&token) else { return false };
+            if let Some(message) = message {
+                progress.message = Some(message.to_owned());
+            }
+            if percentage.is_some() {
+                progress.percentage = percentage;
+            }
+            message.is_some() || percentage.is_some()
+        }
+        Some("end") => active.remove(&token).is_some(),
+        _ => false,
+    }
+}
+
 pub struct Client {
     pub name: &'static str,
     language_id: &'static str,
     root: PathBuf,
     ignored: Vec<String>,
     retired: AtomicBool,
+    connected: AtomicBool,
     stdin: Mutex<ChildStdin>,
     child: Mutex<Child>,
     next_id: AtomicI64,
     pending: Arc<Mutex<HashMap<i64, Sender<Value>>>>,
     ready: OnceLock<Result<(), String>>,
+    progress: Mutex<HashMap<ProgressToken, Progress>>,
     docs: Mutex<HashMap<String, Synced>>,
 }
 
@@ -142,7 +197,12 @@ impl Drop for Client {
 
 impl Client {
     /// Spawn the server and start the `initialize` handshake in the background.
-    pub fn start(spec: &ServerSpec, root: &Path, ignored: &[String]) -> Result<Arc<Client>, String> {
+    pub fn start(
+        spec: &ServerSpec,
+        root: &Path,
+        ignored: &[String],
+        repaint: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) -> Result<Arc<Client>, String> {
         let launch = resolve(spec.command).ok_or_else(|| format!("{} is not installed", spec.command))?;
         let mut cmd = Command::new(&launch.exe);
         cmd.args(&launch.args)
@@ -166,21 +226,24 @@ impl Client {
             root: root.to_path_buf(),
             ignored: ignored.to_vec(),
             retired: AtomicBool::new(false),
+            connected: AtomicBool::new(true),
             stdin: Mutex::new(stdin),
             child: Mutex::new(child),
             next_id: AtomicI64::new(1),
             pending: Arc::new(Mutex::new(HashMap::new())),
             ready: OnceLock::new(),
+            progress: Mutex::new(HashMap::new()),
             docs: Mutex::new(HashMap::new()),
         });
 
         let weak = Arc::downgrade(&client);
         let pending = client.pending.clone();
+        let reader_repaint = repaint.clone();
         std::thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
             while let Some(msg) = read_message(&mut reader) {
-                let id = msg.get("id").cloned();
-                let method = msg.get("method").and_then(Value::as_str).map(str::to_string);
+                let id = msg.get("id");
+                let method = msg.get("method").and_then(Value::as_str);
                 match (id, method) {
                     // Response to one of our requests.
                     (Some(id), None) => {
@@ -195,11 +258,26 @@ impl Client {
                             let items = msg["params"]["items"].as_array().map_or(&[][..], Vec::as_slice);
                             Value::Array(items.iter().map(|item| c.configuration(&item["section"])).collect())
                         } else {
+                            // Includes window/workDoneProgress/create. Track the token when it begins.
                             Value::Null
                         };
                         c.send(&json!({"jsonrpc": "2.0", "id": id, "result": result}));
                     }
-                    _ => {} // notifications (logs, progress, diagnostics) are ignored
+                    (None, Some("$/progress")) => {
+                        let Some(c) = weak.upgrade() else { break };
+                        let changed = update_progress(&mut c.progress.lock().unwrap(), &msg["params"]);
+                        if changed && let Some(repaint) = &reader_repaint {
+                            repaint();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(c) = weak.upgrade() {
+                c.connected.store(false, Ordering::Release);
+                pending.lock().unwrap().clear();
+                if let Some(repaint) = reader_repaint {
+                    repaint();
                 }
             }
         });
@@ -216,6 +294,7 @@ impl Client {
                 "workspaceFolders": [{"uri": root_uri, "name": root_name}],
                 "capabilities": {
                     "general": {"positionEncodings": ["utf-16"]},
+                    "window": {"workDoneProgress": true},
                     "textDocument": {
                         "synchronization": {"dynamicRegistration": false},
                         "definition": {"linkSupport": true},
@@ -231,12 +310,35 @@ impl Client {
                 .request("initialize", params, Duration::from_secs(60))
                 .map(|_| c.notify("initialized", json!({})));
             let _ = c.ready.set(res);
+            if let Some(repaint) = repaint {
+                repaint();
+            }
         });
         Ok(client)
     }
 
     pub fn alive(&self) -> bool {
         self.child.lock().map(|mut c| matches!(c.try_wait(), Ok(None))).unwrap_or(false)
+    }
+
+    pub fn is_available(&self) -> bool {
+        self.connected.load(Ordering::Acquire) && !self.retired.load(Ordering::Acquire) && !matches!(self.ready.get(), Some(Err(_)))
+    }
+
+    pub fn is_starting(&self) -> bool {
+        self.is_available() && self.ready.get().is_none()
+    }
+
+    pub fn active_progress(&self) -> Vec<Progress> {
+        if !self.is_available() {
+            return Vec::new();
+        }
+        // A progress report can arrive while the UI is drawing. The reader will request another frame.
+        let Ok(active) = self.progress.try_lock() else { return Vec::new() };
+        let mut snapshot: Vec<_> = active.values().cloned().collect();
+        drop(active);
+        snapshot.sort_unstable();
+        snapshot
     }
 
     /// Prevent workers that still hold an Arc from sending after this client is replaced.
@@ -278,7 +380,7 @@ impl Client {
         let (tx, rx) = channel();
         {
             let mut pending = self.pending.lock().unwrap();
-            if self.retired.load(Ordering::Acquire) {
+            if self.retired.load(Ordering::Acquire) || !self.connected.load(Ordering::Acquire) {
                 return Err(format!("{} was stopped", self.name));
             }
             pending.insert(id, tx);
@@ -443,5 +545,33 @@ mod tests {
         let raw = format!("Content-Length: {}\r\nContent-Type: x\r\n\r\n{body}", body.len());
         let msg = read_message(&mut std::io::Cursor::new(raw)).unwrap();
         assert_eq!(msg["id"], 1);
+    }
+
+    #[test]
+    fn tracks_work_done_progress_by_token() {
+        let mut active = HashMap::new();
+        assert!(!update_progress(
+            &mut active,
+            &json!({"token": 1, "value": {"kind": "report", "percentage": 20}})
+        ));
+        assert!(update_progress(
+            &mut active,
+            &json!({"token": 1, "value": {"kind": "begin", "title": "Indexing", "message": "Scanning", "percentage": 0}})
+        ));
+        assert!(update_progress(
+            &mut active,
+            &json!({"token": "1", "value": {"kind": "begin", "title": "Checking"}})
+        ));
+        assert!(update_progress(
+            &mut active,
+            &json!({"token": 1, "value": {"kind": "report", "percentage": 45}})
+        ));
+        let indexing = &active[&ProgressToken::Number(1)];
+        assert_eq!(indexing.title, "Indexing");
+        assert_eq!(indexing.message.as_deref(), Some("Scanning"));
+        assert_eq!(indexing.percentage, Some(45));
+        assert!(update_progress(&mut active, &json!({"token": 1, "value": {"kind": "end"}})));
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[&ProgressToken::String("1".into())].title, "Checking");
     }
 }

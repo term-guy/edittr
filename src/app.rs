@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, channel};
+use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::time::{Duration, Instant};
 
 const SAVE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::S);
@@ -29,6 +29,7 @@ const GO_BACK: KeyboardShortcut = KeyboardShortcut::new(Modifiers::CTRL, Key::Mi
 const GO_BACK: KeyboardShortcut = KeyboardShortcut::new(Modifiers::ALT, Key::ArrowLeft);
 const COMMIT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Enter);
 const STATUS_POLL: Duration = Duration::from_secs(3);
+const ACTIVITY_POLL: Duration = Duration::from_millis(250);
 const HIGHLIGHT_LIMIT: usize = 1_000_000; // bytes; bigger files are shown as plain text
 const IGNORED_DIRS: &[&str] = &[".git", "node_modules", "target", ".venv", "__pycache__", "dist", "build"];
 
@@ -73,6 +74,11 @@ struct InstallJob {
     command: &'static str,
     progress: Arc<installer::Progress>,
     rx: Receiver<Result<PathBuf, String>>,
+}
+
+struct GitRefresh {
+    status: Result<Status, String>,
+    branches: Vec<String>,
 }
 
 impl Doc {
@@ -187,6 +193,7 @@ enum Confirm {
 }
 
 pub struct App {
+    ctx: egui::Context,
     /// Open project folder; None = empty project.
     root: Option<PathBuf>,
     ignored: Vec<String>,
@@ -202,7 +209,7 @@ pub struct App {
     expanded: HashSet<PathBuf>,
 
     status: Status,
-    status_rx: Option<Receiver<Result<Status, String>>>,
+    status_rx: Option<Receiver<GitRefresh>>,
     last_poll: Instant,
     branches: Vec<String>,
     commit_msg: String,
@@ -242,6 +249,7 @@ impl App {
             s.spacing.item_spacing.y = 3.0;
         });
         let mut app = App {
+            ctx: cc.egui_ctx.clone(),
             repo: None,
             root: None,
             ignored: Vec::new(),
@@ -309,6 +317,8 @@ impl App {
         self.graph = None;
         self.graph_sel = None;
         self.status = Status::default();
+        self.status_rx = None;
+        self.branches.clear();
         self.reset_lsp();
         self.goto_rx = None;
         self.nav_back.clear();
@@ -379,12 +389,17 @@ impl App {
     fn refresh_git(&mut self) {
         let Some(repo) = self.repo.clone() else { return };
         let (tx, rx) = channel();
+        let ctx = self.ctx.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(git::status(&repo));
+            let _ = tx.send(GitRefresh {
+                status: git::status(&repo),
+                branches: git::branches(&repo),
+            });
+            ctx.request_repaint();
         });
         self.status_rx = Some(rx);
         self.last_poll = Instant::now();
-        self.branches = git::branches(self.repo.as_ref().unwrap());
+        self.ctx.request_repaint();
         if self.graph.is_some() {
             self.load_graph();
         }
@@ -412,6 +427,7 @@ impl App {
             return;
         }
         let (tx, rx) = channel();
+        ctx.request_repaint();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             let _ = tx.send(git::run(&repo, args));
@@ -422,16 +438,21 @@ impl App {
     }
 
     fn poll_background(&mut self, ctx: &egui::Context) {
-        self.poll_goto(ctx);
+        self.poll_goto();
         self.poll_search(ctx);
-        if let Some(rx) = &self.status_rx
-            && let Ok(res) = rx.try_recv()
-        {
-            match res {
-                Ok(s) => self.status = s,
-                Err(e) => self.message = e,
+        if let Some(rx) = &self.status_rx {
+            match rx.try_recv() {
+                Ok(refresh) => {
+                    match refresh.status {
+                        Ok(s) => self.status = s,
+                        Err(e) => self.message = e,
+                    }
+                    self.branches = refresh.branches;
+                    self.status_rx = None;
+                }
+                Err(TryRecvError::Disconnected) => self.status_rx = None,
+                Err(TryRecvError::Empty) => {}
             }
-            self.status_rx = None;
         }
         if let Some((label, rx)) = &self.bg_task
             && let Ok(res) = rx.try_recv()
@@ -667,9 +688,11 @@ impl App {
                     _ => {}
                 }
             }
-            match lsp::Client::start(&spec, &root, &ignored) {
+            let ctx = self.ctx.clone();
+            match lsp::Client::start(&spec, &root, &ignored, Some(Arc::new(move || ctx.request_repaint()))) {
                 Ok(c) => {
                     self.lsp.insert(spec.name, c.clone());
+                    self.ctx.request_repaint();
                     return Some(c);
                 }
                 Err(e) => {
@@ -707,6 +730,7 @@ impl App {
             client,
         };
         let (tx, rx) = channel();
+        ctx.request_repaint();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             let _ = tx.send(goto::run(req));
@@ -717,23 +741,22 @@ impl App {
         self.message = format!("Finding definition of `{word}`…");
     }
 
-    fn poll_goto(&mut self, ctx: &egui::Context) {
-        if let Some(job) = &self.install {
-            ctx.request_repaint_after(Duration::from_millis(200));
-            if let Ok(res) = job.rx.try_recv() {
-                let command = job.command;
-                self.install = None;
-                match res {
-                    Ok(path) => {
-                        self.message = format!("Installed {command} at {}", path.display());
-                        self.lsp_failed.clear();
-                        if let Some(Tab::File(d)) = self.tabs.get(self.active) {
-                            let ext = d.ext();
-                            self.client_for(&ext);
-                        }
+    fn poll_goto(&mut self) {
+        if let Some(job) = &self.install
+            && let Ok(res) = job.rx.try_recv()
+        {
+            let command = job.command;
+            self.install = None;
+            match res {
+                Ok(path) => {
+                    self.message = format!("Installed {command} at {}", path.display());
+                    self.lsp_failed.clear();
+                    if let Some(Tab::File(d)) = self.tabs.get(self.active) {
+                        let ext = d.ext();
+                        self.client_for(&ext);
                     }
-                    Err(e) => self.message = format!("Could not install {command}: {e}"),
                 }
+                Err(e) => self.message = format!("Could not install {command}: {e}"),
             }
         }
         let Some(rx) = &self.goto_rx else { return };
@@ -779,6 +802,7 @@ impl App {
         let progress = Arc::new(installer::Progress::default());
         let (tx, rx) = channel();
         let p = progress.clone();
+        ctx.request_repaint();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             let _ = tx.send(installer::install(&inst, &p));
@@ -858,6 +882,7 @@ impl App {
             st.cancel.clone(),
             ctx.clone(),
         ));
+        ctx.request_repaint();
     }
 
     fn poll_search(&mut self, ctx: &egui::Context) {
@@ -1614,34 +1639,110 @@ impl App {
         }
     }
 
-    fn status_bar(&mut self, ui: &mut egui::Ui) {
+    fn background_activity(&self, server: Option<&lsp::Client>) -> Vec<(String, Option<String>)> {
+        let mut activity = Vec::new();
+        if let Some(job) = &self.install {
+            activity.push((job.progress.describe(job.command), None));
+        }
+        if self.goto_rx.is_some() {
+            activity.push(("Finding definition…".into(), None));
+        }
+        if self.search.rx.is_some() {
+            let suffix = if self.search.total == 1 { "result" } else { "results" };
+            activity.push((format!("Searching… {} {suffix}", self.search.total), None));
+        }
+
+        let mut clients: Vec<_> = self.lsp.values().map(Arc::as_ref).collect();
+        clients.sort_unstable_by_key(|client| (server.map(|s| s.name) != Some(client.name), client.name));
+        for client in clients {
+            for progress in client.active_progress() {
+                let mut label = format!("{}: {}", client.name, progress.title);
+                if let Some(percentage) = progress.percentage {
+                    label.push_str(&format!(" {percentage}%"));
+                }
+                activity.push((label, progress.message));
+            }
+            if client.is_starting() {
+                activity.push((format!("{}: Starting…", client.name), None));
+            }
+        }
+
+        if let Some((label, _)) = &self.bg_task {
+            activity.push((format!("{label}…"), None));
+        }
+        if self.status_rx.is_some() {
+            activity.push(("Refreshing Git…".into(), None));
+        }
+        activity
+    }
+
+    fn status_bar(&self, ui: &mut egui::Ui) {
+        let file = match self.tabs.get(self.active) {
+            Some(Tab::File(doc)) => Some((doc, doc.ext())),
+            _ => None,
+        };
+        let server = file.as_ref().and_then(|(doc, ext)| {
+            if self.path_is_ignored(&doc.path) {
+                return None;
+            }
+            lsp::servers_for(ext)
+                .iter()
+                .filter_map(|spec| self.lsp.get(spec.name))
+                .find(|client| client.is_available())
+                .map(Arc::as_ref)
+        });
+        let activity = self.background_activity(server);
         ui.horizontal(|ui| {
             if self.repo.is_some() {
-                ui.label(format!("{} {} {}", ic::GIT_BRANCH, self.status.branch, self.status.ahead_behind));
+                let branch = format!("{} {} {}", ic::GIT_BRANCH, self.status.branch, self.status.ahead_behind);
+                ui.add(egui::Label::new(branch).truncate());
                 ui.separator();
             }
-            ui.label(&self.message);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if let Some(job) = &self.install {
-                    ui.label(job.progress.describe());
-                    ui.spinner();
-                }
-                if let Some(Tab::File(d)) = self.tabs.get(self.active) {
-                    let server = lsp::servers_for(&d.ext()).iter().find_map(|s| self.lsp.get(s.name)).map(|c| c.name);
-                    match server {
-                        Some(name) => ui
-                            .weak(name)
-                            .on_hover_text("Language server running: Ctrl/Cmd+click or F12 to go to definition"),
-                        None => ui
-                            .weak("text search")
-                            .on_hover_text("No language server for this file; go to definition uses text search"),
+                if let Some((doc, ext)) = &file {
+                    let (backend, hint) = match server {
+                        Some(client) => (client.name, "Language server for go to definition (Ctrl/Cmd+click or F12)"),
+                        None => (
+                            "text search",
+                            "Go to definition (Ctrl/Cmd+click or F12) uses text search for this file",
+                        ),
                     };
-                    ui.weak(&d.lang);
-                    let (line, col) = goto::line_col16(&d.text, d.cursor);
-                    ui.weak(format!("Ln {}, Col {}", line + 1, col + 1));
-                    if self.goto_rx.is_some() {
-                        ui.spinner();
+                    let language = format!("{} · {backend}", language_name(ext));
+                    ui.add(
+                        egui::Label::new(RichText::new(language).weak())
+                            .truncate()
+                            .show_tooltip_when_elided(false),
+                    )
+                    .on_hover_text(hint);
+                    let (line, col) = goto::line_col16(&doc.text, doc.cursor);
+                    ui.add(egui::Label::new(RichText::new(format!("Ln {}, Col {}", line + 1, col + 1)).weak()).truncate());
+                }
+                if let Some((first, _)) = activity.first() {
+                    ui.ctx().request_repaint_after(ACTIVITY_POLL);
+                    if file.is_some() {
+                        ui.separator();
                     }
+                    let label = if activity.len() == 1 {
+                        first.clone()
+                    } else {
+                        format!("{first} · +{}", activity.len() - 1)
+                    };
+                    let tooltip = activity
+                        .iter()
+                        .map(|(label, detail)| match detail {
+                            Some(detail) if !detail.is_empty() => format!("{label}\n{detail}"),
+                            _ => label.clone(),
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    status_spinner(ui).on_hover_text(&tooltip);
+                    ui.add(egui::Label::new(label).truncate().show_tooltip_when_elided(false))
+                        .on_hover_text(tooltip);
+                }
+                if !self.message.is_empty() {
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.add(egui::Label::new(&self.message).truncate());
+                    });
                 }
             });
         });
@@ -1887,6 +1988,54 @@ impl eframe::App for App {
             t.raw_input_hook(raw);
         }
     }
+}
+
+fn language_name(ext: &str) -> &'static str {
+    match ext {
+        "rs" => "Rust",
+        "c" | "h" => "C",
+        "cc" | "cpp" | "cxx" | "hh" | "hpp" | "hxx" => "C++",
+        "ts" | "mts" | "cts" => "TypeScript",
+        "tsx" => "TypeScript React",
+        "js" | "mjs" | "cjs" => "JavaScript",
+        "jsx" => "JavaScript React",
+        "py" | "pyi" => "Python",
+        "go" => "Go",
+        "md" | "markdown" => "Markdown",
+        "json" | "jsonc" => "JSON",
+        "toml" => "TOML",
+        "yaml" | "yml" => "YAML",
+        "sh" | "bash" | "zsh" | "fish" => "Shell",
+        "htm" | "html" => "HTML",
+        "css" => "CSS",
+        "scss" => "SCSS",
+        "xml" | "svg" => "XML",
+        "java" => "Java",
+        "rb" => "Ruby",
+        "php" => "PHP",
+        "lua" => "Lua",
+        "zig" => "Zig",
+        "cs" => "C#",
+        "swift" => "Swift",
+        "kt" | "kts" => "Kotlin",
+        "sql" => "SQL",
+        _ => "Plain Text",
+    }
+}
+
+// Advance on the activity timer so the spinner doesn't request full-speed animation.
+fn status_spinner(ui: &mut egui::Ui) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::Vec2::splat(14.0), egui::Sense::hover());
+    response.widget_info(|| egui::WidgetInfo::new(egui::Role::ProgressIndicator));
+    if ui.is_rect_visible(rect) {
+        let step = std::f32::consts::TAU / 12.0;
+        let phase = ui.input(|i| (i.time / ACTIVITY_POLL.as_secs_f64()).floor() % 12.0) as f32 * step;
+        let points = (0..9)
+            .map(|i| rect.center() + egui::Vec2::angled(phase + i as f32 * step) * 5.0)
+            .collect();
+        ui.painter().line(points, egui::Stroke::new(1.5, ui.visuals().strong_text_color()));
+    }
+    response
 }
 
 #[cfg(target_os = "linux")]
@@ -2645,4 +2794,27 @@ fn fuzzy_filter(files: &[String], query: &str, limit: usize) -> Vec<String> {
         .collect();
     scored.sort_by_key(|&(score, _)| std::cmp::Reverse(score));
     scored.into_iter().take(limit).map(|(_, f)| f.clone()).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::language_name;
+
+    #[test]
+    fn language_names_for_extensions() {
+        for (ext, name) in [
+            ("rs", "Rust"),
+            ("h", "C"),
+            ("hpp", "C++"),
+            ("mts", "TypeScript"),
+            ("tsx", "TypeScript React"),
+            ("jsx", "JavaScript React"),
+            ("yml", "YAML"),
+            ("zsh", "Shell"),
+            ("", "Plain Text"),
+            ("unknown", "Plain Text"),
+        ] {
+            assert_eq!(language_name(ext), name, "extension {ext:?}");
+        }
+    }
 }
