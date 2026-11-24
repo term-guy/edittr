@@ -315,6 +315,8 @@ pub struct App {
     root: Option<PathBuf>,
     watcher: Option<Watcher>,
     ignored: Vec<String>,
+    /// Ignored folders switched off in the list (not applied, kept for later).
+    ignored_off: Vec<String>,
     code_navigation: code_navigation::CodeNavigation,
     /// Recently opened folders, most recent first.
     recent: Vec<PathBuf>,
@@ -418,6 +420,7 @@ impl App {
             root: None,
             watcher: None,
             ignored: Vec::new(),
+            ignored_off: Vec::new(),
             code_navigation: code_navigation::CodeNavigation::default(),
             recent: load_recent(),
             side: Side::Explorer,
@@ -487,6 +490,7 @@ impl App {
     fn activate_root(&mut self, root: PathBuf, ignored: Vec<String>) {
         self.clear_project();
         self.watcher = Some(Watcher::start(root.clone(), self.ctx.clone()));
+        self.ignored_off = workspace::load_ignored_off(&root);
         self.ignored = ignored;
         self.root = Some(root);
         self.refresh_symbol_cache();
@@ -507,6 +511,7 @@ impl App {
     }
 
     fn clear_project(&mut self) {
+        self.ignored_off.clear();
         self.code_navigation = code_navigation::CodeNavigation::default();
         self.root = None;
         self.search.opts.include.clear();
@@ -1396,8 +1401,18 @@ impl App {
 
     fn ignore_folder(&mut self, rel: String, ctx: &egui::Context) {
         if workspace::valid_folder(&rel) && !workspace::is_ignored(&rel, &self.ignored) {
+            if let Some(i) = self.ignored_off.iter().position(|r| *r == rel) {
+                self.ignored_off.remove(i);
+                self.save_ignored_off();
+            }
             self.ignored.push(rel);
             self.ignored_changed(ctx);
+        }
+    }
+
+    fn save_ignored_off(&self) {
+        if let Some(root) = &self.root {
+            workspace::save_ignored_off(root, &self.ignored_off);
         }
     }
 
@@ -1589,22 +1604,62 @@ impl App {
             self.start_search(ui.ctx());
             self.search.focus = true;
         }
-        if !self.ignored.is_empty() {
-            let mut remove = None;
-            egui::CollapsingHeader::new(format!("Ignored ({})", self.ignored.len()))
-                .id_salt("ignored-folders")
-                .show(ui, |ui| {
-                    for (index, rel) in self.ignored.iter().enumerate() {
-                        ui.horizontal(|ui| {
-                            if icon_button(ui, ic::X).on_hover_text("Remove from ignored folders").clicked() {
-                                remove = Some(index);
-                            }
-                            ui.add(egui::Label::new(rel).truncate()).on_hover_text(rel);
-                        });
-                    }
-                });
-            if let Some(index) = remove {
-                self.ignored.remove(index);
+        if !self.ignored.is_empty() || !self.ignored_off.is_empty() {
+            // (folder, active): active ones first, then the switched-off ones.
+            let rows: Vec<(String, bool)> = self
+                .ignored
+                .iter()
+                .map(|r| (r.clone(), true))
+                .chain(self.ignored_off.iter().map(|r| (r.clone(), false)))
+                .collect();
+            let (mut remove, mut toggle) = (None, None);
+            let title = if self.ignored_off.is_empty() {
+                format!("Ignored ({})", self.ignored.len())
+            } else {
+                format!("Ignored ({} of {})", self.ignored.len(), rows.len())
+            };
+            egui::CollapsingHeader::new(title).id_salt("ignored-folders").show(ui, |ui| {
+                for (rel, active) in &rows {
+                    ui.horizontal(|ui| {
+                        if icon_button(ui, ic::X).on_hover_text("Remove from ignored folders").clicked() {
+                            remove = Some((rel.clone(), *active));
+                        }
+                        let mut on = *active;
+                        let tip = if on {
+                            "Ignored: not searched, not analyzed. Uncheck to include it again (kept in the list)"
+                        } else {
+                            "Not ignored right now. Check to ignore it again"
+                        };
+                        if ui.checkbox(&mut on, "").on_hover_text(tip).changed() {
+                            toggle = Some((rel.clone(), on));
+                        }
+                        let text = if *active {
+                            RichText::new(rel)
+                        } else {
+                            RichText::new(rel).weak().strikethrough()
+                        };
+                        ui.add(egui::Label::new(text).truncate()).on_hover_text(rel);
+                    });
+                }
+            });
+            if let Some((rel, active)) = remove {
+                if active {
+                    self.ignored.retain(|r| *r != rel);
+                    self.ignored_changed(ui.ctx());
+                } else {
+                    self.ignored_off.retain(|r| *r != rel);
+                    self.save_ignored_off();
+                }
+            }
+            if let Some((rel, on)) = toggle {
+                if on {
+                    self.ignored_off.retain(|r| *r != rel);
+                    self.ignored.push(rel);
+                } else {
+                    self.ignored.retain(|r| *r != rel);
+                    self.ignored_off.push(rel);
+                }
+                self.save_ignored_off();
                 self.ignored_changed(ui.ctx());
             }
         }

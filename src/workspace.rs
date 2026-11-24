@@ -23,6 +23,53 @@ pub fn load_ignored(root: &Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
+const IGNORE_OFF: &str = "ignore-off=";
+
+/// Ignored folders the user switched off (kept in the list, not applied).
+pub fn load_ignored_off(root: &Path) -> Vec<String> {
+    let root = root.to_string_lossy();
+    let text = config_file(&root)
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .unwrap_or_default();
+    parse(&root, &text)
+        .map(|config| {
+            config
+                .unknown
+                .iter()
+                .filter_map(|line| line.strip_prefix(IGNORE_OFF))
+                .filter(|rel| valid_folder(rel))
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub fn save_ignored_off(root: &Path, list: &[String]) {
+    if cfg!(feature = "tour") && std::env::var_os("EDITTR_TOUR_OUT").is_some() {
+        return;
+    }
+    let root = root.to_string_lossy();
+    let Some(path) = config_file(&root) else { return };
+    let existing = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == ErrorKind::NotFound => String::new(),
+        Err(_) => return,
+    };
+    let Some(config) = parse(&root, &existing) else { return };
+    let _ = write_config(&path, &format_ignored_off(&root, &config, list));
+}
+
+fn format_ignored_off(root: &str, config: &Config, list: &[String]) -> String {
+    let lines: Vec<String> = list
+        .iter()
+        .filter(|rel| valid_folder(rel))
+        .map(|rel| format!("{IGNORE_OFF}{rel}"))
+        .collect();
+    let mut unknown: Vec<&str> = config.unknown.iter().copied().filter(|l| !l.starts_with(IGNORE_OFF)).collect();
+    unknown.extend(lines.iter().map(String::as_str));
+    format_config(root, &config.ignored, &unknown)
+}
+
 pub fn save_ignored(root: &Path, list: &[String]) {
     let _ = update_config(root, |root, config| format_config(root, list, &config.unknown));
 }
@@ -246,6 +293,24 @@ mod tests {
         assert_eq!(plain_path(Path::new(r"\\?\UNC\srv\share\a.c")), PathBuf::from(r"\\srv\share\a.c"));
         assert_eq!(plain_path(Path::new(r"\\?\Volume{1234}\a")), PathBuf::from(r"\\?\Volume{1234}\a"));
         assert_eq!(plain_path(Path::new("/home/u/a.c")), PathBuf::from("/home/u/a.c"));
+    }
+
+    #[test]
+    fn switched_off_ignores_round_trip_next_to_active_ones() {
+        let root = "/home/user/project";
+        let config = parse(root, "root=/home/user/project\nignore=vendor\nignore-off=old\nfuture=1\n").unwrap();
+        let text = format_ignored_off(root, &config, &["build".into(), "docs/gen".into()]);
+        assert_eq!(
+            text,
+            "root=/home/user/project\nignore=vendor\nfuture=1\nignore-off=build\nignore-off=docs/gen\n"
+        );
+        let reparsed = parse(root, &text).unwrap();
+        assert_eq!(reparsed.ignored, ["vendor"]);
+        // Active ones are saved without touching the switched-off ones.
+        assert_eq!(
+            format_config(root, &["x".into()], &reparsed.unknown).matches("ignore-off=").count(),
+            2
+        );
     }
 
     #[test]
