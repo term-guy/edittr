@@ -87,6 +87,11 @@ impl App {
 
 impl Find {
     #[cfg(feature = "tour")]
+    pub(super) fn close_for_tour(&mut self) {
+        self.open = false;
+    }
+
+    #[cfg(feature = "tour")]
     pub(super) fn set_query_for_tour(&mut self, query: &str) {
         self.opts.query = query.into();
         self.replacement = "track".into();

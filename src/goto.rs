@@ -175,25 +175,41 @@ fn related_exts(ext: &str) -> Option<&'static [&'static str]> {
     GROUPS.iter().copied().find(|g| g.contains(&ext))
 }
 
-fn patterns(name: &str) -> Vec<(Regex, u8)> {
-    let n = regex::escape(name);
-    let kw = r"fn|function|def|class|struct|enum|trait|type|interface|const|let|var|val|mod|module|namespace|func|union|typedef|macro_rules!|record|object|protocol|static|alias|local";
+struct Pattern {
+    regex: Regex,
+    score: u8,
+    kind: &'static str,
+}
+
+fn patterns(name: &str) -> Vec<Pattern> {
+    let keywords = r"fn|function|def|class|struct|enum|trait|type|interface|const|let|var|val|mod|module|namespace|func|union|typedef|macro_rules!|record|object|protocol|static|alias|local";
     [
-        // `fn name`, `class Name`, `let mut name`, `func (r *T) name`, `function* name`
+        // `fn name`, `class Name`, `let mut name`, `func (r *T) name`.
         (
-            format!(r"(?:^|[^\w.$])(?:{kw})\s+(?:mut\s+|async\s+|\*\s*)?(?:\([^)]*\)\s*)?({n})\b"),
+            format!(r"(?:^|[^\w.$])(?P<keyword>{keywords})\s+(?:mut\s+|async\s+|\*\s*)?(?:\([^)]*\)\s*)?(?P<name>{name})\b"),
             4,
+            "Definition",
         ),
-        (format!(r"^\s*#\s*define\s+({n})\b"), 4),
-        // C/C++/Java/C# style `Type name(` or `Type name =` at line start
-        (format!(r"^\s*(?:[\w:<>,\[\]\*&]+\s+)+[\*&]*({n})\s*(?:\(|=[^=]|;|\[)"), 2),
-        // `name = ...` / `export name = ...` / `name: function` / `name(...) {` (method)
-        (format!(r"^\s*(?:export\s+)?({n})\s*(?::[^=]*)?=[^=>]"), 1),
-        (format!(r"^\s*({n})\s*:\s*(?:function|\(|async)"), 1),
-        (format!(r"^\s*(?:async\s+|static\s+|get\s+|set\s+)*({n})\s*\([^)]*\)\s*\{{\s*$"), 1),
+        (format!(r"^\s*#\s*define\s+(?P<name>{name})\b"), 4, "Macro"),
+        // C/C++/Java/C# style declarations.
+        (
+            format!(r"^\s*(?:[\w:<>,\[\]\*&]+\s+)+[\*&]*(?P<name>{name})\s*(?P<separator>\(|=[^=]|;|\[)"),
+            2,
+            "Definition",
+        ),
+        (format!(r"^\s*(?:export\s+)?(?P<name>{name})\s*(?::[^=]*)?=[^=>]"), 1, "Variable"),
+        (format!(r"^\s*(?P<name>{name})\s*:\s*(?:function|\(|async)"), 1, "Function"),
+        (
+            format!(r"^\s*(?:async\s+|static\s+|get\s+|set\s+)*(?P<name>{name})\s*\([^)]*\)\s*\{{\s*$"),
+            1,
+            "Method",
+        ),
     ]
     .into_iter()
-    .filter_map(|(p, score)| Regex::new(&p).ok().map(|r| (r, score)))
+    .filter_map(|(pattern, score, kind)| {
+        let regex = Regex::new(&pattern).ok()?;
+        Some(Pattern { regex, score, kind })
+    })
     .collect()
 }
 
@@ -201,10 +217,16 @@ const NOT_DEFINITIONS: &[&str] = &[
     "return ", "else ", "if ", "while ", "case ", "new ", "await ", "throw ", "yield ", "delete ",
 ];
 
-/// Best definition-looking match of `name` in one file's text: (score, line, char cols).
-fn best_in_text(pats: &[(Regex, u8)], text: &str) -> Vec<(u8, usize, Range<usize>)> {
-    let mut out = Vec::new();
-    for (line_no, line) in text.split('\n').enumerate() {
+pub(crate) struct Definition<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) kind: &'static str,
+    pub(crate) line: usize,
+    pub(crate) cols: Range<usize>,
+    score: u8,
+}
+
+fn definitions_in<'a>(patterns: &'a [Pattern], text: &'a str) -> impl Iterator<Item = Definition<'a>> {
+    text.split('\n').enumerate().filter_map(move |(line_no, line)| {
         let t = line.trim_start();
         let is_comment = t.starts_with("//")
             || t.starts_with("/*")
@@ -212,21 +234,66 @@ fn best_in_text(pats: &[(Regex, u8)], text: &str) -> Vec<(u8, usize, Range<usize
             || t.starts_with("--")
             || (t.starts_with('#') && !t.trim_start_matches(['#', ' ']).starts_with("define"));
         if is_comment || NOT_DEFINITIONS.iter().any(|k| t.starts_with(k)) {
-            continue;
+            return None;
         }
-        for (re, score) in pats {
-            if let Some(m) = re.captures(line).and_then(|c| c.get(1)) {
-                let c0 = line[..m.start()].chars().count();
-                out.push((*score, line_no, c0..c0 + m.as_str().chars().count()));
-                break;
-            }
+        let mut matches = patterns.iter().filter_map(|pattern| {
+            let captures = pattern.regex.captures(line)?;
+            Some((captures, pattern))
+        });
+        let (mut captures, mut pattern) = matches.next()?;
+        let mut name = captures.name("name")?;
+        let after_name = line[name.end()..].trim_start();
+        if matches!(captures.name("keyword").map(|m| m.as_str()), Some("const" | "static"))
+            && (!after_name.starts_with(':') || after_name.starts_with("::"))
+            && let Some((typed, declaration)) = matches.next()
+            && typed.name("separator").is_some()
+            && let Some(typed_name) = typed.name("name")
+            && typed_name.as_str() != name.as_str()
+        {
+            // In `static int count()` the declaration supplies the name, not the keyword pattern.
+            (captures, pattern, name) = (typed, declaration, typed_name);
         }
-    }
-    out
+        let kind = match captures.name("keyword").map(|m| m.as_str()) {
+            Some("fn" | "function" | "def" | "func") => "Function",
+            Some("class") => "Class",
+            Some("struct" | "record" | "union") => "Struct",
+            Some("enum") => "Enum",
+            Some("trait" | "interface" | "protocol") => "Interface",
+            Some("const") => "Constant",
+            Some("mod" | "module" | "namespace") => "Module",
+            Some("type" | "typedef" | "alias") => "Type",
+            Some("macro_rules!") => "Macro",
+            Some("object") => "Object",
+            Some(_) => "Variable",
+            None => match captures.name("separator").map(|m| m.as_str()) {
+                Some("(") => "Function",
+                Some(_) => "Variable",
+                None => pattern.kind,
+            },
+        };
+        let start = line[..name.start()].chars().count();
+        Some(Definition {
+            name: name.as_str(),
+            kind,
+            line: line_no,
+            cols: start..start + name.as_str().chars().count(),
+            score: pattern.score,
+        })
+    })
+}
+
+pub(crate) fn definitions(text: &str) -> impl Iterator<Item = Definition<'_>> {
+    static PATTERNS: std::sync::LazyLock<Vec<Pattern>> = std::sync::LazyLock::new(|| patterns(r"[\p{Alphabetic}_$][\w$]*"));
+    definitions_in(&PATTERNS, text)
+}
+
+/// Definition-looking matches of the requested name in one file.
+fn best_in_text(pats: &[Pattern], text: &str) -> Vec<(u8, usize, Range<usize>)> {
+    definitions_in(pats, text).map(|def| (def.score, def.line, def.cols)).collect()
 }
 
 fn heuristic(root: &Path, files: Vec<String>, current: &Path, text: Option<&str>, cursor_line: usize, name: &str) -> Option<Target> {
-    let pats = patterns(name);
+    let pats = patterns(&regex::escape(name));
 
     // 1) Current buffer: the highest-scoring definition, preferring the closest one
     //    above the cursor (so local variables resolve to their nearest `let`).

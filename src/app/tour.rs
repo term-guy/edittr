@@ -28,6 +28,7 @@ const STEPS: &[&str] = &[
     "go-to-file",
     "search-in-files",
     "find-replace",
+    "command-palette",
     "source-control",
     "source-control-tree",
     "diff-side-by-side",
@@ -213,7 +214,15 @@ impl Tour {
                 app.show_find(true);
                 app.find.set_query_for_tour("lane");
             }
+            "command-palette" => {
+                app.find.close_for_tour();
+                app.run_command(crate::commands::Command::Palette);
+                if let Some(p) = &mut app.picker {
+                    p.set_query_for_tour("tog");
+                }
+            }
             "source-control" => {
+                app.picker = None;
                 app.side = Side::Changes;
                 app.settings.changes_tree = false;
                 app.refresh_vcs();

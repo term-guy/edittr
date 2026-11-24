@@ -1,4 +1,6 @@
-//! Language Server Protocol client for go-to-definition and diagnostics.
+//! Language Server Protocol client: definitions, symbols and diagnostics.
+//!
+//! One server process per language per project folder, started lazily on first use.
 
 use crate::diagnostics::{self, ByPath};
 pub use crate::diagnostics::{Diagnostic, Severity};
@@ -113,6 +115,13 @@ pub struct Location {
 
 /// Document id and edit version, ordered across reopening the same file.
 pub type Revision = (u64, u64);
+
+pub(crate) struct Symbol {
+    pub(crate) name: String,
+    pub(crate) kind: &'static str,
+    pub(crate) container: Option<String>,
+    pub(crate) location: Location,
+}
 
 struct Synced {
     version: i64,
@@ -370,6 +379,7 @@ impl Client {
                         "definition": {"linkSupport": true},
                         "declaration": {"linkSupport": true},
                         "publishDiagnostics": {"versionSupport": true},
+                        "documentSymbol": {"hierarchicalDocumentSymbolSupport": true},
                     },
                     "workspace": {"workspaceFolders": true, "configuration": true},
                 },
@@ -628,6 +638,22 @@ impl Client {
         }
         Ok(locs)
     }
+
+    pub(crate) fn document_symbols(&self, path: &Path, text: &str, revision: Revision, timeout: Duration) -> Result<Vec<Symbol>, String> {
+        let kind = self.wait_ready(timeout)?;
+        if !self.sync(path, text, revision, kind) {
+            return Err("The document changed".into());
+        }
+        let params = json!({"textDocument": {"uri": path_to_uri(path)}});
+        let result = self.request("textDocument/documentSymbol", params, timeout)?;
+        Ok(parse_symbols(&result, Some(path)))
+    }
+
+    pub(crate) fn workspace_symbols(&self, query: &str, timeout: Duration) -> Result<Vec<Symbol>, String> {
+        self.wait_ready(timeout)?;
+        let result = self.request("workspace/symbol", json!({"query": query}), timeout)?;
+        Ok(parse_symbols(&result, None))
+    }
 }
 
 fn read_message(r: &mut impl BufRead) -> Option<Value> {
@@ -657,27 +683,92 @@ fn parse_locations(v: &Value) -> Vec<Location> {
         Value::Object(_) => vec![v],
         _ => vec![],
     };
-    items
-        .into_iter()
-        .filter_map(|item| {
-            let uri = item.get("targetUri").or_else(|| item.get("uri"))?.as_str()?;
-            let range = item.get("targetSelectionRange").or_else(|| item.get("range"))?;
-            let start = &range["start"];
-            let end = &range["end"];
-            let line = start["line"].as_u64()? as usize;
-            let c0 = start["character"].as_u64()? as usize;
-            let c1 = if end["line"].as_u64() == Some(line as u64) {
-                end["character"].as_u64()? as usize
-            } else {
-                c0
-            };
-            Some(Location {
-                path: uri_to_path(uri)?,
-                line,
-                col16: c0..c1.max(c0),
-            })
-        })
-        .collect()
+    items.into_iter().filter_map(parse_location).collect()
+}
+
+fn parse_location(item: &Value) -> Option<Location> {
+    let uri = item.get("targetUri").or_else(|| item.get("uri"))?.as_str()?;
+    let range = item.get("targetSelectionRange").or_else(|| item.get("range"))?;
+    location_at(uri_to_path(uri)?, range)
+}
+
+fn location_at(path: PathBuf, range: &Value) -> Option<Location> {
+    let start = &range["start"];
+    let end = &range["end"];
+    let line = usize::try_from(start["line"].as_u64()?).ok()?;
+    let c0 = usize::try_from(start["character"].as_u64()?).ok()?;
+    let c1 = if end["line"].as_u64() == Some(line as u64) {
+        usize::try_from(end["character"].as_u64()?).ok()?
+    } else {
+        c0
+    };
+    Some(Location {
+        path,
+        line,
+        col16: c0..c1.max(c0),
+    })
+}
+
+/// DocumentSymbol trees and the flat SymbolInformation / WorkspaceSymbol forms.
+fn parse_symbols(value: &Value, document: Option<&Path>) -> Vec<Symbol> {
+    let mut out = Vec::new();
+    collect_symbols(value, document, None, &mut out);
+    out
+}
+
+fn collect_symbols(value: &Value, document: Option<&Path>, parent: Option<&str>, out: &mut Vec<Symbol>) {
+    let Some(items) = value.as_array() else { return };
+    for item in items {
+        let name = item["name"].as_str();
+        let location = match item.get("location") {
+            Some(location) => parse_location(location),
+            None => document.and_then(|path| location_at(path.to_path_buf(), &item["selectionRange"])),
+        };
+        if let (Some(name), Some(location)) = (name, location) {
+            out.push(Symbol {
+                name: name.to_owned(),
+                kind: symbol_kind(item["kind"].as_u64()),
+                container: item["containerName"].as_str().or(parent).map(str::to_owned),
+                location,
+            });
+        }
+        collect_symbols(&item["children"], document, name.or(parent), out);
+    }
+}
+
+fn symbol_kind(kind: Option<u64>) -> &'static str {
+    const KINDS: &[&str] = &[
+        "Symbol",
+        "File",
+        "Module",
+        "Namespace",
+        "Package",
+        "Class",
+        "Method",
+        "Property",
+        "Field",
+        "Constructor",
+        "Enum",
+        "Interface",
+        "Function",
+        "Variable",
+        "Constant",
+        "String",
+        "Number",
+        "Boolean",
+        "Array",
+        "Object",
+        "Key",
+        "Null",
+        "Enum member",
+        "Struct",
+        "Event",
+        "Operator",
+        "Type parameter",
+    ];
+    kind.and_then(|n| usize::try_from(n).ok())
+        .and_then(|i| KINDS.get(i).copied())
+        .unwrap_or(KINDS[0])
 }
 
 pub fn path_to_uri(p: &Path) -> String {
@@ -702,6 +793,57 @@ mod tests {
         let b = parse_locations(&link);
         assert_eq!((b[0].line, b[0].col16.clone()), (1, 2..5));
         assert!(parse_locations(&Value::Null).is_empty());
+    }
+
+    #[test]
+    fn parses_nested_document_symbols_at_selection_ranges() {
+        let file = std::env::temp_dir().join("model.rs");
+        let symbols = parse_symbols(
+            &json!([{
+                "name": "Model", "kind": 23,
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 6, "character": 1}},
+                "selectionRange": {"start": {"line": 0, "character": 7}, "end": {"line": 0, "character": 12}},
+                "children": [{
+                    "name": "field", "kind": 8,
+                    "selectionRange": {"start": {"line": 2, "character": 6}, "end": {"line": 2, "character": 11}}
+                }]
+            }]),
+            Some(&file),
+        );
+        assert_eq!(symbols.len(), 2);
+        assert_eq!((&*symbols[0].name, symbols[0].kind), ("Model", "Struct"));
+        assert_eq!(symbols[0].location.col16, 7..12);
+        assert_eq!(symbols[1].container.as_deref(), Some("Model"));
+        assert_eq!(symbols[1].location.path, file);
+        assert_eq!((symbols[1].location.line, symbols[1].location.col16.clone()), (2, 6..11));
+    }
+
+    #[test]
+    fn parses_flat_document_and_workspace_symbols_with_locations() {
+        let file = std::env::temp_dir().join("from server.rs");
+        let result = json!([
+            {
+                "name": "read", "kind": 12, "containerName": "io",
+                "location": {
+                    "uri": path_to_uri(&file),
+                    "range": {"start": {"line": 5, "character": 3}, "end": {"line": 7, "character": 0}}
+                }
+            },
+            {"name": "unresolved", "kind": 99, "location": {"uri": path_to_uri(&file)}},
+            {"name": "invalid", "location": {"uri": "https://example.com/other.rs"}}
+        ]);
+        let document = std::env::temp_dir().join("current.rs");
+        for context in [None, Some(document.as_path())] {
+            let symbols = parse_symbols(&result, context);
+            assert_eq!(symbols.len(), 1);
+            assert_eq!(
+                (&*symbols[0].name, symbols[0].kind, symbols[0].container.as_deref()),
+                ("read", "Function", Some("io"))
+            );
+            assert_eq!(symbols[0].location.path, file);
+            assert_eq!((symbols[0].location.line, symbols[0].location.col16.clone()), (5, 3..3));
+        }
+        assert!(parse_symbols(&Value::Null, None).is_empty());
     }
 
     #[test]

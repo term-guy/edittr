@@ -3,6 +3,7 @@
 mod app;
 mod blame;
 mod bundled;
+mod commands;
 mod diagnostics;
 mod diff;
 mod editor;
@@ -17,6 +18,7 @@ mod replace;
 mod search;
 mod settings;
 mod svn;
+mod symbols;
 mod tree;
 pub mod vcs;
 mod watch;

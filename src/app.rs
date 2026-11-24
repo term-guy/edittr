@@ -1,9 +1,11 @@
 mod find;
+mod navigation;
 mod problems;
 mod search_replace;
 #[cfg(feature = "tour")]
 mod tour;
 
+use crate::commands::{self, Command, Setting};
 use crate::editor;
 use crate::graph::Graph;
 use crate::icons as ic;
@@ -12,8 +14,8 @@ use crate::settings::{Settings, SettingsWriter};
 use crate::vcs::{self, FileChange, Status, Vcs};
 use crate::watch::{Changes, IGNORED_DIRS, Watcher};
 use crate::{blame, highlight};
-use crate::{goto, installer, lsp, workspace};
-use eframe::egui::{self, Color32, Key, KeyboardShortcut, Modifiers, RichText};
+use crate::{goto, installer, lsp, symbols, workspace};
+use eframe::egui::{self, Color32, Key, Modifiers, RichText};
 use egui_extras::syntax_highlighting::{self, CodeTheme};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -22,20 +24,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::time::{Duration, Instant};
 
-const SAVE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::S);
-const QUICK_OPEN: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::P);
-const CLOSE_TAB: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::W);
-const FIND: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::F);
-const REPLACE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::H);
-const REPLACE_ALT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::ALT), Key::F);
-const FIND_IN_FILES: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::F);
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(250);
-const GOTO_DEF: KeyboardShortcut = KeyboardShortcut::new(Modifiers::NONE, Key::F12);
-#[cfg(target_os = "macos")]
-const GO_BACK: KeyboardShortcut = KeyboardShortcut::new(Modifiers::CTRL, Key::Minus);
-#[cfg(not(target_os = "macos"))]
-const GO_BACK: KeyboardShortcut = KeyboardShortcut::new(Modifiers::ALT, Key::ArrowLeft);
-const COMMIT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Enter);
 const SAFETY_POLL: Duration = Duration::from_secs(30);
 const FALLBACK_POLL: Duration = Duration::from_secs(3);
 const ACTIVITY_POLL: Duration = Duration::from_millis(250);
@@ -335,6 +324,7 @@ pub struct App {
     bg_task: Option<VcsJob>,
     message: String,
     quick_open: Option<QuickOpen>,
+    picker: Option<navigation::Picker>,
     confirm: Option<Confirm>,
     open_folder_requested: bool,
     open_folder: Option<String>,
@@ -409,6 +399,7 @@ impl App {
             bg_task: None,
             message: String::new(),
             quick_open: None,
+            picker: None,
             confirm: None,
             open_folder_requested: false,
             open_folder: None,
@@ -478,6 +469,7 @@ impl App {
         self.bg_task = None;
         self.amend = false;
         self.quick_open = None;
+        self.picker = None;
         self.confirm = None;
     }
 
@@ -501,6 +493,7 @@ impl App {
     fn open_requested_folder(&mut self, frame: &eframe::Frame) {
         if !std::mem::take(&mut self.open_folder_requested)
             || self.quick_open.is_some()
+            || self.picker.is_some()
             || self.confirm.is_some()
             || self.install_prompt.is_some()
             || self.open_folder.is_some()
@@ -726,6 +719,7 @@ impl App {
     fn poll_background(&mut self, ctx: &egui::Context) {
         self.poll_goto();
         self.poll_problems();
+        self.poll_picker();
         self.poll_search(ctx);
         self.poll_project_replace(ctx);
         self.poll_find_edit();
@@ -1030,49 +1024,6 @@ impl App {
         };
     }
 
-    // ----------------------------------------------------------- shortcuts
-
-    fn shortcuts(&mut self, ctx: &egui::Context) {
-        if self.search_replace.confirming() {
-            return;
-        }
-        if ctx.input_mut(|i| i.consume_shortcut(&SAVE)) {
-            self.save_active();
-        }
-        if ctx.input_mut(|i| i.consume_shortcut(&QUICK_OPEN)) {
-            self.start_quick_open();
-        }
-        if ctx.input_mut(|i| i.consume_shortcut(&CLOSE_TAB)) {
-            self.close_tab(self.active, false);
-        }
-        if ctx.input_mut(|i| i.consume_shortcut(&GOTO_DEF))
-            && let Some(Tab::File(d)) = self.tabs.get(self.active)
-        {
-            let idx = d.cursor;
-            self.go_to_definition(idx, ctx);
-        }
-        if ctx.input_mut(|i| i.consume_shortcut(&GO_BACK)) {
-            self.go_back();
-        }
-        if ctx.input_mut(|i| i.consume_shortcut(&FIND_IN_FILES)) {
-            let selection = match self.tabs.get(self.active) {
-                Some(Tab::File(d)) => d.selected_text(),
-                _ => None,
-            };
-            self.show_search();
-            if let Some(sel) = selection {
-                // Search right away for exactly what's selected.
-                self.search.opts.query = if self.search.opts.regex { regex::escape(&sel) } else { sel };
-                self.start_search(ctx);
-            }
-        }
-        if ctx.input_mut(|i| i.consume_shortcut(&REPLACE) || i.consume_shortcut(&REPLACE_ALT)) {
-            self.show_find(true);
-        } else if ctx.input_mut(|i| i.consume_shortcut(&FIND)) {
-            self.show_find(false);
-        }
-    }
-
     fn show_search(&mut self) {
         self.side = Side::Search;
         self.side_open = true;
@@ -1091,6 +1042,7 @@ impl App {
             let lower = files.iter().map(|f| f.to_lowercase()).collect();
             (files, lower)
         });
+        self.picker = None;
         self.quick_open = Some(QuickOpen {
             query: String::new(),
             files: Vec::new(),
@@ -1316,17 +1268,12 @@ impl App {
         }
     }
 
-    fn open_at(&mut self, path: &Path, line: usize, cols: std::ops::Range<usize>) {
+    fn open_at(&mut self, path: &Path, line: usize, cols: impl Into<symbols::Columns>) {
         self.open_file(path);
         if let Some(Tab::File(doc)) = self.tabs.get_mut(self.active)
             && doc.path == path
         {
-            let line_start: usize = doc.text.split('\n').take(line).map(|l| l.chars().count() + 1).sum();
-            let max = doc.text.chars().count();
-            doc.goto = Some((
-                line_start.saturating_add(cols.start).min(max),
-                line_start.saturating_add(cols.end).min(max),
-            ));
+            doc.goto = Some(symbols::selection(&doc.text, line, cols.into()));
         }
     }
 
@@ -1597,11 +1544,12 @@ impl App {
                     self.side = side;
                 }
             }
+            let quick_open = commands::entry(Command::QuickOpen);
             if activity_button(ui, ic::FILE_SEARCH, false)
-                .on_hover_text("Go to file (Ctrl/Cmd+P)")
+                .on_hover_text(format!("{} ({})", quick_open.title, quick_open.shortcut_text(ui.ctx())))
                 .clicked()
             {
-                self.start_quick_open();
+                self.run_command(Command::QuickOpen);
             }
             ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
                 ui.add_space(4.0);
@@ -1610,10 +1558,10 @@ impl App {
                     .on_hover_text("Toggle theme")
                     .clicked()
                 {
-                    ui.ctx().set_theme(if dark { egui::Theme::Light } else { egui::Theme::Dark });
+                    self.run_command(Command::ToggleTheme);
                 }
                 if activity_button(ui, ic::FOLDER_OPEN, false).on_hover_text("Open folder").clicked() {
-                    self.request_open_folder();
+                    self.run_command(Command::OpenFolder);
                 }
                 self.settings_menu(ui);
             });
@@ -1622,25 +1570,19 @@ impl App {
 
     fn settings_menu(&mut self, ui: &mut egui::Ui) {
         let gear = activity_button(ui, ic::GEAR, false).on_hover_text("Settings");
-        let menu = egui::Popup::menu(&gear)
+        egui::Popup::menu(&gear)
             .align(egui::RectAlign::RIGHT_END)
             .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
             .accessible_name("Settings")
             .show(|ui| {
-                let mut changed = false;
-                for (label, value) in [
-                    ("Highlight current line", &mut self.settings.highlight_line),
-                    ("Show whitespace", &mut self.settings.show_whitespace),
-                    ("Inline blame (who changed the current line)", &mut self.settings.inline_blame),
-                    ("Source Control: view as tree", &mut self.settings.changes_tree),
-                ] {
-                    changed |= ui.checkbox(value, label).changed();
+                for entry in commands::COMMANDS {
+                    let Command::ToggleSetting(setting) = entry.id else { continue };
+                    let mut enabled = *setting.value(&mut self.settings);
+                    if ui.checkbox(&mut enabled, setting.label()).changed() {
+                        self.run_command(entry.id);
+                    }
                 }
-                changed
             });
-        if menu.is_some_and(|menu| menu.inner) {
-            self.save_settings(ui.ctx());
-        }
     }
 
     fn save_settings(&mut self, ctx: &egui::Context) {
@@ -1903,11 +1845,10 @@ impl App {
                 (ic::TREE_VIEW, "View as tree (grouped by folder)")
             };
             if icon_button(ui, icon).on_hover_text(tip).clicked() {
-                self.settings.changes_tree = !self.settings.changes_tree;
-                self.save_settings(ui.ctx());
+                self.run_command(Command::ToggleSetting(Setting::ChangesTree));
             }
             if icon_button(ui, ic::TREE_STRUCTURE).on_hover_text(vcs.history_title()).clicked() {
-                self.open_graph();
+                self.run_command(Command::History);
             }
         });
         ui.add_space(4.0);
@@ -1917,26 +1858,15 @@ impl App {
                 .desired_rows(3)
                 .desired_width(f32::INFINITY),
         );
-        let commit_key = ui.input_mut(|i| i.consume_shortcut(&COMMIT));
+        let commit_key = ui.input_mut(|i| commands::entry(Command::Commit).consume(i));
         ui.horizontal(|ui| {
-            let can = !busy
-                && !self.commit_msg.trim().is_empty()
-                && if has_index {
-                    !self.status.staged.is_empty() || self.amend
-                } else {
-                    !self.status.unstaged.is_empty()
-                };
+            let can = self.can_commit();
             let commit = ui.add_enabled(can, egui::Button::new(format!("{} Commit", ic::CHECK)));
             if has_index {
                 ui.checkbox(&mut self.amend, "Amend");
             }
             if can && (commit.clicked() || commit_key) {
-                let draft = self.commit_msg.clone();
-                let amend = has_index && self.amend;
-                let message = draft.trim().to_string();
-                self.spawn_vcs(VcsOperation::Commit(draft, amend), move |vcs, repo| {
-                    vcs.commit(repo, &message, amend)
-                });
+                self.run_command(Command::Commit);
             }
         });
         ui.separator();
@@ -2063,7 +1993,7 @@ impl App {
             Some(TabMenu::Close(i)) => self.close_tabs(vec![i], false),
             Some(TabMenu::CloseOthers(i)) => self.close_tabs((0..self.tabs.len()).filter(|&j| j != i).collect(), false),
             Some(TabMenu::CloseRight(i)) => self.close_tabs((i + 1..self.tabs.len()).collect(), false),
-            Some(TabMenu::CloseAll) => self.close_tabs((0..self.tabs.len()).collect(), false),
+            Some(TabMenu::CloseAll) => self.run_command(Command::CloseAllTabs),
             Some(TabMenu::Copy(text)) => ui.ctx().copy_text(text),
             None => {}
         }
@@ -2526,6 +2456,7 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         self.poll_background(&ctx);
         self.shortcuts(&ctx);
+        self.picker_dialog(&ctx);
 
         let title = match &self.root {
             Some(r) => format!("{} — edittr", dir_name(r)),
@@ -3208,10 +3139,10 @@ fn walk_files(root: &Path, limit: usize, ignored: &[String]) -> Vec<String> {
 /// Indices of the best `limit` matches of `query` (subsequence, case-insensitive)
 /// among `lower` (lowercased paths), best first; favours file-name and contiguous hits.
 fn fuzzy_filter(lower: &[String], query: &str, limit: usize) -> Vec<usize> {
-    if query.is_empty() {
+    let q: Vec<char> = query.to_lowercase().chars().filter(|c| !c.is_whitespace()).collect();
+    if q.is_empty() {
         return (0..lower.len().min(limit)).collect();
     }
-    let q: Vec<char> = query.to_lowercase().chars().filter(|c| !c.is_whitespace()).collect();
     let mut scored: Vec<(i32, usize)> = lower
         .iter()
         .enumerate()
@@ -3261,6 +3192,7 @@ mod tests {
         assert_eq!(m.len(), 3);
         assert!(fuzzy_filter(&files, "zzz", 10).is_empty());
         assert_eq!(fuzzy_filter(&files, "", 2), vec![0, 1]);
+        assert_eq!(fuzzy_filter(&files, "  ", 2), vec![0, 1]);
 
         let many: Vec<String> = (0..100_000).map(|i| format!("crates/module{}/src/file_{i}.rs", i % 97)).collect();
         let t = std::time::Instant::now();
