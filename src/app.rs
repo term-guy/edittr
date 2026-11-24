@@ -59,6 +59,11 @@ struct Doc {
     blame_rx: Option<Receiver<(u64, Result<blame::Blame, String>)>>,
     /// Incremental syntax highlighting + cached layout.
     hl: highlight::Cache,
+    /// Per-frame values cached by `version` (they are O(file size) to compute).
+    dirty_cache: std::cell::Cell<(u64, bool)>,
+    line_col_cache: std::cell::Cell<(u64, usize, (usize, usize))>,
+    /// Line numbers for the gutter, for (version, text length).
+    gutter: (u64, usize, String),
 }
 
 impl Doc {
@@ -93,7 +98,38 @@ struct VcsRefresh {
 
 impl Doc {
     fn dirty(&self) -> bool {
-        self.text != self.saved
+        let (v, dirty) = self.dirty_cache.get();
+        if v == self.version {
+            return dirty;
+        }
+        let dirty = self.text != self.saved;
+        self.dirty_cache.set((self.version, dirty));
+        dirty
+    }
+
+    fn mark_saved(&mut self) {
+        self.saved = self.text.clone();
+        self.dirty_cache.set((self.version, false));
+    }
+
+    /// Replace the buffer with `text` as read from disk.
+    fn reload(&mut self, text: String) {
+        self.saved = text.clone();
+        self.text = text;
+        self.version += 1;
+        self.cursor = self.cursor.min(self.text.chars().count());
+        self.anchor = self.anchor.min(self.text.chars().count());
+    }
+
+    /// 0-based line and UTF-16 column of the cursor (cached: it scans the text).
+    fn line_col(&self) -> (usize, usize) {
+        let (v, c, lc) = self.line_col_cache.get();
+        if v == self.version && c == self.cursor {
+            return lc;
+        }
+        let lc = goto::line_col16(&self.text, self.cursor);
+        self.line_col_cache.set((self.version, self.cursor, lc));
+        lc
     }
     fn name(&self) -> String {
         self.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
@@ -231,6 +267,8 @@ struct VcsJob {
 
 pub struct App {
     ctx: egui::Context,
+    /// Window title last sent (sending it every frame costs a platform call).
+    title: String,
     /// Open project folder; None = empty project.
     root: Option<PathBuf>,
     ignored: Vec<String>,
@@ -300,6 +338,7 @@ impl App {
         });
         let mut app = App {
             ctx: cc.egui_ctx.clone(),
+            title: String::new(),
             repo: None,
             vcs: None,
             repo_rx: None,
@@ -723,6 +762,9 @@ impl App {
             blame_version: None,
             blame_rx: None,
             hl: Default::default(),
+            dirty_cache: Default::default(),
+            line_col_cache: std::cell::Cell::new((u64::MAX, 0, (0, 0))),
+            gutter: (u64::MAX, 0, String::new()),
         }));
         // Warm up the language server so the first go-to-definition is fast.
         let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
@@ -772,7 +814,7 @@ impl App {
         if let Some(Tab::File(doc)) = self.tabs.get_mut(self.active) {
             match std::fs::write(&doc.path, &doc.text) {
                 Ok(()) => {
-                    doc.saved = doc.text.clone();
+                    doc.mark_saved();
                     if self.vcs == Some(Vcs::Svn) {
                         doc.blame_version = None; // svn blames the saved file: redo it
                     }
@@ -1849,7 +1891,7 @@ impl App {
                     _ => doc.blame_version == Some(doc.version),
                 };
                 let inline = if self.settings.inline_blame && fresh {
-                    let line = goto::line_col16(&doc.text, doc.cursor).0;
+                    let line = doc.line_col().0;
                     doc.blame.as_ref().and_then(|b| b.line(line)).map(|l| l.describe(blame::now()))
                 } else {
                     None
@@ -2017,7 +2059,7 @@ impl App {
                             .show_tooltip_when_elided(false),
                     )
                     .on_hover_text(hint);
-                    let (line, col) = goto::line_col16(&doc.text, doc.cursor);
+                    let (line, col) = doc.line_col();
                     ui.add(egui::Label::new(RichText::new(format!("Ln {}, Col {}", line + 1, col + 1)).weak()).truncate());
                 }
                 if let Some((first, _)) = activity.first() {
@@ -2236,8 +2278,9 @@ impl App {
                 && let Ok(t) = std::fs::read_to_string(&d.path)
             {
                 let t = t.replace("\r\n", "\n");
-                d.text = t.clone();
-                d.saved = t;
+                if t != d.text {
+                    d.reload(t);
+                }
             }
         }
     }
@@ -2253,7 +2296,10 @@ impl eframe::App for App {
             Some(r) => format!("{} — edittr", dir_name(r)),
             None => "edittr".to_string(),
         };
-        ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
+        if title != self.title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.title = title;
+        }
 
         egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
         egui::Panel::left("activity")
@@ -2387,15 +2433,24 @@ fn editor(ui: &mut egui::Ui, doc: &mut Doc, settings: Settings, inline: Option<S
     // Taken out of `doc` while the editor (which also needs `doc`) is shown; put back below.
     let mut hl = std::mem::take(&mut doc.hl);
     let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, _wrap: f32| hl.layout(ui, buf.as_str(), &lang, highlight);
-    let lines = doc.text.split('\n').count();
+    if doc.gutter.0 != doc.version || doc.gutter.1 != doc.text.len() {
+        let lines = doc.text.split('\n').count();
+        doc.gutter = (doc.version, doc.text.len(), (1..=lines).map(|n| format!("{n:>4}\n")).collect());
+    }
     egui::ScrollArea::both()
         .id_salt(&doc.path)
         .auto_shrink([false, false])
         .show(ui, |ui| {
             ui.horizontal_top(|ui| {
                 let line_slot = settings.highlight_line.then(|| ui.painter().add(egui::Shape::Noop));
-                let gutter: String = (1..=lines).map(|n| format!("{n:>4}\n")).collect();
-                ui.add(egui::Label::new(RichText::new(gutter).monospace().color(ui.visuals().weak_text_color())).selectable(false));
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(doc.gutter.2.as_str())
+                            .monospace()
+                            .color(ui.visuals().weak_text_color()),
+                    )
+                    .selectable(false),
+                );
                 // Column mode takes the keys it handles before the text edit sees them.
                 let focused = doc.editor_id.is_some_and(|id| ui.memory(|m| m.has_focus(id)));
                 if focused && doc.column.is_some() {

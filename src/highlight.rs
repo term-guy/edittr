@@ -53,10 +53,16 @@ struct Line {
     end: (ParseState, HighlightState),
 }
 
+/// Files with more lines than this get their first full highlight on a background
+/// thread (shown as plain text meanwhile) instead of stalling the frame that opens them.
+const BACKGROUND_LINES: usize = 2_000;
+
 #[derive(Default)]
 pub struct Cache {
     key: Option<(String, bool)>, // language, dark
     lines: Vec<Line>,
+    /// A background full highlight in progress, for `key`.
+    pending: Option<std::sync::mpsc::Receiver<Vec<Line>>>,
     /// Galley of the last layout, reused while text, theme and font are unchanged.
     galley: Option<(u64, egui::FontId, bool, Arc<egui::Galley>)>,
 }
@@ -87,7 +93,14 @@ impl Cache {
             return g.clone();
         }
         let job = if highlight && let Some(syntax) = syntax(lang) {
-            self.job(text, syntax, lang, dark, &font)
+            match self.job(ui, text, syntax, lang, dark, &font) {
+                Some(job) => job,
+                // Highlighting in the background: plain text for now (not cached as final).
+                None => {
+                    let job = LayoutJob::simple(text.to_string(), font.clone(), ui.visuals().text_color(), f32::INFINITY);
+                    return ui.fonts_mut(|f| f.layout_job(job));
+                }
+            }
         } else {
             LayoutJob::simple(text.to_string(), font.clone(), ui.visuals().text_color(), f32::INFINITY)
         };
@@ -98,12 +111,43 @@ impl Cache {
         galley
     }
 
-    fn job(&mut self, text: &str, syntax: &SyntaxReference, lang: &str, dark: bool, font: &egui::FontId) -> LayoutJob {
+    fn job(
+        &mut self,
+        ui: &egui::Ui,
+        text: &str,
+        syntax: &'static SyntaxReference,
+        lang: &str,
+        dark: bool,
+        font: &egui::FontId,
+    ) -> Option<LayoutJob> {
         let key = (lang.to_string(), dark);
         if self.key.as_ref() != Some(&key) {
             self.lines.clear();
+            self.pending = None;
             self.key = Some(key);
         }
+        if let Some(rx) = &self.pending {
+            match rx.try_recv() {
+                Ok(lines) => {
+                    self.lines = lines;
+                    self.pending = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => return None,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.pending = None,
+            }
+        } else if self.lines.is_empty() && text.bytes().filter(|&b| b == b'\n').count() > BACKGROUND_LINES {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let (text, ctx) = (text.to_string(), ui.ctx().clone());
+            std::thread::spawn(move || {
+                let mut c = Cache::default();
+                c.update(&text, syntax, dark);
+                let _ = tx.send(c.lines);
+                ctx.request_repaint();
+            });
+            self.pending = Some(rx);
+            return None;
+        }
+        // Also brings lines highlighted in the background up to date with edits made meanwhile.
         self.update(text, syntax, dark);
         let mut job = LayoutJob {
             text: text.to_string(),
@@ -126,7 +170,7 @@ impl Cache {
             }
             offset += line.len();
         }
-        job
+        Some(job)
     }
 
     /// Bring `self.lines` in sync with `text`, re-highlighting as little as possible.
