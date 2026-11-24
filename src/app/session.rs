@@ -1,4 +1,4 @@
-use super::{App, Confirm, Tab, background, read_doc_text, receive, save_recent};
+use super::{App, Confirm, DiskText, Tab, background, read_doc_text, receive, save_recent};
 use crate::session::{Debounce, Decision, FileTab, Side, Sidebar, Startup, Update, Window, Workspace, Writer};
 use crate::workspace;
 use eframe::egui;
@@ -20,7 +20,7 @@ struct LoadedWorkspace {
     root: Option<PathBuf>,
     ignored: Vec<String>,
     sidebar: Sidebar,
-    tabs: Vec<(FileTab, String)>,
+    tabs: Vec<(FileTab, DiskText)>,
     active: Option<PathBuf>,
     error: Option<String>,
 }
@@ -39,7 +39,7 @@ impl LoadedWorkspace {
                 }
                 let text = read_doc_text(path).ok().flatten()?;
                 if tab.cursor != 0 || tab.anchor != 0 {
-                    let len = text.chars().count();
+                    let len = text.text.chars().count();
                     tab.cursor = tab.cursor.min(len);
                     tab.anchor = tab.anchor.min(len);
                 }
@@ -162,7 +162,7 @@ impl App {
             for (tab, text) in loaded.tabs {
                 let path = PathBuf::from(tab.path);
                 let index = self.tabs.len();
-                self.add_file_tab(&path, text);
+                self.add_file_tab(&path, text.text, text.crlf);
                 if let Tab::File(doc) = &mut self.tabs[index] {
                     doc.cursor = tab.cursor;
                     doc.anchor = tab.anchor;

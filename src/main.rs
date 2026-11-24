@@ -7,6 +7,8 @@ mod commands;
 mod diagnostics;
 mod diff;
 mod editor;
+mod editorconfig;
+mod formatter;
 mod git;
 mod goto;
 mod graph;

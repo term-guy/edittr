@@ -571,6 +571,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "syntect",
+ "toml",
  "ureq",
  "url",
  "winresource",

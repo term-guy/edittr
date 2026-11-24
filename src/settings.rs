@@ -11,6 +11,7 @@ use eframe::egui;
 #[derive(Clone, Copy)]
 pub(crate) struct Settings {
     pub(crate) changes_tree: bool,
+    pub(crate) format_on_save: bool,
     pub(crate) highlight_line: bool,
     /// Show spaces as middle dots and tabs as arrows.
     pub(crate) show_whitespace: bool,
@@ -23,6 +24,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             changes_tree: false,
+            format_on_save: false,
             highlight_line: true,
             show_whitespace: false,
             inline_blame: true,
@@ -79,6 +81,7 @@ impl Settings {
             if let Ok(value) = value.parse() {
                 match key {
                     "changes_tree" => settings.changes_tree = value,
+                    "format_on_save" => settings.format_on_save = value,
                     "highlight_line" => settings.highlight_line = value,
                     "show_whitespace" => settings.show_whitespace = value,
                     "inline_blame" => settings.inline_blame = value,
@@ -96,7 +99,7 @@ impl Settings {
             if !matches!(
                 entry(line),
                 Some((
-                    "changes_tree" | "highlight_line" | "show_whitespace" | "inline_blame" | "restore_previous_session",
+                    "changes_tree" | "highlight_line" | "show_whitespace" | "inline_blame" | "restore_previous_session" | "format_on_save",
                     _
                 ))
             ) {
@@ -109,6 +112,7 @@ impl Settings {
         text.push_str(&format!("show_whitespace={}\n", self.show_whitespace));
         text.push_str(&format!("inline_blame={}\n", self.inline_blame));
         text.push_str(&format!("restore_previous_session={}\n", self.restore_previous_session));
+        text.push_str(&format!("format_on_save={}\n", self.format_on_save));
         text
     }
 }
@@ -151,6 +155,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn format_on_save_round_trip_and_default_off() {
+        assert!(!Settings::parse("").format_on_save);
+        let settings = Settings {
+            format_on_save: true,
+            ..Settings::default()
+        };
+        let text = settings.format("format_on_save=false\n");
+        assert_eq!(text.matches("format_on_save=").count(), 1);
+        assert!(Settings::parse(&text).format_on_save);
+    }
+
+    #[test]
     fn changes_tree_round_trip() {
         for changes_tree in [false, true] {
             let text = Settings {
@@ -184,7 +200,7 @@ mod tests {
         let text = settings.format(previous);
         assert_eq!(
             text,
-            "future_key=one=two\nfuture_key = three\n# A comment\nchanges_tree=false\nhighlight_line=false\nshow_whitespace=false\ninline_blame=true\nrestore_previous_session=true\n"
+            "future_key=one=two\nfuture_key = three\n# A comment\nchanges_tree=false\nhighlight_line=false\nshow_whitespace=false\ninline_blame=true\nrestore_previous_session=true\nformat_on_save=false\n"
         );
         assert!(!Settings::parse(&text).changes_tree);
     }

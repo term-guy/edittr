@@ -278,6 +278,7 @@ impl App {
                 }
             }
             Command::Save => self.save_active(),
+            Command::FormatDocument => self.format_document(self.active),
             Command::CloseTab => self.close_tab(self.active, false),
             Command::CloseAllTabs => self.close_tabs((0..self.tabs.len()).collect(), false),
             Command::ToggleTheme => self.ctx.set_theme(match self.ctx.theme() {

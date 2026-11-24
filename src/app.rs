@@ -1,3 +1,4 @@
+mod document_save;
 mod find;
 mod navigation;
 mod problems;
@@ -38,6 +39,7 @@ struct Doc {
     path: PathBuf,
     text: String,
     saved: String,
+    crlf: bool,
     lang: String,
     /// Pending selection (char range) to reveal on the next frame, e.g. from a search hit.
     goto: Option<(usize, usize)>,
@@ -94,7 +96,7 @@ struct VcsRefresh {
     status: Option<Result<Status, String>>,
     branches: Vec<String>,
     refresh_git_history: bool,
-    files: Vec<(u64, u64, String)>,
+    files: Vec<(u64, u64, DiskText)>,
 }
 
 impl Doc {
@@ -111,6 +113,11 @@ impl Doc {
     fn mark_saved(&mut self) {
         self.saved = self.text.clone();
         self.dirty_cache.set((self.version, false));
+    }
+
+    fn mark_saved_snapshot(&mut self, text: String) {
+        self.saved = text;
+        self.dirty_cache.set((self.version, self.text != self.saved));
     }
 
     /// 0-based line and UTF-16 column of the cursor (cached: it scans the text).
@@ -336,6 +343,7 @@ pub struct App {
     install_prompt: Option<&'static str>,
     install_declined: HashSet<&'static str>,
     settings: Settings,
+    document_save: document_save::DocumentSave,
     settings_writer: SettingsWriter,
     sessions: session::Sessions,
     /// Collapsed folders in the Changes tree, keyed "S:<path>" (staged) or "U:<path>".
@@ -372,6 +380,7 @@ impl App {
             tabs: Vec::new(),
             active: 0,
             next_doc_id: 0,
+            document_save: Default::default(),
             tree: HashMap::new(),
             tree_loading: HashSet::new(),
             tree_requested: HashSet::new(),
@@ -543,7 +552,7 @@ impl App {
             .tabs
             .iter()
             .filter_map(|tab| match tab {
-                Tab::File(doc) if (changes.rescan || changes.affects(&doc.path)) && !doc.dirty() => {
+                Tab::File(doc) if (changes.rescan || changes.affects(&doc.path)) && !doc.dirty() && !self.writing_document(&doc.path) => {
                     Some((doc.path.clone(), doc.id, doc.version))
                 }
                 _ => None,
@@ -715,6 +724,7 @@ impl App {
             self.message = format!("Could not save settings: {err}");
         }
         self.poll_project_changes(ctx);
+        self.poll_document_saves();
         self.poll_vcs(ctx);
         self.poll_blame(ctx);
         self.start_refresh();
@@ -760,7 +770,7 @@ impl App {
                     self.refresh_history();
                 }
             }
-            for (id, version, text) in refresh.files {
+            for (id, version, DiskText { text, crlf }) in refresh.files {
                 if let Some(doc) = self.tabs.iter_mut().find_map(|tab| match tab {
                     Tab::File(doc) if doc.id == id => Some(doc),
                     _ => None,
@@ -768,6 +778,7 @@ impl App {
                     && !doc.dirty()
                     && doc.text != text
                 {
+                    doc.crlf = crlf;
                     doc.reload(text, ctx);
                 }
             }
@@ -845,6 +856,7 @@ impl App {
 
     fn poll_project_changes(&mut self, ctx: &egui::Context) {
         let mut changes = self.watcher.as_ref().map_or_else(Changes::default, Watcher::take);
+        let watcher_rescan = changes.rescan;
         if let Some(error) = self.watcher.as_ref().and_then(Watcher::error) {
             self.watcher = None;
             self.message = format!("File watcher unavailable. Checking for changes while focused: {error}");
@@ -862,6 +874,7 @@ impl App {
         } else if gained_focus {
             changes.rescan = true;
         }
+        self.invalidate_editorconfigs(&changes, watcher_rescan);
         if changes.rescan || !changes.dirs.is_empty() {
             self.invalidate_tree(|dir| changes.rescan || changes.dirs.contains(dir) || changes.affects(dir));
         }
@@ -882,7 +895,7 @@ impl App {
             self.message = "Wait for replacements to finish before opening this file".into();
             return;
         }
-        let text = match read_doc_text(path) {
+        let DiskText { text, crlf } = match read_doc_text(path) {
             Ok(Some(text)) => text,
             Ok(None) => {
                 self.message = format!("{} looks binary; not opening", path.display());
@@ -894,11 +907,11 @@ impl App {
             }
         };
         // The active document's sync starts its language server (see sync_active_document).
-        self.add_file_tab(path, text);
+        self.add_file_tab(path, text, crlf);
         self.active = self.tabs.len() - 1;
     }
 
-    fn add_file_tab(&mut self, path: &Path, text: String) {
+    fn add_file_tab(&mut self, path: &Path, text: String, crlf: bool) {
         let lang = path
             .extension()
             .or_else(|| path.file_name())
@@ -910,6 +923,7 @@ impl App {
             id: self.next_doc_id,
             path: path.to_path_buf(),
             saved: text.clone(),
+            crlf,
             text,
             lang,
             goto: None,
@@ -928,6 +942,7 @@ impl App {
             line_col_cache: std::cell::Cell::new((u64::MAX, 0, (0, 0))),
         }));
         self.next_doc_id += 1;
+        self.prime_editorconfig(path.to_owned());
     }
 
     fn show_tab(&mut self, tab: Tab) {
@@ -964,26 +979,6 @@ impl App {
             self.load_graph();
         }
         self.show_tab(Tab::Graph);
-    }
-
-    fn save_active(&mut self) {
-        if let Some(Tab::File(doc)) = self.tabs.get_mut(self.active) {
-            match std::fs::write(&doc.path, &doc.text) {
-                Ok(()) => {
-                    // Reject disk reads started before this save.
-                    doc.version += 1;
-                    doc.mark_saved();
-                    if self.vcs == Some(Vcs::Svn) {
-                        doc.clear_blame(); // SVN blames the saved file.
-                    }
-                    self.message = format!("Saved {}", doc.path.display());
-                }
-                Err(e) => self.message = format!("Save failed: {e}"),
-            }
-            if self.watcher.is_none() || !self.root.as_ref().is_some_and(|root| doc.path.starts_with(root)) {
-                self.refresh_vcs();
-            }
-        }
     }
 
     fn close_tab(&mut self, i: usize, force: bool) {
@@ -1963,6 +1958,9 @@ impl App {
                         item(ui, "Close All", true, TabMenu::CloseAll);
                         if let Some(p) = &file_path {
                             ui.separator();
+                            if matches!(tab, Tab::File(_)) {
+                                item(ui, "Format document (Shift+Alt+F)", true, TabMenu::Format(i));
+                            }
                             item(ui, "Copy Path", true, TabMenu::Copy(p.display().to_string()));
                             let rel = self.display_path(p);
                             item(ui, "Copy Relative Path", true, TabMenu::Copy(rel));
@@ -1988,6 +1986,7 @@ impl App {
             Some(TabMenu::CloseRight(i)) => self.close_tabs((i + 1..self.tabs.len()).collect(), false),
             Some(TabMenu::CloseAll) => self.run_command(Command::CloseAllTabs),
             Some(TabMenu::Copy(text)) => ui.ctx().copy_text(text),
+            Some(TabMenu::Format(i)) => self.format_document(i),
             None => {}
         }
     }
@@ -2034,8 +2033,18 @@ impl App {
             _ => Vec::new(),
         };
         let marks: Vec<std::ops::Range<usize>> = self.find_matches().map(<[_]>::to_vec).unwrap_or_default();
+        // .editorconfig's indent wins over the one detected from the file.
+        let editorconfig_indent = match self.tabs.get(active) {
+            Some(Tab::File(doc)) => self.editorconfig_indent(&doc.path),
+            _ => None,
+        };
         match &mut self.tabs[active] {
             Tab::File(doc) => {
+                if let Some(unit) = editorconfig_indent
+                    && doc.indent != unit
+                {
+                    doc.indent = unit;
+                }
                 let dialog_open = self.quick_open.is_some()
                     || self.confirm.is_some()
                     || self.install_prompt.is_some()
@@ -2738,6 +2747,7 @@ enum TabMenu {
     CloseRight(usize),
     CloseAll,
     Copy(String),
+    Format(usize),
 }
 
 /// (added, removed) text colors.
@@ -3046,9 +3056,21 @@ fn save_recent(list: &[PathBuf]) {
     let _ = std::fs::write(f, text);
 }
 
-fn read_doc_text(path: &Path) -> std::io::Result<Option<String>> {
+struct DiskText {
+    text: String,
+    crlf: bool,
+}
+
+fn read_doc_text(path: &Path) -> std::io::Result<Option<DiskText>> {
     let bytes = std::fs::read(path)?;
-    Ok((!bytes.iter().take(8000).any(|&b| b == 0)).then(|| String::from_utf8_lossy(&bytes).replace("\r\n", "\n")))
+    Ok((!bytes.iter().take(8000).any(|&b| b == 0)).then(|| {
+        let text = String::from_utf8_lossy(&bytes);
+        let crlf = text.contains("\r\n");
+        DiskText {
+            text: if crlf { text.replace("\r\n", "\n") } else { text.into_owned() },
+            crlf,
+        }
+    }))
 }
 
 fn read_dir_sorted(dir: &Path) -> DirEntries {

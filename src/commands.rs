@@ -23,6 +23,7 @@ pub(crate) enum Command {
     CloseTab,
     CloseAllTabs,
     ToggleTheme,
+    FormatDocument,
     ToggleSetting(Setting),
 }
 
@@ -33,6 +34,7 @@ pub(crate) enum Setting {
     InlineBlame,
     ChangesTree,
     RestoreSession,
+    FormatOnSave,
 }
 
 impl Setting {
@@ -43,6 +45,7 @@ impl Setting {
             Self::InlineBlame => "Inline blame (who changed the current line)",
             Self::ChangesTree => "Source Control: view as tree",
             Self::RestoreSession => "Restore previous session",
+            Self::FormatOnSave => "Format on save",
         }
     }
 
@@ -53,6 +56,7 @@ impl Setting {
             Self::InlineBlame => &mut settings.inline_blame,
             Self::ChangesTree => &mut settings.changes_tree,
             Self::RestoreSession => &mut settings.restore_previous_session,
+            Self::FormatOnSave => &mut settings.format_on_save,
         }
     }
 }
@@ -134,6 +138,12 @@ pub(crate) const COMMANDS: &[Entry] = &[
     Entry::new(ToggleSetting(Setting::InlineBlame), "Toggle inline blame", &[]),
     Entry::new(ToggleSetting(Setting::ChangesTree), "Toggle source control tree view", &[]),
     Entry::new(ToggleSetting(Setting::RestoreSession), "Toggle restoring the previous session", &[]),
+    Entry::new(ToggleSetting(Setting::FormatOnSave), "Toggle format on save", &[]),
+    Entry::new(
+        FormatDocument,
+        "Format document",
+        &[KeyboardShortcut::new(Modifiers::SHIFT.plus(Modifiers::ALT), Key::F)],
+    ),
 ];
 
 pub(crate) fn entry(id: Command) -> &'static Entry {
