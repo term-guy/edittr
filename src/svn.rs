@@ -511,10 +511,11 @@ impl Revision {
     }
 }
 
+/// SVN's UTC timestamp as local "YYYY-MM-DD HH:MM", like the Git history shows.
 fn date_time(date: &str) -> String {
-    match (date.get(..10), date.get(11..16)) {
-        (Some(day), Some(time)) => format!("{day} {time}"),
-        _ => String::new(),
+    match crate::blame::date_to_epoch(date) {
+        Some(utc) if date.len() > 10 => crate::blame::local_date_time(utc),
+        _ => date.get(..10).unwrap_or_default().to_owned(),
     }
 }
 
@@ -899,7 +900,9 @@ Body &lt;details&gt;</msg>
         assert!(commits[2].refs.is_empty());
         assert_eq!(commits[2].subject, "One & two");
         assert_eq!(commits[2].author, "harry");
-        assert_eq!(commits[2].date, "2008-05-29 13:26");
+        // Shown in local time, like Git history.
+        let utc = crate::blame::date_to_epoch("2008-05-29T13:26:12Z").unwrap();
+        assert_eq!(commits[2].date, crate::blame::local_date_time(utc));
         assert!(history.commits(4)[3].author.is_empty());
     }
 

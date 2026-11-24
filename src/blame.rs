@@ -28,7 +28,9 @@ impl BlameLine {
         }
         let mut s = self.author.clone();
         if self.time > 0 {
-            s.push_str(", ");
+            if !s.is_empty() {
+                s.push_str(", ");
+            }
             s.push_str(&ago(now - self.time));
         }
         if !self.summary.is_empty() {
@@ -127,7 +129,7 @@ pub fn from_svn(lines: &[crate::vcs::BlameLine]) -> Blame {
 }
 
 /// An SVN UTC timestamp or a cached YYYY-MM-DD date to seconds since the epoch.
-fn date_to_epoch(date: &str) -> Option<i64> {
+pub(crate) fn date_to_epoch(date: &str) -> Option<i64> {
     let y: i64 = date.get(0..4)?.parse().ok()?;
     let m: i64 = date.get(5..7)?.parse().ok()?;
     let d: i64 = date.get(8..10)?.parse().ok()?;
@@ -147,6 +149,64 @@ fn date_to_epoch(date: &str) -> Option<i64> {
         hours * 3600 + minutes * 60 + seconds
     };
     Some(days * 86_400 + time)
+}
+
+/// Seconds east of UTC of the local time zone at `utc` (seconds since the epoch).
+pub(crate) fn local_offset(utc: i64) -> i64 {
+    #[cfg(unix)]
+    {
+        let t = utc as libc::time_t;
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        // SAFETY: localtime_r only writes to `tm`.
+        if unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
+            return 0;
+        }
+        tm.tm_gmtoff as i64
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{FILETIME, SYSTEMTIME};
+        use windows_sys::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToFileTime, SystemTimeToTzSpecificLocalTime};
+        let ticks = (utc + 11_644_473_600) * 10_000_000;
+        let ft = FILETIME {
+            dwLowDateTime: ticks as u32,
+            dwHighDateTime: (ticks >> 32) as u32,
+        };
+        // SAFETY: plain conversions between stack values.
+        unsafe {
+            let (mut st, mut local, mut out): (SYSTEMTIME, SYSTEMTIME, FILETIME) = std::mem::zeroed();
+            if FileTimeToSystemTime(&ft, &mut st) == 0
+                || SystemTimeToTzSpecificLocalTime(std::ptr::null(), &st, &mut local) == 0
+                || SystemTimeToFileTime(&local, &mut out) == 0
+            {
+                return 0;
+            }
+            let local_ticks = ((out.dwHighDateTime as i64) << 32) | out.dwLowDateTime as i64;
+            (local_ticks - ticks) / 10_000_000
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = utc;
+        0
+    }
+}
+
+/// "YYYY-MM-DD HH:MM" in local time for seconds since the epoch.
+pub(crate) fn local_date_time(utc: i64) -> String {
+    let t = utc + local_offset(utc);
+    let (days, secs) = (t.div_euclid(86_400), t.rem_euclid(86_400));
+    // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02} {:02}:{:02}", secs / 3600, secs % 3600 / 60)
 }
 
 /// Parse `git blame --porcelain`.
@@ -246,6 +306,15 @@ filename a.rs
         assert!(!second.uncommitted() && !second.author.is_empty() && second.time > 0);
         let new = git(root, "no/such/file.rs", "a\nb").unwrap();
         assert!(new.line(1).unwrap().uncommitted());
+    }
+
+    #[test]
+    fn local_dates_round_trip_the_offset() {
+        let utc = 1_700_000_000; // 2023-11-14 22:13:20 UTC
+        let shown = local_date_time(utc);
+        let back = date_to_epoch(&format!("{}T{}:00Z", &shown[..10], &shown[11..])).unwrap();
+        assert_eq!(back - local_offset(utc), utc - 20);
+        assert_eq!(local_date_time(0).len(), 16);
     }
 
     #[test]

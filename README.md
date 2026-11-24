@@ -39,7 +39,7 @@ A small, fast code editor with built-in git. It's a single native binary written
 
 ### Source control
 
-- **Git and Subversion**, detected automatically
+- **Git and Subversion**, detected automatically. Large working copies stay fast: tested with 20,000 files and 8,000 pending changes
 - Staged and unstaged changes as a list or a tree (remembered), per-file diffs, stage/unstage/discard (single file or all), commit / amend, switch branches, fetch / pull (fast-forward only) / push
 - **Graph and history**: branch lanes, merges, branch and tag badges; click a commit to see its stats and patch. For Subversion, the log and blame are cached so the server isn't asked again
 - A **background watcher** keeps the Explorer colors and Source Control view up to date when files or the repository change outside the editor
@@ -84,7 +84,18 @@ Servers start the first time you open a file of their language, not when you ope
 
 Servers edittr installs go into its own folder (`~/Library/Application Support/edittr/servers` on macOS, `~/.local/share/edittr/servers` on Linux, `%LOCALAPPDATA%\edittr\servers` on Windows; override it with `EDITTR_SERVERS_DIR`). edittr also starts servers it finds on `PATH` for Java (jdtls), Ruby (ruby-lsp), PHP (intelephense), Lua, Zig and C#.
 
-When a workspace has a compilation database, edittr gives clangd a filtered copy in the OS cache directory under `edittr/clangd/`. It checks the workspace root, `build*/`, `out/`, `cmake-build-*/`, and a workspace-wide `CompileFlags.CompilationDatabase` path in `.clangd`. Ignored folders are excluded from the copy, and edittr restarts clangd when the database or the workspace ignore list changes. clangd stores its persistent index alongside the database it uses. If clangd discovers a project-local database on its own, edittr hides its `.cache/clangd` directory from Explorer, search and untracked Source Control results.
+### C and C++ compile flags
+
+clangd needs each file's compile flags. edittr finds them in this order, and the status bar shows which one is in use (click it for the C/C++ settings):
+
+1. **The project's `compile_commands.json`**: the workspace root, `build*/`, `out/`, `cmake-build-*/`, or the `CompileFlags.CompilationDatabase` path in `.clangd`. clangd gets a filtered copy in the OS cache directory under `edittr/clangd/`, without the ignored folders.
+2. **A generated database**: **C/C++: Generate compile database** (command palette or the settings dialog) runs a CMake or Meson configure, your build under [bear](https://github.com/rizsotto/Bear), or a `make -n` dry run, after showing you the exact command. Output streams live and can be cancelled; the result goes into the cache, never into the project.
+3. **clangd's own discovery**: `compile_flags.txt`, nested `compile_commands.json` files and `.clangd` settings.
+4. **Inferred from the Makefiles**: edittr reads the Makefile and the `.mk` files it includes (without running anything) for `-I`, `-D`, `-std` and friends, adds include folders found from your `#include` lines, and writes a database so clangd can index the whole project.
+
+**Embedded and automotive compilers**: commands for compilers clangd can't run (IAR, TI, Keil armcc and C51/C166, TASKING, Green Hills, Wind River Diab, Renesas CC-RH/RL/RX, Cosmic, SDCC, CodeWarrior) are converted to clang commands. Their include paths, defines and pre-includes are kept, their predefined macros and keyword extensions (`__no_init`, `__interrupt`, `__ramfunc`, ...) are defined, and their own C library headers are found from the install folder. For GCC cross compilers such as `arm-none-eabi-gcc`, clangd gets `--query-driver` so it finds their system headers.
+
+The C/C++ settings (per folder) add extra flags, set the compiler and set the build command used for generating. edittr restarts clangd when the database, `.clangd` or the ignore list changes, or when a Makefile changes and the flags were inferred from it. A generated database is marked out of date instead. clangd stores its persistent index alongside the database it uses.
 
 Rust-analyzer warms its analysis caches and uses a separate Cargo target subdirectory. gopls manages its own persistent cache. edittr also caches regex-based symbols from saved workspace files under `edittr/symbols/` in the OS cache directory, up to 16 MiB per workspace.
 
