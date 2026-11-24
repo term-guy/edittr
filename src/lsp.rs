@@ -382,6 +382,9 @@ impl Client {
                         "declaration": {"linkSupport": true},
                         "publishDiagnostics": {"versionSupport": true},
                         "documentSymbol": {"hierarchicalDocumentSymbolSupport": true},
+                        "hover": {"contentFormat": ["plaintext", "markdown"]},
+                        "completion": {"completionItem": {"snippetSupport": false, "documentationFormat": ["plaintext"]}},
+                        "references": {},
                     },
                     "workspace": {"workspaceFolders": true, "configuration": true},
                 },
@@ -641,6 +644,73 @@ impl Client {
         Ok(locs)
     }
 
+    /// Sync the document and send a request at a position.
+    #[allow(clippy::too_many_arguments)]
+    fn at_position(
+        &self,
+        method: &str,
+        path: &Path,
+        text: &str,
+        revision: Revision,
+        (line, col16): (usize, usize),
+        extra: Value,
+        timeout: Duration,
+    ) -> Result<Value, String> {
+        if self.ignores(path) {
+            return Ok(Value::Null);
+        }
+        let kind = self.wait_ready(timeout)?;
+        if !self.sync(path, text, revision, kind) {
+            return Err("The document changed".into());
+        }
+        let mut params = json!({
+            "textDocument": {"uri": path_to_uri(path)},
+            "position": {"line": line, "character": col16},
+        });
+        if let (Some(p), Value::Object(extra)) = (params.as_object_mut(), extra) {
+            p.extend(extra);
+        }
+        self.request(method, params, timeout)
+    }
+
+    /// Hover text (markdown or plain) at a position.
+    pub fn hover(
+        &self,
+        path: &Path,
+        text: &str,
+        revision: Revision,
+        pos: (usize, usize),
+        timeout: Duration,
+    ) -> Result<Option<String>, String> {
+        let v = self.at_position("textDocument/hover", path, text, revision, pos, Value::Null, timeout)?;
+        Ok(parse_hover(&v["contents"]))
+    }
+
+    pub fn completion(
+        &self,
+        path: &Path,
+        text: &str,
+        revision: Revision,
+        pos: (usize, usize),
+        timeout: Duration,
+    ) -> Result<Vec<Completion>, String> {
+        let v = self.at_position("textDocument/completion", path, text, revision, pos, Value::Null, timeout)?;
+        Ok(parse_completions(&v))
+    }
+
+    pub fn references(
+        &self,
+        path: &Path,
+        text: &str,
+        revision: Revision,
+        pos: (usize, usize),
+        timeout: Duration,
+    ) -> Result<Vec<Location>, String> {
+        let extra = json!({"context": {"includeDeclaration": true}});
+        let v = self.at_position("textDocument/references", path, text, revision, pos, extra, timeout)?;
+        Ok(parse_locations(&v))
+    }
+
     pub(crate) fn document_symbols(&self, path: &Path, text: &str, revision: Revision, timeout: Duration) -> Result<Vec<Symbol>, String> {
         let kind = self.wait_ready(timeout)?;
         if !self.sync(path, text, revision, kind) {
@@ -679,6 +749,143 @@ fn read_message(r: &mut impl BufRead) -> Option<Value> {
 }
 
 /// Accepts `Location`, `Location[]`, `LocationLink[]` or null.
+/// A completion suggestion.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Completion {
+    pub label: String,
+    /// Kind name (Function, Variable, ...) or empty.
+    pub kind: &'static str,
+    pub detail: String,
+    /// Text to insert in place of the word before the cursor.
+    pub insert: String,
+    /// What to match the typed prefix against.
+    pub filter: String,
+    pub sort: String,
+}
+
+fn completion_kind(n: u64) -> &'static str {
+    match n {
+        2 => "Method",
+        3 => "Function",
+        4 => "Constructor",
+        5 => "Field",
+        6 => "Variable",
+        7 => "Class",
+        8 => "Interface",
+        9 => "Module",
+        10 => "Property",
+        13 => "Enum",
+        14 => "Keyword",
+        15 => "Snippet",
+        20 => "EnumMember",
+        21 => "Constant",
+        22 => "Struct",
+        25 => "TypeParameter",
+        _ => "",
+    }
+}
+
+/// Snippet syntax to plain text: `${1:x}` -> `x`, `$0` / `$1` -> nothing.
+fn strip_snippet(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                if let Some(n) = chars.next() {
+                    out.push(n);
+                }
+            }
+            '$' if chars.peek().is_some_and(|c| c.is_ascii_digit()) => {
+                while chars.peek().is_some_and(|c| c.is_ascii_digit()) {
+                    chars.next();
+                }
+            }
+            '$' if chars.peek() == Some(&'{') => {
+                chars.next();
+                while chars.peek().is_some_and(|c| c.is_ascii_digit()) {
+                    chars.next();
+                }
+                if chars.peek() == Some(&':') {
+                    chars.next();
+                }
+                let mut depth = 1;
+                for c in chars.by_ref() {
+                    match c {
+                        '{' => depth += 1,
+                        '}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    if depth > 0 {
+                        out.push(c);
+                    }
+                }
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+pub(crate) fn parse_completions(v: &Value) -> Vec<Completion> {
+    let items = v.get("items").unwrap_or(v);
+    let Some(items) = items.as_array() else { return Vec::new() };
+    items
+        .iter()
+        .filter_map(|it| {
+            // clangd marks items that would also add an #include with a leading bullet.
+            let label = it["label"].as_str()?.trim().trim_start_matches(['•', '·']).trim().to_string();
+            let snippet = it["insertTextFormat"].as_u64() == Some(2);
+            let raw = it["textEdit"]["newText"]
+                .as_str()
+                .or_else(|| it["insertText"].as_str())
+                .unwrap_or(&label);
+            let insert = if snippet { strip_snippet(raw) } else { raw.to_string() };
+            Some(Completion {
+                kind: completion_kind(it["kind"].as_u64().unwrap_or(0)),
+                detail: it["detail"].as_str().unwrap_or_default().trim().to_string(),
+                filter: it["filterText"].as_str().unwrap_or(&label).to_string(),
+                sort: it["sortText"].as_str().unwrap_or(&label).to_string(),
+                insert,
+                label,
+            })
+        })
+        .collect()
+}
+
+/// Hover contents (MarkupContent, MarkedString or an array of them) as plain text.
+pub(crate) fn parse_hover(v: &Value) -> Option<String> {
+    let part = |v: &Value| -> Option<String> {
+        match v {
+            Value::String(s) => Some(s.clone()),
+            Value::Object(o) => o
+                .get("value")
+                .and_then(Value::as_str)
+                .map(|s| match o.get("language").and_then(Value::as_str) {
+                    Some(_) => s.to_string(),
+                    None => s.to_string(),
+                }),
+            _ => None,
+        }
+    };
+    let text = match v {
+        Value::Array(a) => a.iter().filter_map(part).collect::<Vec<_>>().join("\n\n"),
+        v => part(v)?,
+    };
+    // Markdown code fences and rules are noise in a plain tooltip.
+    let cleaned: Vec<&str> = text
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("```") && l.trim() != "---")
+        .collect();
+    let cleaned = cleaned.join("\n").trim().to_string();
+    (!cleaned.is_empty()).then_some(cleaned)
+}
+
 fn parse_locations(v: &Value) -> Vec<Location> {
     let items: Vec<&Value> = match v {
         Value::Array(a) => a.iter().collect(),
@@ -927,6 +1134,27 @@ mod tests {
         assert!(!client.diagnostics_snapshot().contains_key(&path));
         drop(client);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn parses_hover_and_completions() {
+        assert_eq!(
+            parse_hover(&json!({"kind": "markdown", "value": "```rust\nfn f()\n```\n---\nDocs"})).as_deref(),
+            Some("fn f()\nDocs")
+        );
+        assert_eq!(
+            parse_hover(&json!([{"language": "c", "value": "int x"}, "note"])).as_deref(),
+            Some("int x\n\nnote")
+        );
+        assert_eq!(parse_hover(&json!("")), None);
+        let items = parse_completions(&json!({"isIncomplete": false, "items": [
+            {"label": "push", "kind": 2, "detail": "fn(&mut self, T)", "insertTextFormat": 2, "insertText": "push(${1:value})$0"},
+            {"label": " len", "textEdit": {"newText": "len", "range": {}}},
+        ]}));
+        assert_eq!(items[0].insert, "push(value)");
+        assert_eq!(items[0].kind, "Method");
+        assert_eq!(items[1].label, "len");
+        assert_eq!(items[1].insert, "len");
     }
 
     #[test]

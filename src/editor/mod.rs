@@ -142,6 +142,14 @@ impl State {
         }
     }
 
+    /// Replace `range` (bytes) with `insert` as one undoable edit; the caret goes after it.
+    pub fn replace(&mut self, text: &mut String, range: Range<usize>, insert: &str) {
+        let before = self.sels.clone();
+        self.sels = buffer::edit(text, &mut self.history, &before, vec![(range, insert.to_string())], Kind::Other);
+        self.reveal = Some(false);
+        self.preferred_x = None;
+    }
+
     /// Select a range (byte offsets) and scroll it to the center.
     pub fn select(&mut self, range: Range<usize>) {
         self.sels = vec![Sel {

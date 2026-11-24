@@ -246,6 +246,7 @@ impl App {
                 }
             }
             Command::GoBack => self.go_back(),
+            Command::FindReferences => self.find_references(),
             Command::Explorer => {
                 self.side = Side::Explorer;
                 self.side_open = true;

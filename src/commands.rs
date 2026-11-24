@@ -12,6 +12,7 @@ pub(crate) enum Command {
     DocumentSymbols,
     WorkspaceSymbols,
     GoToDefinition,
+    FindReferences,
     GoBack,
     Explorer,
     ToggleSidebar,
@@ -127,6 +128,12 @@ pub(crate) const COMMANDS: &[Entry] = &[
     Entry::new(FindInFiles, "Search in files", &[KeyboardShortcut::new(CMD_SHIFT, Key::F)]),
     Entry::new(DocumentSymbols, "Go to symbol in file", &[KeyboardShortcut::new(CMD_SHIFT, Key::O)]),
     Entry::new(WorkspaceSymbols, "Go to symbol in workspace", &[KeyboardShortcut::new(CMD, Key::T)]),
+    // Before Go to definition: egui also matches F12 when Shift is held.
+    Entry::new(
+        FindReferences,
+        "Find all references",
+        &[KeyboardShortcut::new(Modifiers::SHIFT, Key::F12)],
+    ),
     Entry::new(
         GoToDefinition,
         "Go to definition",

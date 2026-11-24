@@ -1,3 +1,4 @@
+mod assist;
 mod document_save;
 mod find;
 mod gutter;
@@ -334,6 +335,10 @@ pub struct App {
     picker: Option<navigation::Picker>,
     /// Tab shown in the side editor (Open to the Side).
     split: Option<usize>,
+    /// Hover info, completion, references.
+    assist: assist::Assist,
+    /// Screen rect of the active editor's caret (last frame).
+    last_caret: Option<egui::Rect>,
     confirm: Option<Confirm>,
     open_folder_requested: bool,
     open_folder: Option<String>,
@@ -414,6 +419,8 @@ impl App {
             quick_open: None,
             picker: None,
             split: None,
+            assist: Default::default(),
+            last_caret: None,
             confirm: None,
             open_folder_requested: false,
             open_folder: None,
@@ -902,7 +909,7 @@ impl App {
     // --------------------------------------------------------------- tabs
 
     /// Diagnostics of tab `i` as (line, col, end line, end col, color).
-    fn squiggles_for(&self, i: usize, v: &egui::Visuals) -> Vec<(usize, usize, usize, usize, Color32)> {
+    fn squiggles_for(&self, i: usize, v: &egui::Visuals) -> Vec<(usize, usize, usize, usize, Color32, String)> {
         let Some(Tab::File(doc)) = self.tabs.get(i) else {
             return Vec::new();
         };
@@ -914,7 +921,7 @@ impl App {
                     crate::diagnostics::Severity::Warning => v.warn_fg_color,
                     _ => v.hyperlink_color.gamma_multiply(0.7),
                 };
-                (d.line, d.col_start, d.end_line, d.col_end, color)
+                (d.line, d.col_start, d.end_line, d.col_end, color, d.message.clone())
             })
             .collect()
     }
@@ -944,7 +951,7 @@ impl App {
                     });
                 });
                 ui.separator();
-                goto = editor(ui, doc, settings, None, &diags, &[], 1);
+                goto = editor(ui, doc, settings, None, &diags, &[], 1).goto;
             });
         if close {
             self.split = None;
@@ -2091,8 +2098,11 @@ impl App {
         let active = self.active;
         let mut open_path = None;
         let mut goto_at = None;
+        let mut editor_out = None;
         // Diagnostics of the active file, for squiggles (collected before borrowing the tab).
         let diags = self.squiggles_for(active, ui.visuals());
+        // The completion popup takes its keys before the editor sees them.
+        self.completion_keys(&ui.ctx().clone());
         self.split_pane(ui);
         let marks: Vec<std::ops::Range<usize>> = self.find_matches().map(<[_]>::to_vec).unwrap_or_default();
         // .editorconfig's indent wins over the one detected from the file.
@@ -2123,9 +2133,11 @@ impl App {
                 } else {
                     None
                 };
-                if let Some(idx) = editor(ui, doc, self.settings, inline, &diags, &marks, 0) {
+                let out = editor(ui, doc, self.settings, inline, &diags, &marks, 0);
+                if let Some(idx) = out.goto {
                     goto_at = Some(idx);
                 }
+                editor_out = Some(out);
                 self.find.after_editor(ui, doc);
             }
             Tab::Diff(d) => {
@@ -2201,6 +2213,10 @@ impl App {
         }
         if let Some(p) = open_path {
             self.open_file(&p);
+        }
+        if let Some(out) = &editor_out {
+            self.last_caret = out.caret;
+            self.after_editor(out);
         }
         if let Some(idx) = goto_at {
             self.go_to_definition(idx, ui.ctx());
@@ -2551,6 +2567,7 @@ impl eframe::App for App {
         self.sync_active_document();
         self.refresh_outline();
         self.project_replace_modal(&ctx);
+        self.assist_ui(&ctx);
         self.record_session(false);
         #[cfg(feature = "tour")]
         if let Some(mut t) = self.tour.take() {
@@ -2668,10 +2685,10 @@ fn editor(
     doc: &mut Doc,
     settings: Settings,
     inline: Option<String>,
-    diags: &[(usize, usize, usize, usize, Color32)],
+    diags: &[(usize, usize, usize, usize, Color32, String)],
     find_marks: &[std::ops::Range<usize>],
     pane: u8,
-) -> Option<usize> {
+) -> EditorOut {
     let id = ui.make_persistent_id(("editor", doc.id, pane));
     // A pending selection from elsewhere (search hit, go to definition): char range.
     // The main pane (0) takes it, so a file open in both panes jumps once.
@@ -2706,7 +2723,7 @@ fn editor(
         };
         diags
             .iter()
-            .map(|&(l0, c0, l1, c1, color)| (at(l0, c0)..at(l1, c1), color))
+            .map(|(l0, c0, l1, c1, color, _)| (at(*l0, *c0)..at(*l1, *c1), *color))
             .collect()
     };
     // Find matches (char ranges) to bytes.
@@ -2741,7 +2758,35 @@ fn editor(
     let ix = doc.ed.index(&doc.text, doc.version);
     doc.cursor = ix.byte_to_char(&doc.text, p.head);
     doc.anchor = ix.byte_to_char(&doc.text, p.anchor);
-    out.goto.map(|b| ix.byte_to_char(&doc.text, b))
+    // A diagnostic under the resting pointer is shown in the hover tooltip.
+    let hover = out.hover.map(|(b, pos)| {
+        let message = squiggles
+            .iter()
+            .zip(diags)
+            .filter(|((r, _), _)| r.start <= b && b <= r.end.max(r.start + 1))
+            .map(|(_, d)| d.5.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        (b, pos, (!message.is_empty()).then_some(message))
+    });
+    EditorOut {
+        goto: out.goto.map(|b| ix.byte_to_char(&doc.text, b)),
+        hover,
+        caret: out.caret_rect,
+        changed: out.changed,
+        focused: out.focused,
+    }
+}
+
+/// What the editor reports back to the app each frame.
+pub(super) struct EditorOut {
+    /// Cmd/Ctrl+click: go to the definition at this char index.
+    goto: Option<usize>,
+    /// Pointer resting at (byte, screen pos), with any diagnostic messages there.
+    hover: Option<(usize, egui::Pos2, Option<String>)>,
+    caret: Option<egui::Rect>,
+    changed: bool,
+    focused: bool,
 }
 
 fn diff_view(ui: &mut egui::Ui, lines: &[String], id: &str) {

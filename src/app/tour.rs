@@ -28,6 +28,8 @@ const STEPS: &[&str] = &[
     "go-to-file",
     "search-in-files",
     "folding",
+    "lsp-hover",
+    "lsp-completion",
     "find-replace",
     "command-palette",
     "source-control",
@@ -150,6 +152,22 @@ impl Tour {
         if name == "git-graph" && app.graph_sel.is_none() {
             app.load_graph_detail(1);
         }
+        if name == "lsp-hover" && self.frames == 20 {
+            if let Some(r) = app.last_caret {
+                self.inject.push(egui::Event::PointerMoved(r.center() + egui::vec2(4.0, 0.0)));
+            }
+        }
+        if name == "lsp-completion" {
+            match self.frames {
+                20 => {
+                    // Start a new statement on its own line, then type a prefix.
+                    self.key(Key::End);
+                    self.key(Key::Enter);
+                }
+                24 => self.inject.push(egui::Event::Text("ad".into())),
+                _ => {}
+            }
+        }
         let ready = app.search.rx.is_none()
             && app.goto_rx.is_none()
             && app.repo_rx.is_none()
@@ -159,7 +177,12 @@ impl Tour {
             && app.graph_detail_rx.is_none()
             && app.quick_open.as_ref().is_none_or(|q| q.files_rx.is_none());
         let elapsed = self.started.elapsed();
-        let min_frames = if name == "column-select" { 40 } else { 10 };
+        let min_frames = match name {
+            "column-select" => 40,
+            // Give the language server time to answer.
+            "lsp-hover" | "lsp-completion" => 150,
+            _ => 10,
+        };
         if self.frames < min_frames || elapsed < std::time::Duration::from_millis(800) || (!ready && elapsed.as_secs() < 20) {
             return;
         }
@@ -214,6 +237,16 @@ impl Tour {
                 if let Some(Tab::File(d)) = app.tabs.iter_mut().find(|t| matches!(t, Tab::File(_))) {
                     d.ed.folded.insert(5);
                     d.ed.folded.insert(18);
+                }
+            }
+            "lsp-hover" | "lsp-completion" => {
+                // Put the caret on a call of `add` (C demo) or `lane_color` (Rust demo).
+                if let Some(Tab::File(d)) = app.tabs.get_mut(app.active) {
+                    let at = d.text.find("add(1").or_else(|| d.text.find("lane_color(i"));
+                    if let Some(b) = at {
+                        let c = d.text[..b].chars().count() + 1;
+                        d.goto = Some((c, c));
+                    }
                 }
             }
             "find-replace" => {
