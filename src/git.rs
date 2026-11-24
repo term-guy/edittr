@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-fn cmd(repo: &Path) -> Command {
+pub(crate) fn cmd(repo: &Path) -> Command {
     let mut c = Command::new("git");
     c.current_dir(repo).env("GIT_TERMINAL_PROMPT", "0");
     #[cfg(windows)]

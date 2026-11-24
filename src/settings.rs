@@ -14,6 +14,8 @@ pub(crate) struct Settings {
     pub(crate) highlight_line: bool,
     /// Show spaces as middle dots and tabs as arrows.
     pub(crate) show_whitespace: bool,
+    /// Dimmed "who changed this line" after the cursor's line.
+    pub(crate) inline_blame: bool,
 }
 
 impl Default for Settings {
@@ -22,6 +24,7 @@ impl Default for Settings {
             changes_tree: false,
             highlight_line: true,
             show_whitespace: false,
+            inline_blame: true,
         }
     }
 }
@@ -76,6 +79,7 @@ impl Settings {
                     "changes_tree" => settings.changes_tree = value,
                     "highlight_line" => settings.highlight_line = value,
                     "show_whitespace" => settings.show_whitespace = value,
+                    "inline_blame" => settings.inline_blame = value,
                     _ => {}
                 }
             }
@@ -86,7 +90,10 @@ impl Settings {
     fn format(&self, previous: &str) -> String {
         let mut text = String::new();
         for line in previous.lines() {
-            if !matches!(entry(line), Some(("changes_tree" | "highlight_line" | "show_whitespace", _))) {
+            if !matches!(
+                entry(line),
+                Some(("changes_tree" | "highlight_line" | "show_whitespace" | "inline_blame", _))
+            ) {
                 text.push_str(line);
                 text.push('\n');
             }
@@ -94,6 +101,7 @@ impl Settings {
         text.push_str(&format!("changes_tree={}\n", self.changes_tree));
         text.push_str(&format!("highlight_line={}\n", self.highlight_line));
         text.push_str(&format!("show_whitespace={}\n", self.show_whitespace));
+        text.push_str(&format!("inline_blame={}\n", self.inline_blame));
         text
     }
 }
@@ -169,7 +177,7 @@ mod tests {
         let text = settings.format(previous);
         assert_eq!(
             text,
-            "future_key=one=two\nfuture_key = three\n# A comment\nchanges_tree=false\nhighlight_line=false\nshow_whitespace=false\n"
+            "future_key=one=two\nfuture_key = three\n# A comment\nchanges_tree=false\nhighlight_line=false\nshow_whitespace=false\ninline_blame=true\n"
         );
         assert!(!Settings::parse(&text).changes_tree);
     }

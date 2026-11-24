@@ -1,6 +1,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod app;
+mod blame;
 mod bundled;
 mod column;
 mod diff;

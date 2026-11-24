@@ -1,6 +1,7 @@
 #[cfg(feature = "tour")]
 mod tour;
 
+use crate::blame;
 use crate::column::{self, ColumnSel};
 use crate::git::{self, FileChange, Status};
 use crate::graph::Graph;
@@ -49,6 +50,13 @@ struct Doc {
     column_drag: bool,
     /// The text edit's widget id (last frame), to know whether it has keyboard focus.
     editor_id: Option<egui::Id>,
+    /// Bumped on every edit; `edited_at` is when the last one happened.
+    version: u64,
+    edited_at: Option<Instant>,
+    /// Inline blame of `blame_version` of the text (None: none / not in a repo).
+    blame: Option<blame::Blame>,
+    blame_version: Option<u64>,
+    blame_rx: Option<Receiver<(u64, Result<blame::Blame, String>)>>,
 }
 
 impl Doc {
@@ -90,6 +98,8 @@ impl Doc {
     }
 }
 
+// File tabs are the common case; boxing them would only add an indirection.
+#[allow(clippy::large_enum_variant)]
 enum Tab {
     File(Doc),
     Diff(Box<DiffTab>),
@@ -445,7 +455,45 @@ impl App {
         self.bg_task = Some((label.to_string(), rx));
     }
 
+    /// Keep the active file's inline blame current: rerun after edits pause.
+    fn poll_blame(&mut self, ctx: &egui::Context) {
+        const SETTLE: Duration = Duration::from_millis(700);
+        if !self.settings.inline_blame {
+            return;
+        }
+        let Some(repo) = self.repo.clone() else { return };
+        let Some(Tab::File(doc)) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        if let Some(rx) = &doc.blame_rx
+            && let Ok((version, res)) = rx.try_recv()
+        {
+            doc.blame_rx = None;
+            doc.blame = res.ok();
+            doc.blame_version = Some(version);
+        }
+        if doc.blame_rx.is_some() || doc.blame_version == Some(doc.version) || doc.text.len() > 2_000_000 {
+            return;
+        }
+        if let Some(t) = doc.edited_at
+            && t.elapsed() < SETTLE
+        {
+            ctx.request_repaint_after(SETTLE - t.elapsed());
+            return;
+        }
+        let Ok(rel) = doc.path.strip_prefix(&repo) else { return };
+        let rel = rel.to_string_lossy().replace('\\', "/");
+        let (text, version, ctx) = (doc.text.clone(), doc.version, ctx.clone());
+        let (tx, rx) = channel();
+        std::thread::spawn(move || {
+            let _ = tx.send((version, blame::git(&repo, &rel, &text)));
+            ctx.request_repaint();
+        });
+        doc.blame_rx = Some(rx);
+    }
+
     fn poll_background(&mut self, ctx: &egui::Context) {
+        self.poll_blame(ctx);
         self.poll_goto();
         self.poll_search(ctx);
         if let Some(err) = self.settings_writer.errors.try_iter().last() {
@@ -519,6 +567,11 @@ impl App {
             column: None,
             column_drag: false,
             editor_id: None,
+            version: 0,
+            edited_at: None,
+            blame: None,
+            blame_version: None,
+            blame_rx: None,
         }));
         // Warm up the language server so the first go-to-definition is fast.
         let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
@@ -1198,6 +1251,7 @@ impl App {
                 for (label, value) in [
                     ("Highlight current line", &mut self.settings.highlight_line),
                     ("Show whitespace", &mut self.settings.show_whitespace),
+                    ("Inline blame (who changed the current line)", &mut self.settings.inline_blame),
                     ("Source Control: view as tree", &mut self.settings.changes_tree),
                 ] {
                     changed |= ui.checkbox(value, label).changed();
@@ -1596,7 +1650,13 @@ impl App {
         let mut goto_at = None;
         match &mut self.tabs[active] {
             Tab::File(doc) => {
-                if let Some(idx) = editor(ui, doc, self.settings) {
+                let inline = if self.settings.inline_blame && doc.blame_version == Some(doc.version) {
+                    let line = goto::line_col16(&doc.text, doc.cursor).0;
+                    doc.blame.as_ref().and_then(|b| b.line(line)).map(|l| l.describe(blame::now()))
+                } else {
+                    None
+                };
+                if let Some(idx) = editor(ui, doc, self.settings, inline) {
                     goto_at = Some(idx);
                 }
             }
@@ -2119,7 +2179,7 @@ mod folder_picker {
 // -------------------------------------------------------------- widgets
 
 /// Draws the editor. Returns a char index when the user Ctrl/Cmd+clicked a symbol.
-fn editor(ui: &mut egui::Ui, doc: &mut Doc, settings: Settings) -> Option<usize> {
+fn editor(ui: &mut egui::Ui, doc: &mut Doc, settings: Settings, inline: Option<String>) -> Option<usize> {
     let mut goto_request = None;
     let theme = CodeTheme::from_style(ui.style());
     let highlight = doc.text.len() <= HIGHLIGHT_LIMIT;
@@ -2161,6 +2221,15 @@ fn editor(ui: &mut egui::Ui, doc: &mut Doc, settings: Settings) -> Option<usize>
                     .layouter(&mut layouter)
                     .show(ui);
                 paint_current_line(ui, line_slot, &out);
+                if out.response.changed() {
+                    doc.version += 1;
+                    doc.edited_at = Some(Instant::now());
+                }
+                if let Some(text) = inline
+                    && doc.column.is_none()
+                {
+                    paint_inline_blame(ui, &out, &text);
+                }
                 if settings.show_whitespace {
                     paint_whitespace(ui, &out);
                 }
@@ -2299,6 +2368,7 @@ fn column_mouse(ui: &egui::Ui, doc: &mut Doc, out: &egui::text_edit::TextEditOut
 fn column_input(ui: &mut egui::Ui, doc: &mut Doc) {
     use column::Edit;
     let Some(mut sel) = doc.column else { return };
+    let mut edited = false;
     let mut copied = None;
     let mut exit = false;
     let events = ui.input_mut(|i| std::mem::take(&mut i.events));
@@ -2309,18 +2379,24 @@ fn column_input(ui: &mut egui::Ui, doc: &mut Doc) {
             continue;
         }
         match &ev {
-            egui::Event::Text(t) if !t.contains('\n') => column::apply(&mut doc.text, &mut sel, Edit::Insert(t)),
+            egui::Event::Text(t) if !t.contains('\n') => {
+                edited = true;
+                column::apply(&mut doc.text, &mut sel, Edit::Insert(t))
+            }
             egui::Event::Copy | egui::Event::Cut => {
                 copied = Some(column::selected_text(&doc.text, &sel));
                 if matches!(ev, egui::Event::Cut) && !sel.is_empty() {
+                    edited = true;
                     column::apply(&mut doc.text, &mut sel, Edit::Delete);
                 }
             }
             egui::Event::Paste(p) => {
                 let pieces: Vec<&str> = p.lines().collect();
                 if !p.contains('\n') {
+                    edited = true;
                     column::apply(&mut doc.text, &mut sel, Edit::Insert(p));
                 } else if pieces.len() == sel.lines().len() {
+                    edited = true;
                     column::apply(&mut doc.text, &mut sel, Edit::InsertPerLine(pieces));
                 } else {
                     exit = true;
@@ -2335,9 +2411,18 @@ fn column_input(ui: &mut egui::Ui, doc: &mut Doc) {
             } => {
                 let shift = modifiers.shift;
                 match key {
-                    Key::Backspace => column::apply(&mut doc.text, &mut sel, Edit::Backspace),
-                    Key::Delete => column::apply(&mut doc.text, &mut sel, Edit::Delete),
-                    Key::Tab if !shift => column::apply(&mut doc.text, &mut sel, Edit::Insert("\t")),
+                    Key::Backspace => {
+                        edited = true;
+                        column::apply(&mut doc.text, &mut sel, Edit::Backspace)
+                    }
+                    Key::Delete => {
+                        edited = true;
+                        column::apply(&mut doc.text, &mut sel, Edit::Delete)
+                    }
+                    Key::Tab if !shift => {
+                        edited = true;
+                        column::apply(&mut doc.text, &mut sel, Edit::Insert("\t"))
+                    }
                     Key::ArrowLeft if !modifiers.command && !modifiers.alt => sel.move_by(-1, shift, &doc.text),
                     Key::ArrowRight if !modifiers.command && !modifiers.alt => sel.move_by(1, shift, &doc.text),
                     Key::Home => sel.home_end(false, shift),
@@ -2364,10 +2449,34 @@ fn column_input(ui: &mut egui::Ui, doc: &mut Doc) {
         }
     }
     ui.input_mut(|i| i.events = rest);
+    if edited {
+        doc.version += 1;
+        doc.edited_at = Some(Instant::now());
+    }
     if let Some(t) = copied {
         ui.ctx().copy_text(t);
     }
     doc.column = (!exit).then_some(sel);
+}
+
+/// Dimmed blame text after the end of the cursor's line (single-line selection only).
+fn paint_inline_blame(ui: &egui::Ui, out: &egui::text_edit::TextEditOutput, text: &str) {
+    let Some(range) = out.state.cursor.char_range() else { return };
+    let cursor = out.galley.layout_from_cursor(range.primary);
+    if !range.is_empty() && cursor.row != out.galley.layout_from_cursor(range.secondary).row {
+        return;
+    }
+    let Some(row) = out.galley.rows.get(cursor.row) else { return };
+    let rect = row.rect().translate(out.galley_pos.to_vec2());
+    let font = egui::TextStyle::Monospace.resolve(ui.style());
+    let color = ui.visuals().weak_text_color().gamma_multiply(0.8);
+    ui.painter().text(
+        egui::pos2(rect.max.x + 32.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        text,
+        font,
+        color,
+    );
 }
 
 /// Middle dots for spaces and arrows for tabs, on the visible rows only.
