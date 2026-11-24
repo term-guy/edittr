@@ -21,6 +21,7 @@ mod lsp;
 mod outline;
 mod replace;
 mod search;
+mod server_check;
 mod session;
 mod settings;
 mod svn;
@@ -40,6 +41,16 @@ fn main() -> eframe::Result {
         import_login_shell_path();
     }
 
+    if std::env::args_os().any(|a| a == "--check-servers") {
+        let args: Vec<String> = std::env::args().collect();
+        let bundled = args.iter().any(|a| a == "--bundled");
+        let only = args.iter().position(|a| a == "--only").and_then(|i| args.get(i + 1));
+        std::process::exit(if server_check::run_cli(bundled, only.map(String::as_str)) {
+            0
+        } else {
+            1
+        });
+    }
     if std::env::args_os().any(|a| a == "--list-servers") {
         list_servers();
         return Ok(());

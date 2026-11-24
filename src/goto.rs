@@ -436,143 +436,34 @@ mod tests {
         assert_eq!((t.line, t.cols), (1, 7..13));
     }
 
-    /// Real language server round trip. Needs the server installed; run with
-    /// `cargo test -- --ignored lsp_round_trip_<name>`.
-    fn lsp_round_trip(ext: &str, files: &[(&str, &str)], main: &str, symbol: &str, expect: (&str, usize)) {
-        let dir = std::env::temp_dir().join(format!("edittr-lsp-{ext}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        for (name, body) in files {
-            let p = dir.join(name);
-            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-            std::fs::write(p, body).unwrap();
-        }
-        let dir = std::fs::canonicalize(&dir).unwrap();
-        let (spec, command) = lsp::servers_for(ext)
-            .into_iter()
-            .find_map(|spec| lsp::resolve(spec.command).map(|command| (spec, command)))
-            .expect("server not installed");
-        let launch = Arc::new(lsp::Launch::default());
-        launch.finish(Some(lsp::Client::start(&spec, command, &dir, &[], None).unwrap()));
-        let text = std::fs::read_to_string(dir.join(main)).unwrap();
-        let idx = text.find(symbol).map(|b| text[..b].chars().count()).unwrap() + 1;
-        // Indexing can take a moment: retry until the server answers with a location.
-        let start = std::time::Instant::now();
-        let target = loop {
-            let req = Request {
-                root: dir.clone(),
-                files: Box::new(Vec::new),
-                path: dir.join(main),
-                text: text.clone(),
-                ignored: Vec::new(),
-                char_idx: idx,
-                client: Some(launch.clone()),
-                revision: (0, 0),
-            };
-            match run(req) {
-                Outcome::Found { target, via } if via == spec.name => break target,
-                _ if start.elapsed() < Duration::from_secs(90) => std::thread::sleep(Duration::from_millis(500)),
-                _ => panic!("{} never answered", spec.name),
-            }
-        };
-        std::fs::remove_dir_all(&dir).ok();
-        assert_eq!((target.path.strip_prefix(&dir).unwrap().to_str().unwrap(), target.line), expect);
-    }
-
+    /// Real language server round trips (need the servers installed): see `server_check`.
     #[test]
     #[ignore]
     fn lsp_round_trip_c() {
-        lsp_round_trip(
-            "c",
-            &[
-                ("util.h", "#pragma once\nint add(int a, int b);\n"),
-                ("util.c", "#include \"util.h\"\n\nint add(int a, int b) { return a + b; }\n"),
-                (
-                    "main.c",
-                    "#include \"util.h\"\nint main(void) {\n  int total = add(1, 2);\n  return total;\n}\n",
-                ),
-                ("compile_flags.txt", "-I.\n"),
-            ],
-            "main.c",
-            "add(1",
-            ("util.h", 1), // clangd: definition lives in another TU, so it reports the declaration
-        );
+        crate::server_check::assert_round_trip("c");
     }
 
     #[test]
     #[ignore]
     fn lsp_round_trip_rust() {
-        lsp_round_trip(
-            "rs",
-            &[
-                ("Cargo.toml", "[package]\nname = \"t\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
-                (
-                    "src/util.rs",
-                    "pub struct Point { pub x: i32 }\n\npub fn make() -> Point { Point { x: 1 } }\n",
-                ),
-                (
-                    "src/main.rs",
-                    "mod util;\nfn main() {\n    let p = util::make();\n    println!(\"{}\", p.x);\n}\n",
-                ),
-            ],
-            "src/main.rs",
-            "make()",
-            ("src/util.rs", 2),
-        );
+        crate::server_check::assert_round_trip("rs");
     }
 
     #[test]
     #[ignore]
     fn lsp_round_trip_ts() {
-        lsp_round_trip(
-            "ts",
-            &[
-                ("tsconfig.json", "{ \"compilerOptions\": { \"strict\": true } }\n"),
-                (
-                    "util.ts",
-                    "export const VERSION = 1;\n\nexport function greet(name: string) {\n  return `hi ${name}`;\n}\n",
-                ),
-                ("main.ts", "import { greet } from \"./util\";\n\nconsole.log(greet(\"x\"));\n"),
-            ],
-            "main.ts",
-            "greet(\"x\")",
-            ("util.ts", 2),
-        );
+        crate::server_check::assert_round_trip("ts");
     }
 
     #[test]
     #[ignore]
     fn lsp_round_trip_py() {
-        lsp_round_trip(
-            "py",
-            &[
-                ("util.py", "import os\n\n\ndef greet(name):\n    return f\"hi {name}\"\n"),
-                ("main.py", "from util import greet\n\nprint(greet(\"x\"))\n"),
-            ],
-            "main.py",
-            "greet(\"x\")",
-            ("util.py", 3),
-        );
+        crate::server_check::assert_round_trip("py");
     }
 
     #[test]
     #[ignore]
     fn lsp_round_trip_go() {
-        lsp_round_trip(
-            "go",
-            &[
-                ("go.mod", "module example.com/t\n\ngo 1.21\n"),
-                (
-                    "util.go",
-                    "package main\n\n// Greet says hi.\nfunc Greet(name string) string { return \"hi \" + name }\n",
-                ),
-                (
-                    "main.go",
-                    "package main\n\nimport \"fmt\"\n\nfunc main() { fmt.Println(Greet(\"x\")) }\n",
-                ),
-            ],
-            "main.go",
-            "Greet(\"x\")",
-            ("util.go", 3),
-        );
+        crate::server_check::assert_round_trip("go");
     }
 }

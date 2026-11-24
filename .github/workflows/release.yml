@@ -8,13 +8,16 @@
 #
 # Trigger: push a version tag, e.g.  git tag v0.2.0 && git push origin v0.2.0
 # Manual runs (Actions tab -> release -> Run workflow) build everything and keep
-# the files as workflow artifacts without publishing a release.
+# the files as workflow artifacts without publishing a release; so does a push to
+# the release-check branch. `verify` must pass before anything is published.
 
 name: release
 
 on:
   push:
     tags: ["v*"]
+    # Build and verify every package without publishing (no tag, so no release).
+    branches: ["release-check"]
   workflow_dispatch:
 
 permissions:
@@ -171,9 +174,72 @@ jobs:
           name: linux-${{ matrix.arch }}
           path: dist/*
 
+  # Install / unpack each full package on a fresh runner and run a real go to
+  # definition against every bundled language server (`edittr --check-servers --bundled`
+  # ignores PATH, so the runner's own tools can't hide a broken bundle). Go and Rust
+  # toolchains stay installed: gopls and rust-analyzer need them to load a project.
+  verify:
+    needs: [windows, macos, linux]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: windows-latest, artifact: windows }
+          - { runner: macos-latest, artifact: macos }
+          - { runner: ubuntu-22.04, artifact: linux-x86_64 }
+          # clangd publishes no arm64 Linux build, so that bundle has no C/C++ server.
+          - { runner: ubuntu-22.04-arm, artifact: linux-aarch64, only: "rs,go,ts,py" }
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist
+      - uses: actions/setup-go@v5
+        with: { go-version: stable, cache: false }
+      - name: Rust toolchain (for rust-analyzer)
+        run: command -v cargo || { curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal; echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"; }
+      - name: Check the servers of every full package
+        env:
+          ONLY: ${{ matrix.only }}
+        run: |
+          ls -la dist
+          check() { # <label> <edittr executable>
+            echo "::group::$1"
+            args=(--check-servers --bundled); [ -n "$ONLY" ] && args+=(--only "$ONLY")
+            want=$(( ${#ONLY} ? $(tr ',' '\n' <<< "$ONLY" | wc -l) : 5 ))
+            "$2" "${args[@]}" | tee out.txt; code=${PIPESTATUS[0]}
+            echo "::endgroup::"
+            passed=$(grep -c '^PASS' out.txt || true)
+            if [ "$code" != 0 ] || [ "$passed" != "$want" ]; then
+              echo "::error::$1: $passed of $want language servers passed (exit $code)"; failed=1
+            fi
+          }
+          failed=0
+          case "${{ runner.os }}" in
+            Windows)
+              7z x -y -oportable dist/*-windows-x64-full-portable.zip > /dev/null
+              check "portable zip" "$(ls portable/*/edittr.exe)"
+              setup=$(ls dist/*-windows-x64-full-setup.exe)
+              pwsh -c "Start-Process -Wait -FilePath '$setup' -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/CURRENTUSER','/DIR=C:\\edittr-test'"
+              check "installer" /c/edittr-test/edittr.exe ;;
+            macOS)
+              hdiutil attach -nobrowse -mountpoint /tmp/edittr-dmg dist/*-macos-universal-full.dmg > /dev/null
+              check "dmg" /tmp/edittr-dmg/edittr.app/Contents/MacOS/edittr
+              ditto -x -k dist/*-macos-universal-full.zip zip
+              check "zip" zip/edittr.app/Contents/MacOS/edittr ;;
+            Linux)
+              mkdir tgz && tar -C tgz -xzf dist/*-full.tar.gz
+              check "tar.gz" "$(ls tgz/*/edittr)" ;;
+          esac
+          exit $failed
+
   publish:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [windows, macos, linux]
+    needs: [windows, macos, linux, verify]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
