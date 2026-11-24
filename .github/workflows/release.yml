@@ -211,8 +211,13 @@ jobs:
             echo "::group::$1"
             args=(--check-servers --bundled); [ -n "$ONLY" ] && args+=(--only "$ONLY")
             want=$(( ${#ONLY} ? $(tr ',' '\n' <<< "$ONLY" | wc -l) : 5 ))
-            "$2" "${args[@]}" | tee out.txt; code=${PIPESTATUS[0]}
+            set +e; "$2" "${args[@]}" > out.txt 2>&1; code=$?; set -e
+            cat out.txt
             echo "::endgroup::"
+            # Annotations are readable without signing in to GitHub (logs are not).
+            while IFS= read -r l; do
+              case $l in PASS*) echo "::notice::$1: $l" ;; FAIL*) echo "::error::$1: $l" ;; esac
+            done < out.txt
             passed=$(grep -c '^PASS' out.txt || true)
             if [ "$code" != 0 ] || [ "$passed" != "$want" ]; then
               echo "::error::$1: $passed of $want language servers passed (exit $code)"; failed=1

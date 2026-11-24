@@ -135,7 +135,13 @@ pub fn round_trip(sample: &Sample, bundled_only: bool, timeout: Duration) -> Res
         std::fs::write(p, body).map_err(|e| e.to_string())?;
     }
     let result = (|| {
-        let dir = std::fs::canonicalize(&dir).map_err(|e| e.to_string())?;
+        // macOS's temp dir is behind a symlink that servers resolve. Not on Windows:
+        // canonicalize gives `\\?\C:\...` paths, which servers' file URIs never match.
+        let dir = if cfg!(windows) {
+            dir.clone()
+        } else {
+            std::fs::canonicalize(&dir).map_err(|e| e.to_string())?
+        };
         let launch = Arc::new(lsp::Launch::default());
         launch.finish(Some(lsp::Client::start(&spec, command, &dir, &[], None)?));
         let text = std::fs::read_to_string(dir.join(sample.main)).map_err(|e| e.to_string())?;
@@ -166,7 +172,9 @@ pub fn round_trip(sample: &Sample, bundled_only: bool, timeout: Duration) -> Res
             .unwrap_or(&target.path)
             .to_string_lossy()
             .replace('\\', "/");
-        if (rel.as_str(), target.line) == sample.expect {
+        // Compare the tail only: on Windows the server may spell the temp folder
+        // differently (8.3 short names such as RUNNER~1, drive letter case).
+        if target.path.ends_with(sample.expect.0) && target.line == sample.expect.1 {
             Ok(())
         } else {
             Err(format!(
