@@ -223,7 +223,11 @@ mod tests {
         let first = |modifiers: Modifiers, key: Key| {
             dispatch_order()
                 .iter()
-                .find(|e| e.shortcuts.iter().any(|s| s.logical_key == key && modifiers.matches_logically(s.modifiers)))
+                .find(|e| {
+                    e.shortcuts
+                        .iter()
+                        .any(|s| s.logical_key == key && modifiers.matches_logically(s.modifiers))
+                })
                 .map(|e| e.id)
         };
         assert!(first(CMD_SHIFT, Key::F) == Some(FindInFiles));

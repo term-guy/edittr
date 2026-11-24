@@ -121,6 +121,20 @@ impl Tour {
             let idx = d.text[..b].chars().count() + 2;
             app.go_to_definition(idx, ctx);
         }
+        if name == "diff-side-by-side" {
+            // The right pane is the real editor: click into a line and type, once the
+            // diff (loaded in the background) is showing.
+            if !matches!(app.tabs.get(app.active), Some(Tab::Diff(_))) {
+                self.frames = 1;
+            }
+            let at = egui::pos2(900.0, 209.0);
+            match self.frames {
+                20 => self.click(at, egui::PointerButton::Primary, true),
+                21 => self.click(at, egui::PointerButton::Primary, false),
+                23 => self.inject.push(egui::Event::Text(" // edited in the diff".into())),
+                _ => {}
+            }
+        }
         if name == "tab-menu" {
             // Right-click the first tab: move, press, release on separate frames.
             if let Some(&r) = self.tab_rects.first() {
@@ -191,7 +205,7 @@ impl Tour {
             && app.quick_open.as_ref().is_none_or(|q| q.files_rx.is_none());
         let elapsed = self.started.elapsed();
         let min_frames = match name {
-            "column-select" => 40,
+            "column-select" | "diff-side-by-side" => 40,
             // Give the language server time to answer.
             "lsp-hover" | "lsp-completion" | "c-flags" => 150,
             _ => 10,

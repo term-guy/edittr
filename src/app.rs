@@ -1,6 +1,7 @@
 mod assist;
 mod c_flags;
 mod code_navigation;
+mod diff_edit;
 mod document_save;
 mod find;
 mod gutter;
@@ -186,6 +187,8 @@ struct DiffTab {
     /// First visible row (last frame).
     top_row: usize,
     hscroll: f32,
+    /// Working-copy change: editable side-by-side view (see diff_edit.rs).
+    live: Option<Box<diff_edit::LiveDiff>>,
 }
 
 impl DiffTab {
@@ -221,6 +224,7 @@ impl DiffTab {
             jump,
             top_row: 0,
             hscroll: 0.0,
+            live: None,
         }
     }
 }
@@ -985,7 +989,7 @@ impl App {
                     });
                 });
                 ui.separator();
-                goto = editor(ui, doc, settings, None, &diags, &[], 1).goto;
+                goto = editor(ui, doc, settings, None, &diags, &[], 1, &[]).goto;
             });
         if close {
             self.split = None;
@@ -1095,7 +1099,16 @@ impl App {
                 "working copy"
             };
             let title = format!("{} ({kind})", file_name(&change.path));
-            DiffTab::new(title, repo.join(&change.path), &text)
+            let mut tab = DiffTab::new(title, repo.join(&change.path), &text);
+            // Unstaged changes to a file that still exists can be edited in place.
+            if !staged && change.code != 'D' && repo.join(&change.path).is_file() {
+                let base = match change.code {
+                    '?' | 'A' => Some(String::new()),
+                    _ => vcs.diff_base(&repo, &change.path),
+                };
+                tab.live = base.map(|b| Box::new(diff_edit::LiveDiff::new(b)));
+            }
+            tab
         }));
     }
 
@@ -2191,106 +2204,110 @@ impl App {
             Some(Tab::File(doc)) => self.editorconfig_indent(&doc.path),
             _ => None,
         };
-        match &mut self.tabs[active] {
-            Tab::File(doc) => {
-                if let Some(unit) = editorconfig_indent
-                    && doc.indent != unit
-                {
-                    doc.indent = unit;
-                }
-                let dialog_open = self.quick_open.is_some()
-                    || self.confirm.is_some()
-                    || self.install_prompt.is_some()
-                    || self.open_folder.is_some()
-                    || self.search_replace.confirming()
-                    || self.c_flags.is_open();
-                self.find.bar(ui, doc, dialog_open);
-                let fresh = match self.vcs {
-                    Some(Vcs::Svn) => doc.blame_version.is_some() && !doc.dirty(),
-                    _ => doc.blame_version == Some(doc.version),
-                };
-                let inline = if self.settings.inline_blame && fresh {
-                    let line = doc.line_col().0;
-                    doc.blame.as_ref().and_then(|b| b.line(line)).map(|l| l.describe(blame::now()))
-                } else {
-                    None
-                };
-                let out = editor(ui, doc, self.settings, inline, &diags, &marks, 0);
-                if let Some(idx) = out.goto {
-                    goto_at = Some(idx);
-                }
-                editor_out = Some(out);
-                self.find.after_editor(ui, doc);
-            }
-            Tab::Diff(d) => {
-                ui.horizontal(|ui| {
-                    if ui.button(format!("{} Open file", ic::ARROW_SQUARE_OUT)).clicked() {
-                        open_path = Some(d.path.clone());
+        if self.is_live_diff(active) {
+            open_path = self.live_diff_ui(ui, active);
+        } else {
+            match &mut self.tabs[active] {
+                Tab::File(doc) => {
+                    if let Some(unit) = editorconfig_indent
+                        && doc.indent != unit
+                    {
+                        doc.indent = unit;
                     }
-                    ui.separator();
-                    if ui.selectable_label(!d.inline, format!("{} Side by side", ic::COLUMNS)).clicked() {
-                        d.inline = false;
-                    }
-                    if ui.selectable_label(d.inline, format!("{} Inline", ic::ROWS)).clicked() {
-                        d.inline = true;
-                    }
-                    if !d.inline && !d.blocks.is_empty() {
-                        ui.separator();
-                        let n = d.blocks.len();
-                        let current = d.blocks.iter().rposition(|&b| b <= d.top_row + 3).unwrap_or(0);
-                        if icon_button(ui, ic::ARROW_UP).on_hover_text("Previous change").clicked() {
-                            d.jump = d
-                                .blocks
-                                .iter()
-                                .rev()
-                                .find(|&&b| b + 3 < d.top_row + 3)
-                                .copied()
-                                .or(d.blocks.last().copied());
-                        }
-                        if icon_button(ui, ic::ARROW_DOWN).on_hover_text("Next change").clicked() {
-                            d.jump = d.blocks.iter().find(|&&b| b > d.top_row + 3).copied().or(d.blocks.first().copied());
-                        }
-                        ui.weak(format!("change {} of {n}", current + 1));
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.colored_label(diff_colors(ui.visuals().dark_mode).1, format!("−{}", d.removed));
-                        ui.colored_label(diff_colors(ui.visuals().dark_mode).0, format!("+{}", d.added));
-                    });
-                });
-                if d.inline {
-                    diff_view(ui, &d.lines, "diff");
-                } else {
-                    side_by_side_view(ui, d);
-                }
-            }
-            Tab::Large(v) => large_view(ui, v),
-            Tab::Graph => {
-                let Some(graph) = &self.graph else {
-                    ui.label(if self.graph_rx.is_some() {
-                        "Loading history…"
+                    let dialog_open = self.quick_open.is_some()
+                        || self.confirm.is_some()
+                        || self.install_prompt.is_some()
+                        || self.open_folder.is_some()
+                        || self.search_replace.confirming()
+                        || self.c_flags.is_open();
+                    self.find.bar(ui, doc, dialog_open);
+                    let fresh = match self.vcs {
+                        Some(Vcs::Svn) => doc.blame_version.is_some() && !doc.dirty(),
+                        _ => doc.blame_version == Some(doc.version),
+                    };
+                    let inline = if self.settings.inline_blame && fresh {
+                        let line = doc.line_col().0;
+                        doc.blame.as_ref().and_then(|b| b.line(line)).map(|l| l.describe(blame::now()))
                     } else {
-                        "No history to show."
-                    });
-                    return;
-                };
-                let mut clicked = None;
-                egui::Panel::bottom("commit_detail")
-                    .resizable(true)
-                    .default_size(260.0)
-                    .show(ui, |ui| {
-                        if self.graph_detail_rx.is_some() {
-                            ui.weak("Loading commit details…");
-                        } else if self.graph_detail.is_empty() {
-                            ui.weak("Select a commit to see its details.");
-                        } else {
-                            diff_view(ui, &self.graph_detail, "detail");
+                        None
+                    };
+                    let out = editor(ui, doc, self.settings, inline, &diags, &marks, 0, &[]);
+                    if let Some(idx) = out.goto {
+                        goto_at = Some(idx);
+                    }
+                    editor_out = Some(out);
+                    self.find.after_editor(ui, doc);
+                }
+                Tab::Diff(d) => {
+                    ui.horizontal(|ui| {
+                        if ui.button(format!("{} Open file", ic::ARROW_SQUARE_OUT)).clicked() {
+                            open_path = Some(d.path.clone());
                         }
+                        ui.separator();
+                        if ui.selectable_label(!d.inline, format!("{} Side by side", ic::COLUMNS)).clicked() {
+                            d.inline = false;
+                        }
+                        if ui.selectable_label(d.inline, format!("{} Inline", ic::ROWS)).clicked() {
+                            d.inline = true;
+                        }
+                        if !d.inline && !d.blocks.is_empty() {
+                            ui.separator();
+                            let n = d.blocks.len();
+                            let current = d.blocks.iter().rposition(|&b| b <= d.top_row + 3).unwrap_or(0);
+                            if icon_button(ui, ic::ARROW_UP).on_hover_text("Previous change").clicked() {
+                                d.jump = d
+                                    .blocks
+                                    .iter()
+                                    .rev()
+                                    .find(|&&b| b + 3 < d.top_row + 3)
+                                    .copied()
+                                    .or(d.blocks.last().copied());
+                            }
+                            if icon_button(ui, ic::ARROW_DOWN).on_hover_text("Next change").clicked() {
+                                d.jump = d.blocks.iter().find(|&&b| b > d.top_row + 3).copied().or(d.blocks.first().copied());
+                            }
+                            ui.weak(format!("change {} of {n}", current + 1));
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.colored_label(diff_colors(ui.visuals().dark_mode).1, format!("−{}", d.removed));
+                            ui.colored_label(diff_colors(ui.visuals().dark_mode).0, format!("+{}", d.added));
+                        });
                     });
-                egui::CentralPanel::default().show(ui, |ui| {
-                    clicked = graph.ui(ui, self.graph_sel);
-                });
-                if let Some(r) = clicked {
-                    self.load_graph_detail(r);
+                    if d.inline {
+                        diff_view(ui, &d.lines, "diff");
+                    } else {
+                        side_by_side_view(ui, d);
+                    }
+                }
+                Tab::Large(v) => large_view(ui, v),
+                Tab::Graph => {
+                    let Some(graph) = &self.graph else {
+                        ui.label(if self.graph_rx.is_some() {
+                            "Loading history…"
+                        } else {
+                            "No history to show."
+                        });
+                        return;
+                    };
+                    let mut clicked = None;
+                    egui::Panel::bottom("commit_detail")
+                        .resizable(true)
+                        .default_size(260.0)
+                        .show(ui, |ui| {
+                            if self.graph_detail_rx.is_some() {
+                                ui.weak("Loading commit details…");
+                            } else if self.graph_detail.is_empty() {
+                                ui.weak("Select a commit to see its details.");
+                            } else {
+                                diff_view(ui, &self.graph_detail, "detail");
+                            }
+                        });
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        clicked = graph.ui(ui, self.graph_sel);
+                    });
+                    if let Some(r) = clicked {
+                        self.load_graph_detail(r);
+                    }
                 }
             }
         }
@@ -2793,7 +2810,7 @@ mod folder_picker {
 // -------------------------------------------------------------- widgets
 
 /// Draws the editor. Returns a char index when the user Ctrl/Cmd+clicked a symbol.
-/// Draws the editor. Returns a char index when the user Ctrl/Cmd+clicked a symbol.
+#[allow(clippy::too_many_arguments)]
 fn editor(
     ui: &mut egui::Ui,
     doc: &mut Doc,
@@ -2802,6 +2819,7 @@ fn editor(
     diags: &[(usize, usize, usize, usize, Color32, String)],
     find_marks: &[std::ops::Range<usize>],
     pane: u8,
+    line_bg: &[(usize, Color32)],
 ) -> EditorOut {
     let id = ui.make_persistent_id(("editor", doc.id, pane));
     // A pending selection from elsewhere (search hit, go to definition): char range.
@@ -2823,6 +2841,7 @@ fn editor(
         comment: doc.comment,
         minimap: settings.minimap,
         bracket_colors: settings.bracket_colors,
+        read_only: false,
     };
     // Diagnostics: (line, char col) pairs to byte ranges.
     let squiggles: Vec<(std::ops::Range<usize>, Color32)> = {
@@ -2861,6 +2880,7 @@ fn editor(
         squiggles: &squiggles,
         marks: &marks,
         gutter: &gutter_marks,
+        line_bg,
     };
     let before = doc.version;
     let out = editor::show(ui, id, &mut doc.ed, &mut doc.text, &mut doc.version, &mut doc.hl, &opts, &extras);
@@ -2889,6 +2909,7 @@ fn editor(
         caret: out.caret_rect,
         changed: out.changed,
         focused: out.focused,
+        top_line: out.top_line,
     }
 }
 
@@ -2993,6 +3014,8 @@ pub(super) struct EditorOut {
     caret: Option<egui::Rect>,
     changed: bool,
     focused: bool,
+    /// First visible line (fractional), for syncing two panes.
+    top_line: f32,
 }
 
 fn diff_view(ui: &mut egui::Ui, lines: &[String], id: &str) {

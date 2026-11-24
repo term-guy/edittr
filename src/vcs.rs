@@ -137,6 +137,14 @@ impl Vcs {
         }
     }
 
+    /// What a working-copy diff compares against (git: the index, svn: BASE); local.
+    pub fn diff_base(self, root: &Path, rel: &str) -> Option<String> {
+        match self {
+            Self::Git => git::run(root, &["show", &format!(":{rel}")]).ok(),
+            Self::Svn => svn::cat_base(root, rel).ok(),
+        }
+    }
+
     pub fn show_commit(self, root: &Path, rev: &str) -> String {
         match self {
             Self::Git => git::show_commit(root, rev),

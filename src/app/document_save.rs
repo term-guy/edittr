@@ -48,8 +48,10 @@ struct Prepared {
 
 impl App {
     pub(super) fn save_active(&mut self) {
+        // In an editable diff, save the file being edited there.
+        let index = self.live_diff_doc(self.active).unwrap_or(self.active);
         self.request_document_action(
-            self.active,
+            index,
             Action::Save {
                 format: self.settings.format_on_save,
             },

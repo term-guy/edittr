@@ -56,12 +56,19 @@ pub struct State {
     view_key: Option<(u64, Vec<usize>)>,
     /// Vertical scroll offset to apply next frame (minimap clicks).
     scroll_to: Option<f32>,
+    /// Line (fractional) to put at the top next frame (`scroll_to_line`).
+    scroll_line: Option<f32>,
     minimap_drag: bool,
     /// Bracket nesting depth at the start of each line, for a version of the text.
     depth: (Option<u64>, Arc<Vec<u32>>),
 }
 
 impl State {
+    /// Scroll so that `line` (fractional) is at the top on the next frame.
+    pub fn scroll_to_line(&mut self, line: f32) {
+        self.scroll_line = Some(line.max(0.0));
+    }
+
     pub fn primary(&self) -> Sel {
         self.sels.last().copied().unwrap_or(Sel::caret(0))
     }
@@ -174,6 +181,8 @@ pub struct Options<'a> {
     pub minimap: bool,
     /// Color brackets by nesting depth.
     pub bracket_colors: bool,
+    /// Selecting, copying, finding and scrolling only (e.g. the base side of a diff).
+    pub read_only: bool,
 }
 
 /// Decorations supplied by the app.
@@ -188,6 +197,8 @@ pub struct Extras<'a> {
     /// Gutter markers per line (e.g. added / modified lines vs. git); `true` draws a
     /// "lines deleted above" triangle instead of a bar.
     pub gutter: &'a [(usize, Color32, bool)],
+    /// Full-width line backgrounds (e.g. changed lines in a diff).
+    pub line_bg: &'a [(usize, Color32)],
 }
 
 #[derive(Default)]
@@ -200,6 +211,8 @@ pub struct Output {
     /// Screen position of the primary caret (for popups such as completion).
     pub caret_rect: Option<Rect>,
     pub focused: bool,
+    /// The (fractional) line at the top of the view, for keeping two editors in sync.
+    pub top_line: f32,
 }
 
 struct Layout<'a> {
@@ -459,6 +472,11 @@ pub fn show(
     let mini_rect = Rect::from_min_max(Pos2::new(full.max.x - mini_w, full.min.y), full.max);
     let mut main_ui = ui.new_child(egui::UiBuilder::new().max_rect(main_rect));
     let mut area = egui::ScrollArea::both().id_salt(id.with("scroll")).auto_shrink([false, false]);
+    if let Some(line) = st.scroll_line.take() {
+        let whole = (line.floor() as usize).min(view.count().saturating_sub(1));
+        let row = if view.is_hidden(whole) { whole } else { view.row(whole) };
+        st.scroll_to = Some((row as f32 + line.fract()) * row_h);
+    }
     if let Some(y) = st.scroll_to.take() {
         area = area.vertical_scroll_offset(y.max(0.0));
     }
@@ -498,6 +516,13 @@ pub fn show(
         let single_line = ix.line_of_byte(primary.anchor) == pl;
         let galleys: Vec<(usize, Arc<egui::Galley>)> = vis_lines.iter().map(|&l| (l, lines.galley(l))).collect();
 
+        for &(l, color) in extras.line_bg {
+            if shown(l) {
+                let y = lay.line_y(l);
+                let band = Rect::from_min_max(Pos2::new(clip.min.x - gutter_w, y), Pos2::new(clip.max.x, y + row_h));
+                ui.painter().with_clip_rect(ui.clip_rect()).rect_filled(band, 0.0, color);
+            }
+        }
         if opts.current_line && single_line && st.sels.len() == 1 && shown(pl) {
             let y = lay.line_y(pl);
             let band = Rect::from_min_max(Pos2::new(clip.min.x - gutter_w, y), Pos2::new(clip.max.x, y + row_h));
@@ -665,6 +690,11 @@ pub fn show(
         ptr
     });
     ui.allocate_rect(full, Sense::hover());
+    {
+        let rows = scroll.state.clamped_offset().y / row_h;
+        let row = (rows.floor() as usize).min(view.count().saturating_sub(1));
+        out.top_line = view.line(row) as f32 + rows.fract();
+    }
     if mini_w > 0.0 {
         minimap(ui, id, st, text, &ix, &view, spans, mini_rect, &scroll, row_h);
     }
@@ -1031,6 +1061,27 @@ fn closer(c: char) -> Option<char> {
 
 /// Returns true when the text changed.
 fn handle_event(ui: &egui::Ui, st: &mut State, text: &mut String, version: &mut u64, k: &KeyCtx, ev: &Event) -> bool {
+    if k.opts.read_only {
+        let edits = match ev {
+            Event::Text(_) | Event::Paste(_) | Event::Ime(egui::ImeEvent::Commit(_)) => true,
+            Event::Key {
+                key,
+                pressed: true,
+                modifiers: m,
+                ..
+            } => {
+                matches!(key, Key::Backspace | Key::Delete | Key::Enter | Key::Tab)
+                    || m.command && matches!(key, Key::Z | Key::Y | Key::Slash)
+            }
+            _ => false,
+        };
+        if edits {
+            return false;
+        }
+        if matches!(ev, Event::Cut) {
+            return handle_event(ui, st, text, version, k, &Event::Copy);
+        }
+    }
     let changed = match ev {
         Event::Text(t) if !t.is_empty() => {
             insert(st, text, t, Kind::Typing);
@@ -1533,6 +1584,7 @@ mod tests {
         hl: highlight::Cache,
         id: egui::Id,
         clipboard: Option<String>,
+        read_only: bool,
     }
 
     impl Harness {
@@ -1545,6 +1597,7 @@ mod tests {
                 hl: Default::default(),
                 id: egui::Id::NULL.with("test-editor"),
                 clipboard: None,
+                read_only: false,
             };
             let id = h.id;
             h.ctx.memory_mut(|m| m.request_focus(id));
@@ -1560,7 +1613,14 @@ mod tests {
                 ..Default::default()
             };
             let mut out = Output::default();
-            let (st, text, version, hl, id) = (&mut self.st, &mut self.text, &mut self.version, &mut self.hl, self.id);
+            let (st, text, version, hl, id, read_only) = (
+                &mut self.st,
+                &mut self.text,
+                &mut self.version,
+                &mut self.hl,
+                self.id,
+                self.read_only,
+            );
             let mut full = self.ctx.run_ui(input, |ui| {
                 let opts = Options {
                     lang: "rs",
@@ -1571,6 +1631,7 @@ mod tests {
                     comment: Some("//"),
                     minimap: false,
                     bracket_colors: true,
+                    read_only,
                 };
                 out = show(ui, id, st, text, version, hl, &opts, &Extras::default());
             });
@@ -1599,6 +1660,26 @@ mod tests {
     }
 
     const NONE: egui::Modifiers = egui::Modifiers::NONE;
+
+    #[test]
+    fn read_only_selects_and_copies_but_never_edits() {
+        let mut h = Harness::new("base text\nline two\n");
+        h.read_only = true;
+        h.key(Key::A, egui::Modifiers::COMMAND);
+        h.frame(vec![Event::Copy]);
+        assert_eq!(h.clipboard.as_deref(), Some("base text\nline two\n"));
+        h.typ("x");
+        h.frame(vec![Event::Paste("pasted".into()), Event::Cut]);
+        for key in [Key::Backspace, Key::Delete, Key::Enter, Key::Tab] {
+            h.key(key, NONE);
+        }
+        h.key(Key::Slash, egui::Modifiers::COMMAND);
+        h.key(Key::Z, egui::Modifiers::COMMAND);
+        assert_eq!(h.text, "base text\nline two\n");
+        assert_eq!(h.version, 0);
+        // Cut copies instead.
+        assert_eq!(h.clipboard.as_deref(), Some("base text\nline two\n"));
+    }
 
     #[test]
     fn typing_navigation_and_undo() {
