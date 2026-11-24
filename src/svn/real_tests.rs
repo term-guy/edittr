@@ -120,6 +120,32 @@ fn change(path: &str, code: char) -> FileChange {
     FileChange { path: path.into(), code }
 }
 
+#[test]
+#[ignore = "requires svn"]
+fn diff_can_ignore_crlf_only_changes() {
+    let scratch = Scratch::new().unwrap();
+    let root = scratch.0.canonicalize().unwrap();
+    checked(
+        command(&root, "svnadmin").args(["create", "repo"]).output().unwrap(),
+        "svnadmin create",
+    );
+    let url = url::Url::from_directory_path(root.join("repo")).unwrap();
+    cli(&root, &["checkout", "--quiet", url.as_str(), "wc"]);
+    let wc = root.join("wc");
+    write(&wc, "file.txt", "a\r\nb\r\n");
+    cli(&wc, &["add", "file.txt"]);
+    cli(&wc, &["commit", "-m", "Initial"]);
+
+    let file = change("file.txt", 'M');
+    write(&wc, "file.txt", "a\nb\n");
+    let filtered = SVN.diff(&wc, &file, false, true);
+    assert!(filtered.text.is_empty());
+    assert!(filtered.only_line_endings);
+    assert!(SVN.diff(&wc, &file, false, false).text.contains("@@ "));
+    write(&wc, "file.txt", "a\nb");
+    assert!(SVN.diff(&wc, &file, false, true).text.contains("No newline at end of file"));
+}
+
 fn timed<T>(label: &str, f: impl FnOnce() -> T) -> (T, Duration) {
     let start = Instant::now();
     let result = f();
@@ -215,19 +241,27 @@ fn svn_real_working_copy_operations() {
     let listed = vcs::list_files(&nested, Some(SVN)).unwrap();
     assert_eq!(listed, ["crlf.txt", "data.bin", "中文 @ & spaces.txt"]);
 
-    assert!(SVN.diff(&wc, &change(text, 'M'), false).contains("+changed"));
-    let crlf_diff = side_by_side(&SVN.diff(&wc, &change(crlf, 'M'), false));
+    assert!(SVN.diff(&wc, &change(text, 'M'), false, false).text.contains("+changed"));
+    let crlf_diff = side_by_side(&SVN.diff(&wc, &change(crlf, 'M'), false, false).text);
     assert_eq!(
         crlf_diff.rows.iter().map(|row| row.kind).collect::<Vec<_>>(),
         [Kind::Same, Kind::Changed]
     );
-    assert!(SVN.diff(&wc, &change(binary, 'M'), false).contains("binary"));
-    assert!(SVN.diff(&wc, &change(props, 'M'), false).contains("Added: test:prop"));
-    assert!(SVN.diff(&wc, &change(missing, 'D'), false).contains("-two"));
-    assert!(SVN.diff(&wc, &change(deleted, 'D'), false).contains("-two"));
-    assert!(SVN.diff(&wc, &change(renamed, 'A'), false).contains("+one"));
-    assert!(SVN.diff(&wc, &change("new added.txt", 'A'), false).contains("+scheduled"));
-    assert!(SVN.diff(&wc, &change("new & loose.txt", '?'), false).contains("+unscheduled"));
+    assert!(SVN.diff(&wc, &change(binary, 'M'), false, false).text.contains("binary"));
+    assert!(SVN.diff(&wc, &change(props, 'M'), false, false).text.contains("Added: test:prop"));
+    assert!(SVN.diff(&wc, &change(missing, 'D'), false, false).text.contains("-two"));
+    assert!(SVN.diff(&wc, &change(deleted, 'D'), false, false).text.contains("-two"));
+    assert!(SVN.diff(&wc, &change(renamed, 'A'), false, false).text.contains("+one"));
+    assert!(
+        SVN.diff(&wc, &change("new added.txt", 'A'), false, false)
+            .text
+            .contains("+scheduled")
+    );
+    assert!(
+        SVN.diff(&wc, &change("new & loose.txt", '?'), false, false)
+            .text
+            .contains("+unscheduled")
+    );
     assert!(SVN.base_text(&wc, "new & loose.txt").is_none());
 
     let log = SVN.log(&wc, 20, |_| {}).unwrap();
@@ -355,10 +389,11 @@ fn svn_real_large_changes() {
     }
 
     timed("working-copy diffs (modified, missing, unversioned)", || {
-        assert!(SVN.diff(wc, &change(&path(0), 'M'), false).contains("+changed"));
-        assert!(SVN.diff(wc, &change(&path(5_000), 'D'), false).contains("-first"));
+        assert!(SVN.diff(wc, &change(&path(0), 'M'), false, false).text.contains("+changed"));
+        assert!(SVN.diff(wc, &change(&path(5_000), 'D'), false, false).text.contains("-first"));
         assert!(
-            SVN.diff(wc, &change(&path(6_000).replace(".txt", " added 中文.txt"), '?'), false)
+            SVN.diff(wc, &change(&path(6_000).replace(".txt", " added 中文.txt"), '?'), false, false)
+                .text
                 .contains("+added")
         );
     });

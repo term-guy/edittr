@@ -1,6 +1,6 @@
 //! Source control operations. Callers run CLI and cache work off the UI thread.
 
-use crate::{git, svn};
+use crate::{diff::FileDiff, git, svn};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -84,10 +84,14 @@ impl Vcs {
         Ok(status)
     }
 
-    pub fn diff(self, root: &Path, change: &FileChange, staged: bool) -> String {
+    pub fn diff(self, root: &Path, change: &FileChange, staged: bool, ignore_eol: bool) -> FileDiff {
         match self {
-            Self::Git => git::diff(root, change, staged),
-            Self::Svn => svn::diff(root, change),
+            Self::Git => git::diff(root, change, staged, ignore_eol),
+            Self::Svn => {
+                let text = svn::diff(root, change, ignore_eol);
+                let unfiltered = (ignore_eol && text.is_empty()).then(|| svn::diff(root, change, false));
+                FileDiff::new(text, unfiltered.as_deref())
+            }
         }
     }
 

@@ -191,12 +191,30 @@ struct DiffTab {
     /// First visible row (last frame).
     top_row: usize,
     hscroll: f32,
+    source: DiffSource,
+    ignore_eol: bool,
+    only_line_endings: bool,
     /// Working-copy change: editable side-by-side view (see diff_edit.rs).
     live: Option<Box<diff_edit::LiveDiff>>,
 }
 
+#[derive(Clone)]
+enum DiffSource {
+    Vcs {
+        repo: PathBuf,
+        vcs: Vcs,
+        change: FileChange,
+        staged: bool,
+    },
+    Disk {
+        disk: Arc<str>,
+        editor: Arc<str>,
+        editor_crlf: bool,
+    },
+}
+
 impl DiffTab {
-    fn new(title: String, path: PathBuf, text: &str) -> Self {
+    fn new(title: String, path: PathBuf, text: &str, source: DiffSource, ignore_eol: bool, only_line_endings: bool) -> Self {
         use crate::diff::Kind;
         let sbs = crate::diff::side_by_side(text);
         let changed = |k: Kind| matches!(k, Kind::Changed | Kind::Added | Kind::Removed);
@@ -228,6 +246,9 @@ impl DiffTab {
             jump,
             top_row: 0,
             hscroll: 0.0,
+            source,
+            ignore_eol,
+            only_line_endings,
             live: None,
         }
     }
@@ -352,7 +373,7 @@ pub struct App {
     graph_rx: Option<Receiver<Result<Graph, String>>>,
     graph_detail_rx: Option<Receiver<Vec<String>>>,
     graph_dialog: Option<graph_menu::GraphDialog>,
-    diff_rx: Option<Receiver<DiffTab>>,
+    diff_rx: Option<Receiver<(DiffTab, bool)>>,
 
     bg_task: Option<VcsJob>,
     message: String,
@@ -945,9 +966,27 @@ impl App {
         if let Some(detail) = receive(&mut self.graph_detail_rx) {
             self.graph_detail = detail;
         }
-        if let Some(mut tab) = receive(&mut self.diff_rx) {
-            tab.inline = matches!(self.tabs.iter().find(|t| matches!(t, Tab::Diff(_))), Some(Tab::Diff(d)) if d.inline);
-            self.show_tab(Tab::Diff(Box::new(tab)));
+        if let Some((mut tab, refresh)) = receive(&mut self.diff_rx) {
+            let current = self.tabs.iter_mut().find_map(|t| match t {
+                Tab::Diff(d) => Some(d),
+                _ => None,
+            });
+            if refresh && current.is_none() {
+                return;
+            }
+            if tab.ignore_eol != self.settings.diff_ignore_eol {
+                self.load_diff(tab.title, tab.path, tab.source, refresh);
+            } else if let Some(current) = current {
+                tab.inline = current.inline;
+                if refresh {
+                    tab.live = current.live.take();
+                    **current = tab;
+                } else {
+                    self.show_tab(Tab::Diff(Box::new(tab)));
+                }
+            } else {
+                self.show_tab(Tab::Diff(Box::new(tab)));
+            }
         }
     }
 
@@ -1069,7 +1108,7 @@ impl App {
             self.active = self.tabs.len() - 1;
             return;
         }
-        let DiskText { text, crlf } = match read_doc_text(path) {
+        let DiskText { text, crlf, .. } = match read_doc_text(path) {
             Ok(Some(text)) => text,
             Ok(None) => {
                 self.message = format!("{} looks binary; not opening", path.display());
@@ -1137,10 +1176,14 @@ impl App {
                 doc.version += 1;
             }
             DiskAction::Compare => {
-                let diff = disk_vs_editor(&doc.path, &disk.text, &doc.text);
                 let title = format!("{} (on disk ↔ editor)", doc.name());
-                let tab = DiffTab::new(title, doc.path.clone(), &diff);
-                self.show_tab(Tab::Diff(Box::new(tab)));
+                let path = doc.path.clone();
+                let source = DiffSource::Disk {
+                    disk: disk.raw_crlf.unwrap_or_else(|| Arc::from(disk.text)),
+                    editor: Arc::from(doc.text.as_str()),
+                    editor_crlf: doc.crlf,
+                };
+                self.load_diff(title, path, source, false);
             }
         }
     }
@@ -1159,27 +1202,66 @@ impl App {
 
     fn open_diff(&mut self, change: &FileChange, staged: bool) {
         let Some((repo, vcs)) = self.repository() else { return };
-        let change = change.clone();
+        let kind = if staged {
+            "staged"
+        } else if vcs.has_index() {
+            "working tree"
+        } else {
+            "working copy"
+        };
+        let title = format!("{} ({kind})", file_name(&change.path));
+        let path = repo.join(&change.path);
+        let source = DiffSource::Vcs {
+            repo,
+            vcs,
+            change: change.clone(),
+            staged,
+        };
+        self.load_diff(title, path, source, false);
+    }
+
+    fn refresh_diff(&mut self) {
+        if self.diff_rx.is_some() {
+            return;
+        }
+        if let Some(d) = self.tabs.iter().find_map(|tab| match tab {
+            Tab::Diff(d) if (d.inline || d.live.is_none()) && d.ignore_eol != self.settings.diff_ignore_eol => Some(d),
+            _ => None,
+        }) {
+            self.load_diff(d.title.clone(), d.path.clone(), d.source.clone(), true);
+        }
+    }
+
+    fn load_diff(&mut self, title: String, path: PathBuf, source: DiffSource, refresh: bool) {
+        let ignore_eol = self.settings.diff_ignore_eol;
         self.diff_rx = Some(background(&self.ctx, move || {
-            let text = vcs.diff(&repo, &change, staged);
-            let kind = if staged {
-                "staged"
-            } else if vcs.has_index() {
-                "working tree"
-            } else {
-                "working copy"
+            let mut live = None;
+            let (text, only_line_endings) = match &source {
+                DiffSource::Vcs { repo, vcs, change, staged } => {
+                    let diff = vcs.diff(repo, change, *staged, ignore_eol);
+                    // Unstaged changes can be edited in place. Load both sides off the UI thread.
+                    if !refresh
+                        && !staged
+                        && change.code != 'D'
+                        && path.is_file()
+                        && let Ok(Some(disk)) = read_doc_text(&path)
+                    {
+                        let base = match change.code {
+                            '?' | 'A' => Some(String::new()),
+                            _ => vcs.diff_base(repo, &change.path),
+                        };
+                        live = base.map(|base| Box::new(diff_edit::LiveDiff::new(base, Some(disk))));
+                    }
+                    (diff.text, diff.only_line_endings)
+                }
+                DiffSource::Disk { disk, editor, editor_crlf } => {
+                    let editor = crate::diff::with_editor_eol(editor, *editor_crlf);
+                    disk_vs_editor(&path, disk, &editor, ignore_eol)
+                }
             };
-            let title = format!("{} ({kind})", file_name(&change.path));
-            let mut tab = DiffTab::new(title, repo.join(&change.path), &text);
-            // Unstaged changes to a file that still exists can be edited in place.
-            if !staged && change.code != 'D' && repo.join(&change.path).is_file() {
-                let base = match change.code {
-                    '?' | 'A' => Some(String::new()),
-                    _ => vcs.diff_base(&repo, &change.path),
-                };
-                tab.live = base.map(|b| Box::new(diff_edit::LiveDiff::new(b)));
-            }
-            tab
+            let mut tab = DiffTab::new(title, path, &text, source, ignore_eol, only_line_endings);
+            tab.live = live;
+            (tab, refresh)
         }));
     }
 
@@ -2455,6 +2537,7 @@ impl App {
         };
         if self.is_live_diff(active) {
             open_path = self.live_diff_ui(ui, active);
+            self.refresh_diff();
         } else {
             match &mut self.tabs[active] {
                 Tab::File(doc) => {
@@ -2489,6 +2572,7 @@ impl App {
                     self.find.after_editor(ui, doc);
                 }
                 Tab::Diff(d) => {
+                    let mut ignore_eol = self.settings.diff_ignore_eol;
                     ui.horizontal(|ui| {
                         if ui.button(format!("{} Open file", ic::ARROW_SQUARE_OUT)).clicked() {
                             open_path = Some(d.path.clone());
@@ -2500,6 +2584,7 @@ impl App {
                         if ui.selectable_label(d.inline, format!("{} Inline", ic::ROWS)).clicked() {
                             d.inline = true;
                         }
+                        ui.checkbox(&mut ignore_eol, "Ignore line endings");
                         if !d.inline && !d.blocks.is_empty() {
                             ui.separator();
                             let n = d.blocks.len();
@@ -2523,11 +2608,19 @@ impl App {
                             ui.colored_label(diff_colors(ui.visuals().dark_mode).0, format!("+{}", d.added));
                         });
                     });
-                    if d.inline {
+                    if ignore_eol != self.settings.diff_ignore_eol {
+                        self.run_command(Command::ToggleSetting(Setting::DiffIgnoreEol));
+                    } else if d.ignore_eol != ignore_eol {
+                        ui.weak("Loading diff…");
+                    } else if d.only_line_endings {
+                        ui.add_space(20.0);
+                        ui.vertical_centered(|ui| ui.weak("Only line endings differ"));
+                    } else if d.inline {
                         diff_view(ui, &d.lines, "diff");
                     } else {
                         side_by_side_view(ui, d);
                     }
+                    self.refresh_diff();
                 }
                 Tab::Large(v) => large_view(ui, v),
                 Tab::Graph => {
@@ -3840,6 +3933,7 @@ fn save_recent(list: &[PathBuf]) {
 struct DiskText {
     text: String,
     crlf: bool,
+    raw_crlf: Option<Arc<str>>,
 }
 
 #[derive(Clone, Copy)]
@@ -3893,18 +3987,15 @@ fn disk_changed_bar(ui: &mut egui::Ui, doc: &Doc) -> Option<DiskAction> {
 }
 
 /// Unified diff from the disk version to the editor text, as `DiffTab` shows it.
-fn disk_vs_editor(path: &Path, disk: &str, editor: &str) -> String {
+fn disk_vs_editor(path: &Path, disk: &str, editor: &str, ignore_eol: bool) -> (String, bool) {
+    let hunks = crate::diff::unified_hunks(disk, editor, ignore_eol, 3, str::to_owned);
+    if hunks.is_empty() {
+        return (hunks, disk != editor);
+    }
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let diff = similar::TextDiff::from_lines(disk, editor);
-    let mut out = format!("diff --git a/{name} b/{name}\n");
-    out.push_str(
-        &diff
-            .unified_diff()
-            .context_radius(3)
-            .header(&format!("a/{name} (on disk)"), &format!("b/{name} (in the editor)"))
-            .to_string(),
-    );
-    out
+    let mut out = format!("diff --git a/{name} b/{name}\n--- a/{name} (on disk)\n+++ b/{name} (in the editor)\n");
+    out.push_str(&hunks);
+    (out, false)
 }
 
 fn read_doc_text(path: &Path) -> std::io::Result<Option<DiskText>> {
@@ -3913,6 +4004,7 @@ fn read_doc_text(path: &Path) -> std::io::Result<Option<DiskText>> {
         let text = String::from_utf8_lossy(&bytes);
         let crlf = text.contains("\r\n");
         DiskText {
+            raw_crlf: crlf.then(|| Arc::from(text.as_ref())),
             text: if crlf { text.replace("\r\n", "\n") } else { text.into_owned() },
             crlf,
         }
@@ -4128,10 +4220,22 @@ mod tests {
 
     #[test]
     fn disk_vs_editor_diff_shows_both_sides() {
-        let diff = super::disk_vs_editor(std::path::Path::new("/p/main.c"), "a\nb\nc\n", "a\nB\nc\nd\n");
-        let tab = super::DiffTab::new("t".into(), "/p/main.c".into(), &diff);
-        assert_eq!((tab.added, tab.removed), (2, 1));
+        let path = std::path::Path::new("/p/main.c");
+        let (diff, only_line_endings) = super::disk_vs_editor(path, "a\r\nb\r\nc\r\n", "a\nB\nc\nd\n", true);
+        assert!(!only_line_endings);
         assert!(diff.contains("(on disk)") && diff.contains("(in the editor)"));
+        assert!(diff.contains("-b\r\n+B\n"));
+        let sides = crate::diff::side_by_side(&diff);
+        let kinds: Vec<_> = sides.rows.iter().map(|row| row.kind).collect();
+        use crate::diff::Kind::*;
+        assert_eq!(kinds, [Same, Changed, Same, Added]);
+        assert_eq!(super::disk_vs_editor(path, "a\r\n", "a\n", true), (String::new(), true));
+        assert!(!super::disk_vs_editor(path, "a\r\n", "a\n", false).0.is_empty());
+        assert!(
+            super::disk_vs_editor(path, "a\r\n", "a", true)
+                .0
+                .contains("No newline at end of file")
+        );
     }
 
     #[test]

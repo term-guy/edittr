@@ -15,6 +15,7 @@ pub(crate) struct Settings {
     pub(crate) highlight_line: bool,
     /// Show spaces as middle dots and tabs as arrows.
     pub(crate) show_whitespace: bool,
+    pub(crate) diff_ignore_eol: bool,
     /// Dimmed "who changed this line" after the cursor's line.
     pub(crate) inline_blame: bool,
     /// Code overview on the right of the editor.
@@ -35,6 +36,7 @@ impl Default for Settings {
             format_on_save: false,
             highlight_line: true,
             show_whitespace: false,
+            diff_ignore_eol: true,
             inline_blame: true,
             minimap: true,
             bracket_colors: true,
@@ -97,6 +99,7 @@ impl Settings {
                     "format_on_save" => settings.format_on_save = value,
                     "highlight_line" => settings.highlight_line = value,
                     "show_whitespace" => settings.show_whitespace = value,
+                    "diff_ignore_eol" => settings.diff_ignore_eol = value,
                     "inline_blame" => settings.inline_blame = value,
                     "minimap" => settings.minimap = value,
                     "bracket_colors" => settings.bracket_colors = value,
@@ -120,6 +123,7 @@ impl Settings {
                     "changes_tree"
                         | "highlight_line"
                         | "show_whitespace"
+                        | "diff_ignore_eol"
                         | "inline_blame"
                         | "minimap"
                         | "bracket_colors"
@@ -138,6 +142,7 @@ impl Settings {
         text.push_str(&format!("changes_tree={}\n", self.changes_tree));
         text.push_str(&format!("highlight_line={}\n", self.highlight_line));
         text.push_str(&format!("show_whitespace={}\n", self.show_whitespace));
+        text.push_str(&format!("diff_ignore_eol={}\n", self.diff_ignore_eol));
         text.push_str(&format!("inline_blame={}\n", self.inline_blame));
         text.push_str(&format!("minimap={}\n", self.minimap));
         text.push_str(&format!("bracket_colors={}\n", self.bracket_colors));
@@ -253,7 +258,7 @@ mod tests {
         let text = settings.format(previous);
         assert_eq!(
             text,
-            "future_key=one=two\nfuture_key = three\n# A comment\nchanges_tree=false\nhighlight_line=false\nshow_whitespace=false\ninline_blame=true\nminimap=true\nbracket_colors=true\nrestore_previous_session=true\nreopen_last_folder=false\nformat_on_save=false\nshow_outline=true\noutline_expanded=true\n"
+            "future_key=one=two\nfuture_key = three\n# A comment\nchanges_tree=false\nhighlight_line=false\nshow_whitespace=false\ndiff_ignore_eol=true\ninline_blame=true\nminimap=true\nbracket_colors=true\nrestore_previous_session=true\nreopen_last_folder=false\nformat_on_save=false\nshow_outline=true\noutline_expanded=true\n"
         );
         assert!(!Settings::parse(&text).changes_tree);
     }
@@ -279,6 +284,20 @@ mod tests {
             ..Settings::default()
         };
         assert!(Settings::parse(&s.format("")).show_whitespace);
+    }
+
+    #[test]
+    fn diff_ignore_eol_round_trip_and_default_on() {
+        assert!(Settings::parse("").diff_ignore_eol);
+        for diff_ignore_eol in [false, true] {
+            let settings = Settings {
+                diff_ignore_eol,
+                ..Settings::default()
+            };
+            let text = settings.format("diff_ignore_eol=maybe\n");
+            assert_eq!(text.matches("diff_ignore_eol=").count(), 1);
+            assert_eq!(Settings::parse(&text).diff_ignore_eol, diff_ignore_eol);
+        }
     }
 
     #[test]

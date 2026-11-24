@@ -288,15 +288,16 @@ pub fn status(root: &Path) -> Result<Status, String> {
     })
 }
 
-pub fn diff(root: &Path, change: &FileChange) -> String {
+pub fn diff(root: &Path, change: &FileChange, ignore_eol: bool) -> String {
     let path = &change.path;
     if change.code == '?' {
         return new_file_diff(root, path).unwrap_or_else(|e| e.to_string());
     }
     // Working-copy diff uses literal paths and does not strip a peg suffix.
+    let options = if ignore_eol { "-U1000000 --ignore-eol-style" } else { "-U1000000" };
     let diff = run(
         root,
-        &["diff", "--internal-diff", "--show-copies-as-adds", "-x", "-U1000000", "--", path],
+        &["diff", "--internal-diff", "--show-copies-as-adds", "-x", options, "--", path],
     );
     // SVN omits files removed outside of `svn delete` from its working-copy diff.
     if change.code == 'D'

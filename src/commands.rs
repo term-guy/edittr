@@ -38,6 +38,7 @@ pub(crate) enum Command {
 pub(crate) enum Setting {
     HighlightLine,
     ShowWhitespace,
+    DiffIgnoreEol,
     InlineBlame,
     ChangesTree,
     RestoreSession,
@@ -53,6 +54,7 @@ impl Setting {
         match self {
             Self::HighlightLine => "Highlight current line",
             Self::ShowWhitespace => "Show whitespace",
+            Self::DiffIgnoreEol => "Diff: ignore line ending differences",
             Self::InlineBlame => "Inline blame (who changed the current line)",
             Self::ChangesTree => "Source Control: view as tree",
             Self::RestoreSession => "Restore previous session",
@@ -68,6 +70,7 @@ impl Setting {
         match self {
             Self::HighlightLine => &mut settings.highlight_line,
             Self::ShowWhitespace => &mut settings.show_whitespace,
+            Self::DiffIgnoreEol => &mut settings.diff_ignore_eol,
             Self::InlineBlame => &mut settings.inline_blame,
             Self::ChangesTree => &mut settings.changes_tree,
             Self::RestoreSession => &mut settings.restore_previous_session,
@@ -192,6 +195,7 @@ pub(crate) const COMMANDS: &[Entry] = &[
     ),
     Entry::new(ToggleSetting(Setting::HighlightLine), "Toggle current line highlight", &[]),
     Entry::new(ToggleSetting(Setting::ShowWhitespace), "Toggle whitespace", &[]),
+    Entry::new(ToggleSetting(Setting::DiffIgnoreEol), "Diff: ignore line ending differences", &[]),
     Entry::new(ToggleSetting(Setting::InlineBlame), "Toggle inline blame", &[]),
     Entry::new(ToggleSetting(Setting::ChangesTree), "Toggle source control tree view", &[]),
     Entry::new(ToggleSetting(Setting::RestoreSession), "Toggle restoring the previous session", &[]),

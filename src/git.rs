@@ -1,6 +1,7 @@
 //! Thin wrapper over the system `git` CLI. Shelling out keeps the binary small
 //! (no libgit2) and always matches the user's git config, hooks and credentials.
 
+use crate::diff::{FileDiff, unified_hunks};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -105,19 +106,82 @@ pub fn status(repo: &Path) -> Result<Status, String> {
 /// Enough context that the diff contains the whole file (for the side-by-side view).
 const FULL_CONTEXT: &str = "--unified=1000000";
 
-pub fn diff(repo: &Path, change: &FileChange, staged: bool) -> String {
+pub fn diff(repo: &Path, change: &FileChange, staged: bool, ignore_eol: bool) -> FileDiff {
+    let text = diff_patch(repo, change, staged, ignore_eol, FULL_CONTEXT);
+    if !ignore_eol || change.code == '?' {
+        return FileDiff::new(text, None);
+    }
+    // Git's CR filter can also suppress a final LF. Look for a real change
+    // to the final newline in the strict patch before accepting the filtered one.
+    let strict = diff_patch(repo, change, staged, false, "--unified=0");
+    if changes_final_newline(&strict) && !changes_final_newline(&text) {
+        let strict = diff_patch(repo, change, staged, false, FULL_CONTEXT);
+        return FileDiff::new(filter_crlf_hunks(&strict), None);
+    }
+    FileDiff::new(text, Some(&strict))
+}
+
+fn changes_final_newline(patch: &str) -> bool {
+    let mut changed = patch
+        .lines()
+        .zip(patch.lines().skip(1))
+        .filter(|(line, next)| line.starts_with(['-', '+']) && next.starts_with("\\ "));
+    changed.next().is_some() && changed.next().is_none()
+}
+
+fn filter_crlf_hunks(patch: &str) -> String {
+    let mut output = String::new();
+    let mut lines = patch.split_inclusive('\n').peekable();
+    while let Some(header) = lines.next() {
+        if !header.starts_with("@@ ") {
+            output.push_str(header);
+            continue;
+        }
+        let mut old = String::new();
+        let mut new = String::new();
+        while let Some(line) = lines.next_if(|line| line.starts_with([' ', '-', '+'])) {
+            let (tag, content) = line.split_at(1);
+            let content = if lines.next_if(|next| next.starts_with("\\ ")).is_some() {
+                content.strip_suffix('\n').unwrap_or(content)
+            } else {
+                content
+            };
+            if matches!(tag, " " | "-") {
+                old.push_str(content);
+            }
+            if matches!(tag, " " | "+") {
+                new.push_str(content);
+            }
+        }
+        // Keep the original hunk's coordinates by including its full context.
+        output.push_str(&unified_hunks(
+            &old,
+            &new,
+            true,
+            old.lines().count().max(new.lines().count()),
+            |_| header.trim_end_matches('\n').to_owned(),
+        ));
+    }
+    output
+}
+
+fn diff_patch(repo: &Path, change: &FileChange, staged: bool, ignore_eol: bool, context: &str) -> String {
+    let mut args = vec!["diff", "--no-color", context];
+    if ignore_eol {
+        args.push("--ignore-cr-at-eol");
+    }
     let res = if change.code == '?' {
         // Untracked: diff against nothing. Exit code 1 is expected here.
-        run_raw(
-            repo,
-            &["diff", "--no-color", FULL_CONTEXT, "--no-index", "--", "/dev/null", &change.path],
-        )
-        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-        .map_err(|e| e.to_string())
-    } else if staged {
-        run(repo, &["diff", "--no-color", FULL_CONTEXT, "--cached", "--", &change.path])
+        args.extend(["--no-index", "--", "/dev/null", &change.path]);
+        run_raw(repo, &args)
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .map_err(|e| e.to_string())
     } else {
-        run(repo, &["diff", "--no-color", FULL_CONTEXT, "--", &change.path])
+        if staged {
+            args.push("--cached");
+        }
+        args.extend(["--", &change.path]);
+        run(repo, &args)
     };
     res.unwrap_or_else(|e| e)
 }

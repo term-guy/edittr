@@ -4,34 +4,45 @@
 //! work as usual). Changed lines are tinted and recomputed as you type, and the two
 //! panes scroll together, lined up through the diff.
 
-use super::{App, Doc, EditorOut, Tab, diff_colors, editor, file_name, icon_button};
+use super::{App, DiskText, Doc, EditorOut, Tab, background, diff_colors, editor, file_name, icon_button, read_doc_text, receive};
+use crate::commands::{Command, Setting};
+use crate::diff::{with_editor_eol, without_cr_at_eol};
 use crate::{editor as ed, highlight, icons as ic};
 use eframe::egui::{self, Color32};
 use similar::{Algorithm, DiffTag};
+use std::borrow::Cow;
 use std::ops::Range;
 use std::path::Path;
+use std::sync::{Arc, mpsc::Receiver};
 use std::time::Duration;
 
 pub(super) struct LiveDiff {
     base: String,
+    initial_disk: Option<DiskText>,
+    disk_rx: Option<Receiver<std::io::Result<Option<DiskText>>>>,
+    working_eol: Option<(u64, u64, Arc<str>)>,
     base_state: ed::State,
     base_version: u64,
     base_hl: highlight::Cache,
-    /// (document id, version, dark) the ops/tints below were computed for.
-    key: Option<(u64, u64, bool)>,
+    /// (document id, version, dark, ignore EOL) the ops/tints below were computed for.
+    key: Option<(u64, u64, bool, bool)>,
     ops: Vec<(DiffTag, Range<usize>, Range<usize>)>,
     left_bg: Vec<(usize, Color32)>,
     right_bg: Vec<(usize, Color32)>,
     added: usize,
     removed: usize,
+    only_line_endings: bool,
     /// Top lines (left, right) as last shown, to tell which pane the user scrolled.
     tops: (f32, f32),
 }
 
 impl LiveDiff {
-    pub(super) fn new(base: String) -> Self {
+    pub(super) fn new(base: String, initial_disk: Option<DiskText>) -> Self {
         Self {
             base,
+            initial_disk,
+            disk_rx: None,
+            working_eol: None,
             base_state: ed::State::default(),
             base_version: 0,
             base_hl: highlight::Cache::default(),
@@ -41,22 +52,26 @@ impl LiveDiff {
             right_bg: Vec::new(),
             added: 0,
             removed: 0,
+            only_line_endings: false,
             tops: (0.0, 0.0),
         }
     }
 
-    fn update(&mut self, doc: &Doc, dark: bool) {
-        let key = (doc.id, doc.version, dark);
+    fn update(&mut self, doc: &Doc, dark: bool, ignore_eol: bool) {
+        let key = (doc.id, doc.version, dark, ignore_eol);
         if self.key == Some(key) {
             return;
         }
         self.key = Some(key);
-        // Bounded: a huge rewrite falls back to a coarser diff instead of stalling a frame.
-        let diff = similar::TextDiff::configure()
-            .algorithm(Algorithm::Myers)
-            .timeout(Duration::from_millis(30))
-            .diff_lines(&self.base, &doc.text);
-        self.ops = diff.ops().iter().map(|op| op.as_tag_tuple()).collect();
+        let raw = self
+            .working_eol
+            .as_ref()
+            .and_then(|(id, version, raw)| (*id == doc.id && *version == doc.version).then(|| Arc::clone(raw)));
+        let editor = match raw.as_deref() {
+            Some(text) => Cow::Borrowed(text),
+            None => with_editor_eol(&doc.text, doc.crlf),
+        };
+        self.update_ops(&editor, ignore_eol);
         let (add, del) = diff_colors(dark);
         let (add, del) = (add.gamma_multiply(0.16), del.gamma_multiply(0.16));
         self.left_bg.clear();
@@ -69,6 +84,21 @@ impl LiveDiff {
         }
         self.removed = self.left_bg.len();
         self.added = self.right_bg.len();
+    }
+
+    fn update_ops(&mut self, editor: &str, ignore_eol: bool) {
+        let old = without_cr_at_eol(&self.base, ignore_eol);
+        let new = without_cr_at_eol(editor, ignore_eol);
+        self.only_line_endings = old == new && self.base != editor;
+        // Bounded: a huge rewrite falls back to a coarser diff instead of stalling a frame.
+        let diff = similar::TextDiff::configure()
+            .algorithm(Algorithm::Myers)
+            .timeout(Duration::from_millis(30))
+            .diff_slices(
+                &old.split_inclusive('\n').collect::<Vec<_>>(),
+                &new.split_inclusive('\n').collect::<Vec<_>>(),
+            );
+        self.ops = diff.ops().iter().map(|op| op.as_tag_tuple()).collect();
     }
 
     /// First right-side line of each change.
@@ -125,21 +155,36 @@ impl App {
 
     /// Draws the live diff in tab `active`; returns a path to open, if any.
     pub(super) fn live_diff_ui(&mut self, ui: &mut egui::Ui, active: usize) -> Option<std::path::PathBuf> {
-        let path = match &self.tabs[active] {
-            Tab::Diff(d) => d.path.clone(),
-            _ => return None,
-        };
-        // The right pane edits the file's own document: open it (in the background) if needed.
-        let file = match self.live_diff_doc(active) {
+        let open_doc = self.live_diff_doc(active);
+        // The right pane edits the file's own document, using the worker's snapshot if unopened.
+        let Tab::Diff(d) = &mut self.tabs[active] else { return None };
+        let path = d.path.clone();
+        let live = d.live.as_mut()?;
+        let mut disk = live.initial_disk.take();
+        let file = match open_doc {
             Some(i) => i,
             None => {
-                let Ok(Some(disk)) = super::read_doc_text(&path) else {
-                    if let Tab::Diff(d) = &mut self.tabs[active] {
-                        d.live = None;
+                if disk.is_none() {
+                    let source = path.clone();
+                    let rx = &mut live.disk_rx;
+                    if rx.is_none() {
+                        *rx = Some(background(&self.ctx, move || read_doc_text(&source)));
                     }
-                    return None;
-                };
-                self.add_file_tab(&path, disk.text, disk.crlf);
+                    disk = match receive(rx) {
+                        Some(Ok(Some(disk))) => Some(disk),
+                        _ if rx.is_some() => {
+                            ui.weak("Loading diff…");
+                            return None;
+                        }
+                        _ => {
+                            d.live = None;
+                            ui.ctx().request_repaint();
+                            return None;
+                        }
+                    };
+                }
+                let disk = disk.as_mut().unwrap();
+                self.add_file_tab(&path, std::mem::take(&mut disk.text), disk.crlf);
                 self.tabs.len() - 1
             }
         };
@@ -149,10 +194,16 @@ impl App {
             return None;
         };
         let live = d.live.as_mut().unwrap();
-        live.update(doc, dark);
+        if let Some(disk) = disk
+            && (open_doc.is_none() || (disk.crlf == doc.crlf && disk.text == doc.text))
+        {
+            live.working_eol = disk.raw_crlf.map(|raw| (doc.id, doc.version, raw));
+        }
+        live.update(doc, dark, settings.diff_ignore_eol);
 
         let mut open_path = None;
         let mut jump = None;
+        let mut ignore_eol = settings.diff_ignore_eol;
         ui.horizontal(|ui| {
             if ui.button(format!("{} Open file", ic::ARROW_SQUARE_OUT)).clicked() {
                 open_path = Some(path.clone());
@@ -162,6 +213,7 @@ impl App {
             if ui.selectable_label(false, format!("{} Inline", ic::ROWS)).clicked() {
                 d.inline = true;
             }
+            ui.checkbox(&mut ignore_eol, "Ignore line endings");
             let blocks = live.blocks();
             if !blocks.is_empty() {
                 ui.separator();
@@ -182,6 +234,9 @@ impl App {
                 ui.colored_label(add, format!("+{}", live.added));
             });
         });
+        if live.only_line_endings {
+            ui.weak("Only line endings differ");
+        }
         if let Some(line) = jump {
             doc.ed.scroll_to_line(line.saturating_sub(3) as f32);
         }
@@ -236,6 +291,9 @@ impl App {
         if live.tops.0 != left_top || live.tops.1 != right_top {
             ui.ctx().request_repaint();
         }
+        if ignore_eol != settings.diff_ignore_eol {
+            self.run_command(Command::ToggleSetting(Setting::DiffIgnoreEol));
+        }
         open_path
     }
 }
@@ -245,8 +303,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ignores_only_cr_before_lf() {
+        let mut live = LiveDiff::new("a\r\nb\r\n".into(), None);
+        live.update_ops("a\nb\n", true);
+        assert!(live.blocks().is_empty());
+        assert!(live.only_line_endings);
+        live.update_ops("a\nb\n", false);
+        assert_eq!(live.blocks(), [0]);
+        assert!(!live.only_line_endings);
+        live.update_ops("a \nb", true);
+        assert_eq!(live.blocks(), [0]);
+        assert!(!live.only_line_endings);
+        live.update_ops("a\nb", true);
+        assert_eq!(live.blocks(), [1]);
+    }
+
+    #[test]
     fn maps_lines_through_the_diff() {
-        let mut live = LiveDiff::new("a\nb\nc\nd\ne\n".into());
+        let mut live = LiveDiff::new("a\nb\nc\nd\ne\n".into(), None);
         let new = "a\nX\nY\nc\nd\nZ\ne\n";
         let diff = similar::TextDiff::from_lines(live.base.as_str(), new);
         live.ops = diff.ops().iter().map(|op| op.as_tag_tuple()).collect();

@@ -1,6 +1,64 @@
 //! Turns a unified diff into aligned side-by-side rows.
 
-use std::ops::Range;
+use std::{borrow::Cow, fmt::Write as _, ops::Range};
+
+pub struct FileDiff {
+    pub text: String,
+    pub only_line_endings: bool,
+}
+
+impl FileDiff {
+    pub fn new(text: String, unfiltered: Option<&str>) -> Self {
+        let only_line_endings = text.is_empty() && unfiltered.is_some_and(|patch| patch.lines().any(|line| line.starts_with("@@ ")));
+        Self { text, only_line_endings }
+    }
+}
+
+const NO_NEWLINE: &str = "\\ No newline at end of file";
+
+/// The editor stores LF internally and writes its configured line endings on save.
+pub fn with_editor_eol(text: &str, crlf: bool) -> Cow<'_, str> {
+    if crlf {
+        Cow::Owned(text.replace('\n', "\r\n"))
+    } else {
+        Cow::Borrowed(text)
+    }
+}
+
+pub fn without_cr_at_eol(text: &str, ignore_eol: bool) -> Cow<'_, str> {
+    if ignore_eol && text.as_bytes().windows(2).any(|pair| pair == b"\r\n") {
+        Cow::Owned(text.replace("\r\n", "\n"))
+    } else {
+        Cow::Borrowed(text)
+    }
+}
+
+/// Generate hunks using normalized comparison keys and the original text for display.
+pub fn unified_hunks(old: &str, new: &str, ignore_eol: bool, context: usize, mut header: impl FnMut(&str) -> String) -> String {
+    let old_lines: Vec<_> = old.split_inclusive('\n').collect();
+    let new_lines: Vec<_> = new.split_inclusive('\n').collect();
+    let old = without_cr_at_eol(old, ignore_eol);
+    let new = without_cr_at_eol(new, ignore_eol);
+    let diff = similar::TextDiff::from_slices(
+        &old.split_inclusive('\n').collect::<Vec<_>>(),
+        &new.split_inclusive('\n').collect::<Vec<_>>(),
+    );
+    let mut out = String::new();
+    for hunk in diff.unified_diff().context_radius(context).iter_hunks() {
+        let _ = writeln!(out, "{}", header(&hunk.header().to_string()));
+        for change in hunk.iter_changes() {
+            let line = match change.old_index() {
+                Some(i) => old_lines[i],
+                None => new_lines[change.new_index().unwrap()],
+            };
+            let _ = write!(out, "{}{line}", change.tag());
+            if !line.ends_with('\n') {
+                let _ = writeln!(out, "\n{NO_NEWLINE}");
+            }
+        }
+    }
+    out
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Kind {

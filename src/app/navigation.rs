@@ -317,6 +317,9 @@ impl App {
                 let value = setting.value(&mut self.settings);
                 *value = !*value;
                 self.save_settings(&self.ctx.clone());
+                if setting == commands::Setting::DiffIgnoreEol {
+                    self.refresh_diff();
+                }
             }
         }
     }

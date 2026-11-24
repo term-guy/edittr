@@ -118,6 +118,47 @@ impl Drop for TestRepo {
 }
 
 #[test]
+fn diff_can_ignore_crlf_only_changes_in_the_worktree_and_index() {
+    let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let repo = TestRepo(std::env::temp_dir().join(format!("edittr-git-eol-{}-{unique}", std::process::id())));
+    fs::create_dir(&repo.0).unwrap();
+    let git = |args: &[&str]| run(&repo.0, args).unwrap();
+    git(&["init"]);
+    git(&["config", "user.name", "Test Author"]);
+    git(&["config", "user.email", "author@example.invalid"]);
+    git(&["config", "core.autocrlf", "false"]);
+    git(&["config", "core.hooksPath", ".git/test-hooks"]);
+    fs::write(repo.0.join(".gitattributes"), "*.txt -text\n").unwrap();
+    let path = repo.0.join("file.txt");
+    fs::write(&path, "a\r\nb\r\n").unwrap();
+    git(&["add", ".gitattributes", "file.txt"]);
+    git(&["-c", "commit.gpgsign=false", "commit", "-m", "Initial"]);
+
+    let change = FileChange {
+        path: "file.txt".into(),
+        code: 'M',
+    };
+    fs::write(&path, "a\nb").unwrap();
+    let missing_newline = Vcs::Git.diff(&repo.0, &change, false, true);
+    assert!(!missing_newline.only_line_endings);
+    assert!(missing_newline.text.contains(" a\r\n-b\r\n+b\n\\ No newline at end of file"));
+    fs::write(&path, "a\nB\nb").unwrap();
+    let mixed = Vcs::Git.diff(&repo.0, &change, false, true);
+    assert!(mixed.text.contains(" a\r\n"));
+    assert!(mixed.text.contains("-b\r\n+B\n+b\n\\ No newline at end of file"));
+    fs::write(&path, "a\nb\n").unwrap();
+    for staged in [false, true] {
+        if staged {
+            git(&["add", "file.txt"]);
+        }
+        let filtered = Vcs::Git.diff(&repo.0, &change, staged, true);
+        assert!(filtered.text.is_empty());
+        assert!(filtered.only_line_endings);
+        assert!(Vcs::Git.diff(&repo.0, &change, staged, false).text.contains("@@ "));
+    }
+}
+
+#[test]
 fn graph_history_actions_on_a_real_git_repository() {
     use HistoryAction::*;
     let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
