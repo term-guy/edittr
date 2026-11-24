@@ -279,6 +279,12 @@ impl App {
             }
             Command::Save => self.save_active(),
             Command::FormatDocument => self.format_document(self.active),
+            Command::SplitEditor => {
+                self.split = match self.split {
+                    Some(_) => None,
+                    None => matches!(self.tabs.get(self.active), Some(Tab::File(_))).then_some(self.active),
+                };
+            }
             Command::CloseTab => self.close_tab(self.active, false),
             Command::CloseAllTabs => self.close_tabs((0..self.tabs.len()).collect(), false),
             Command::ToggleTheme => self.ctx.set_theme(match self.ctx.theme() {

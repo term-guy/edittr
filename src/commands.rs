@@ -23,6 +23,7 @@ pub(crate) enum Command {
     CloseTab,
     CloseAllTabs,
     ToggleTheme,
+    SplitEditor,
     FormatDocument,
     ToggleSetting(Setting),
 }
@@ -139,6 +140,11 @@ pub(crate) const COMMANDS: &[Entry] = &[
     Entry::new(CloseTab, "Close tab", &[KeyboardShortcut::new(CMD, Key::W)]),
     Entry::new(CloseAllTabs, "Close all tabs", &[]),
     Entry::new(ToggleTheme, "Toggle theme", &[]),
+    Entry::new(
+        SplitEditor,
+        "Split editor (open the file to the side)",
+        &[KeyboardShortcut::new(CMD, Key::Backslash)],
+    ),
     Entry::new(ToggleSetting(Setting::HighlightLine), "Toggle current line highlight", &[]),
     Entry::new(ToggleSetting(Setting::ShowWhitespace), "Toggle whitespace", &[]),
     Entry::new(ToggleSetting(Setting::InlineBlame), "Toggle inline blame", &[]),

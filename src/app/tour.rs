@@ -38,6 +38,7 @@ const STEPS: &[&str] = &[
     "tab-menu",
     "go-to-definition-install-offer",
     "go-to-definition",
+    "split-editor",
     "light-theme",
     "column-select",
 ];
@@ -274,7 +275,18 @@ impl Tour {
                     }
                 }
             }
+            "split-editor" => {
+                app.side_open = false;
+                let graph = app
+                    .tabs
+                    .iter()
+                    .position(|t| matches!(t, Tab::File(d) if d.path.ends_with("graph.rs")));
+                app.open_file(&self.demo.join("a.rs"));
+                app.split = graph;
+            }
             "light-theme" => {
+                app.split = None;
+                app.side_open = true;
                 ctx.set_theme(egui::Theme::Light);
                 if let Some(i) = app.tabs.iter().position(|t| matches!(t, Tab::Diff(_))) {
                     app.active = i;

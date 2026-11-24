@@ -330,6 +330,8 @@ pub struct App {
     message: String,
     quick_open: Option<QuickOpen>,
     picker: Option<navigation::Picker>,
+    /// Tab shown in the side editor (Open to the Side).
+    split: Option<usize>,
     confirm: Option<Confirm>,
     open_folder_requested: bool,
     open_folder: Option<String>,
@@ -408,6 +410,7 @@ impl App {
             message: String::new(),
             quick_open: None,
             picker: None,
+            split: None,
             confirm: None,
             open_folder_requested: false,
             open_folder: None,
@@ -894,6 +897,61 @@ impl App {
 
     // --------------------------------------------------------------- tabs
 
+    /// Diagnostics of tab `i` as (line, col, end line, end col, color).
+    fn squiggles_for(&self, i: usize, v: &egui::Visuals) -> Vec<(usize, usize, usize, usize, Color32)> {
+        let Some(Tab::File(doc)) = self.tabs.get(i) else {
+            return Vec::new();
+        };
+        self.diagnostics_for(&doc.path)
+            .iter()
+            .map(|d| {
+                let color = match d.severity {
+                    crate::diagnostics::Severity::Error => v.error_fg_color,
+                    crate::diagnostics::Severity::Warning => v.warn_fg_color,
+                    _ => v.hyperlink_color.gamma_multiply(0.7),
+                };
+                (d.line, d.col_start, d.end_line, d.col_end, color)
+            })
+            .collect()
+    }
+
+    /// The second editor (Open to the Side), on the right of the main one.
+    fn split_pane(&mut self, ui: &mut egui::Ui) {
+        let Some(si) = self.split else { return };
+        if !matches!(self.tabs.get(si), Some(Tab::File(_))) {
+            self.split = None;
+            return;
+        }
+        let diags = self.squiggles_for(si, ui.visuals());
+        let settings = self.settings;
+        let (mut close, mut goto) = (false, None);
+        egui::Panel::right("split-pane")
+            .resizable(true)
+            .default_size(ui.available_width() / 2.0)
+            .min_size(200.0)
+            .show(ui, |ui| {
+                let Some(Tab::File(doc)) = self.tabs.get_mut(si) else { return };
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(doc.name()).strong());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if icon_button(ui, ic::X).on_hover_text("Close the split").clicked() {
+                            close = true;
+                        }
+                    });
+                });
+                ui.separator();
+                goto = editor(ui, doc, settings, None, &diags, &[], 1);
+            });
+        if close {
+            self.split = None;
+        }
+        if let Some(idx) = goto {
+            // Go to definition from the side editor: make it the active one first.
+            self.active = si;
+            self.go_to_definition(idx, &self.ctx.clone());
+        }
+    }
+
     fn open_file(&mut self, path: &Path) {
         if let Some(i) = self.tabs.iter().position(|t| matches!(t, Tab::File(d) if d.path == path)) {
             self.active = i;
@@ -1005,6 +1063,9 @@ impl App {
         if !force && idx.iter().any(|&i| matches!(&self.tabs[i], Tab::File(d) if d.dirty())) {
             self.confirm = Some(Confirm::CloseTabs(idx));
             return;
+        }
+        if let Some(si) = self.split {
+            self.split = (!idx.contains(&si)).then(|| si - idx.iter().filter(|&&i| i < si).count());
         }
         let active_closed = idx.contains(&self.active);
         let removed_before_active = idx.iter().filter(|&&i| i < self.active).count();
@@ -1968,6 +2029,7 @@ impl App {
                         if let Some(p) = &file_path {
                             ui.separator();
                             if matches!(tab, Tab::File(_)) {
+                                item(ui, "Open to the Side", true, TabMenu::Split(i));
                                 item(ui, "Format document (Shift+Alt+F)", true, TabMenu::Format(i));
                             }
                             item(ui, "Copy Path", true, TabMenu::Copy(p.display().to_string()));
@@ -1996,6 +2058,7 @@ impl App {
             Some(TabMenu::CloseAll) => self.run_command(Command::CloseAllTabs),
             Some(TabMenu::Copy(text)) => ui.ctx().copy_text(text),
             Some(TabMenu::Format(i)) => self.format_document(i),
+            Some(TabMenu::Split(i)) => self.split = Some(i),
             None => {}
         }
     }
@@ -2024,23 +2087,8 @@ impl App {
         let mut open_path = None;
         let mut goto_at = None;
         // Diagnostics of the active file, for squiggles (collected before borrowing the tab).
-        let diags: Vec<(usize, usize, usize, usize, Color32)> = match self.tabs.get(active) {
-            Some(Tab::File(doc)) => {
-                let v = ui.visuals();
-                self.diagnostics_for(&doc.path)
-                    .iter()
-                    .map(|d| {
-                        let color = match d.severity {
-                            crate::diagnostics::Severity::Error => v.error_fg_color,
-                            crate::diagnostics::Severity::Warning => v.warn_fg_color,
-                            _ => v.hyperlink_color.gamma_multiply(0.7),
-                        };
-                        (d.line, d.col_start, d.end_line, d.col_end, color)
-                    })
-                    .collect()
-            }
-            _ => Vec::new(),
-        };
+        let diags = self.squiggles_for(active, ui.visuals());
+        self.split_pane(ui);
         let marks: Vec<std::ops::Range<usize>> = self.find_matches().map(<[_]>::to_vec).unwrap_or_default();
         // .editorconfig's indent wins over the one detected from the file.
         let editorconfig_indent = match self.tabs.get(active) {
@@ -2070,7 +2118,7 @@ impl App {
                 } else {
                     None
                 };
-                if let Some(idx) = editor(ui, doc, self.settings, inline, &diags, &marks) {
+                if let Some(idx) = editor(ui, doc, self.settings, inline, &diags, &marks, 0) {
                     goto_at = Some(idx);
                 }
                 self.find.after_editor(ui, doc);
@@ -2616,10 +2664,14 @@ fn editor(
     inline: Option<String>,
     diags: &[(usize, usize, usize, usize, Color32)],
     find_marks: &[std::ops::Range<usize>],
+    pane: u8,
 ) -> Option<usize> {
-    let id = ui.make_persistent_id(("editor", doc.id));
+    let id = ui.make_persistent_id(("editor", doc.id, pane));
     // A pending selection from elsewhere (search hit, go to definition): char range.
-    if let Some((a, b)) = doc.goto.take() {
+    // The main pane (0) takes it, so a file open in both panes jumps once.
+    if pane == 0
+        && let Some((a, b)) = doc.goto.take()
+    {
         let ix = doc.ed.index(&doc.text, doc.version);
         let (a, b) = (ix.char_to_byte(&doc.text, a), ix.char_to_byte(&doc.text, b));
         doc.ed.select(a..b);
@@ -2766,6 +2818,7 @@ enum TabMenu {
     CloseAll,
     Copy(String),
     Format(usize),
+    Split(usize),
 }
 
 /// (added, removed) text colors.
