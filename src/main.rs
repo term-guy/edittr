@@ -68,36 +68,70 @@ fn main() -> eframe::Result {
 }
 
 /// GUI-launched apps on macOS/Linux get a minimal PATH, which hides tools like
-/// Homebrew's `npm`/`go` or a user-installed language server. Ask the user's
-/// login shell for its PATH (with a timeout) and use that instead.
+/// Homebrew's `npm`/`go` or a user-installed language server. Use the PATH the
+/// user's login shell reported last time (instant), and ask the shell again in
+/// the background for next launch; only the very first launch waits for it.
 #[cfg(unix)]
 fn import_login_shell_path() {
+    let cache = dirs::cache_dir().map(|d| d.join("edittr").join("login-path.txt"));
+    let cached = cache
+        .as_ref()
+        .and_then(|f| std::fs::read_to_string(f).ok())
+        .filter(|p| !p.trim().is_empty());
+    let path = match cached {
+        Some(path) => {
+            if let Some(cache) = cache {
+                std::thread::spawn(move || {
+                    if let Some(fresh) = login_shell_path() {
+                        save_login_path(&cache, &fresh);
+                    }
+                });
+            }
+            path.trim().to_string()
+        }
+        None => {
+            let Some(fresh) = login_shell_path() else { return };
+            if let Some(cache) = cache {
+                save_login_path(&cache, &fresh);
+            }
+            fresh
+        }
+    };
+    // SAFETY: called at startup before any other threads read the environment
+    // (the refresh thread above only runs the shell and writes the cache file).
+    unsafe { std::env::set_var("PATH", path) };
+}
+
+#[cfg(unix)]
+fn save_login_path(cache: &std::path::Path, path: &str) {
+    if let Some(dir) = cache.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(cache, path);
+}
+
+/// The login shell's PATH (waits up to 3 s for the shell).
+#[cfg(unix)]
+fn login_shell_path() -> Option<String> {
     use std::process::{Command, Stdio};
     use std::time::Duration;
     const MARK: &str = "_EDITTR_PATH_";
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
-    let Ok(child) = Command::new(shell)
+    let child = Command::new(shell)
         .args(["-ilc", &format!("printf '{MARK}%s{MARK}' \"$PATH\"")])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-    else {
-        return;
-    };
+        .ok()?;
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let _ = tx.send(child.wait_with_output());
     });
-    let Ok(Ok(out)) = rx.recv_timeout(Duration::from_secs(3)) else {
-        return;
-    };
+    let out = rx.recv_timeout(Duration::from_secs(3)).ok()?.ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
     let path = text.split(MARK).nth(1).unwrap_or_default();
-    if !path.is_empty() {
-        // SAFETY: called at startup before any other threads read the environment.
-        unsafe { std::env::set_var("PATH", path) };
-    }
+    (!path.is_empty()).then(|| path.to_string())
 }
 
 /// `edittr --list-servers`: which language server each language would use, and from where.

@@ -232,8 +232,13 @@ enum SearchRow {
 struct QuickOpen {
     query: String,
     files: Vec<String>,
-    files_rx: Option<Receiver<Vec<String>>>,
+    /// `files`, lowercased once (matching is case-insensitive).
+    lower: Vec<String>,
+    files_rx: Option<Receiver<(Vec<String>, Vec<String>)>>,
     selected: usize,
+    /// Indices into `files` of the best matches, for `matched_query`.
+    matches: Vec<usize>,
+    matched_query: Option<String>,
 }
 
 enum Confirm {
@@ -617,9 +622,11 @@ impl App {
         }
         self.poll_vcs(ctx);
         if let Some(q) = &mut self.quick_open
-            && let Some(files) = receive(&mut q.files_rx)
+            && let Some((files, lower)) = receive(&mut q.files_rx)
         {
             q.files = files;
+            q.lower = lower;
+            q.matched_query = None; // re-rank
         }
     }
 
@@ -905,12 +912,19 @@ impl App {
         };
         let vcs = self.vcs;
         let ignored = self.ignored.clone();
-        let files_rx = background(&self.ctx, move || project_files(&root, vcs, &ignored));
+        let files_rx = background(&self.ctx, move || {
+            let files = project_files(&root, vcs, &ignored);
+            let lower = files.iter().map(|f| f.to_lowercase()).collect();
+            (files, lower)
+        });
         self.quick_open = Some(QuickOpen {
             query: String::new(),
             files: Vec::new(),
+            lower: Vec::new(),
             files_rx: Some(files_rx),
             selected: 0,
+            matches: Vec::new(),
+            matched_query: None,
         });
     }
 
@@ -2113,26 +2127,33 @@ impl App {
                     if r.changed() {
                         q.selected = 0;
                     }
-                    let matches = fuzzy_filter(&q.files, &q.query, 200);
+                    // Rank only when the query or the file list changed, not every frame.
+                    if q.matched_query.as_deref() != Some(q.query.as_str()) {
+                        q.matches = fuzzy_filter(&q.lower, &q.query, 200);
+                        q.matched_query = Some(q.query.clone());
+                    }
+                    let mut moved = false;
                     ui.input(|i| {
                         if i.key_pressed(Key::ArrowDown) {
-                            q.selected = (q.selected + 1).min(matches.len().saturating_sub(1));
+                            q.selected = (q.selected + 1).min(q.matches.len().saturating_sub(1));
+                            moved = true;
                         }
                         if i.key_pressed(Key::ArrowUp) {
                             q.selected = q.selected.saturating_sub(1);
+                            moved = true;
                         }
                         if i.key_pressed(Key::Enter) {
-                            chosen = matches.get(q.selected).cloned();
+                            chosen = q.matches.get(q.selected).map(|&i| q.files[i].clone());
                         }
                     });
                     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                        for (i, m) in matches.iter().enumerate() {
-                            let r = ui.selectable_label(i == q.selected, m);
-                            if i == q.selected {
+                        for (i, &m) in q.matches.iter().enumerate() {
+                            let r = ui.selectable_label(i == q.selected, &q.files[m]);
+                            if i == q.selected && moved {
                                 r.scroll_to_me(None);
                             }
                             if r.clicked() {
-                                chosen = Some(m.clone());
+                                chosen = Some(q.files[m].clone());
                             }
                         }
                     });
@@ -3244,39 +3265,69 @@ fn walk_files(root: &Path, limit: usize, ignored: &[String]) -> Vec<String> {
 }
 
 /// Subsequence fuzzy match, scored to favour matches in the file name and contiguous runs.
-fn fuzzy_filter(files: &[String], query: &str, limit: usize) -> Vec<String> {
+/// Indices of the best `limit` matches of `query` (subsequence, case-insensitive)
+/// among `lower` (lowercased paths), best first; favours file-name and contiguous hits.
+fn fuzzy_filter(lower: &[String], query: &str, limit: usize) -> Vec<usize> {
     if query.is_empty() {
-        return files.iter().take(limit).cloned().collect();
+        return (0..lower.len().min(limit)).collect();
     }
     let q: Vec<char> = query.to_lowercase().chars().filter(|c| !c.is_whitespace()).collect();
-    let mut scored: Vec<(i32, &String)> = files
+    let mut scored: Vec<(i32, usize)> = lower
         .iter()
-        .filter_map(|f| {
-            let lower = f.to_lowercase();
-            let name_start = lower.rfind('/').map(|i| i + 1).unwrap_or(0);
+        .enumerate()
+        .filter_map(|(idx, f)| {
+            let name_start = f.rfind('/').map(|i| i + 1).unwrap_or(0);
             let mut qi = 0;
             let mut score = 0;
             let mut prev = usize::MAX - 1;
-            for (i, ch) in lower.char_indices() {
-                if qi < q.len() && ch == q[qi] {
+            for (i, ch) in f.char_indices() {
+                if ch == q[qi] {
                     score += if i == prev + 1 { 5 } else { 1 };
                     if i >= name_start {
                         score += 3;
                     }
                     prev = i;
                     qi += 1;
+                    if qi == q.len() {
+                        return Some((score * 100 - f.len() as i32, idx));
+                    }
                 }
             }
-            (qi == q.len()).then(|| (score * 100 - f.len() as i32, f))
+            None
         })
         .collect();
-    scored.sort_by_key(|&(score, _)| std::cmp::Reverse(score));
-    scored.into_iter().take(limit).map(|(_, f)| f.clone()).collect()
+    let key = |&(score, idx): &(i32, usize)| (std::cmp::Reverse(score), idx);
+    if scored.len() > limit {
+        scored.select_nth_unstable_by_key(limit, key);
+        scored.truncate(limit);
+    }
+    scored.sort_unstable_by_key(key);
+    scored.into_iter().map(|(_, idx)| idx).collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::language_name;
+
+    #[test]
+    fn fuzzy_filter_ranks_file_name_matches_first_and_is_fast() {
+        use super::fuzzy_filter;
+        let files: Vec<String> = ["src/app.rs", "docs/apples.md", "src/main.rs", "a/p/p.rs"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let m = fuzzy_filter(&files, "App", 10);
+        assert_eq!(files[m[0]], "src/app.rs");
+        assert_eq!(m.len(), 3);
+        assert!(fuzzy_filter(&files, "zzz", 10).is_empty());
+        assert_eq!(fuzzy_filter(&files, "", 2), vec![0, 1]);
+
+        let many: Vec<String> = (0..100_000).map(|i| format!("crates/module{}/src/file_{i}.rs", i % 97)).collect();
+        let t = std::time::Instant::now();
+        let m = fuzzy_filter(&many, "mod5file9", 200);
+        assert_eq!(m.len(), 200);
+        eprintln!("fuzzy_filter over 100k paths: {:?}", t.elapsed());
+    }
 
     #[test]
     fn language_names_for_extensions() {
