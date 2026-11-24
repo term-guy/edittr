@@ -2647,8 +2647,10 @@ impl App {
                         .resizable(true)
                         .default_size(260.0)
                         .show(ui, |ui| {
-                            if let (Some(row), Some(repo), Some(vcs)) = (self.graph_sel, &self.repo, self.vcs) {
-                                self.graph_detail.show(ui, &graph.commits[row], repo, vcs);
+                            // The selection can outlive a shorter, reloaded history: never index blindly.
+                            let commit = self.graph_sel.and_then(|row| graph.commits.get(row));
+                            if let (Some(commit), Some(repo), Some(vcs)) = (commit, &self.repo, self.vcs) {
+                                self.graph_detail.show(ui, commit, repo, vcs);
                             } else {
                                 ui.weak("Select a commit to see its details.");
                             }
