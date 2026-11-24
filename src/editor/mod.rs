@@ -194,6 +194,8 @@ pub struct Extras<'a> {
     pub squiggles: &'a [(Range<usize>, Color32)],
     /// Background marks (byte ranges), e.g. find matches.
     pub marks: &'a [Range<usize>],
+    /// A second kind of marks in their own color (byte ranges): search-in-files results.
+    pub global_marks: &'a [Range<usize>],
     /// Gutter markers per line (e.g. added / modified lines vs. git); `true` draws a
     /// "lines deleted above" triangle instead of a bar.
     pub gutter: &'a [(usize, Color32, bool)],
@@ -558,6 +560,9 @@ pub fn show(
             }
         };
         let mark = ui.visuals().warn_fg_color.gamma_multiply(0.25);
+        // Search-in-files results in blue, under the file's own find matches (amber).
+        let global = Color32::from_rgb(0x3d, 0x8b, 0xfd).gamma_multiply(if ui.visuals().dark_mode { 0.35 } else { 0.28 });
+        paint_ranges(&mut extras.global_marks.iter().cloned(), global, false);
         paint_ranges(&mut extras.marks.iter().cloned(), mark, false);
         let sel_color = ui.visuals().selection.bg_fill.gamma_multiply(if focused { 0.7 } else { 0.4 });
         paint_ranges(&mut st.sels.iter().map(|s| s.range()), sel_color, true);

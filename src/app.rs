@@ -39,6 +39,8 @@ const FALLBACK_POLL: Duration = Duration::from_secs(3);
 const ACTIVITY_POLL: Duration = Duration::from_millis(250);
 const HIGHLIGHT_LIMIT: usize = 1_000_000; // bytes; bigger files are shown as plain text
 type DirEntries = Vec<(PathBuf, bool)>;
+/// Byte ranges of search-in-files matches in one document.
+type SearchMarks = Arc<Vec<std::ops::Range<usize>>>;
 
 struct Doc {
     id: u64,
@@ -246,6 +248,8 @@ struct SearchState {
     focus: bool,
     /// The "files to include / exclude" fields are shown.
     show_filters: bool,
+    /// Bumped by each search run, so editor highlights follow the latest one.
+    generation: u64,
 }
 
 enum SearchRow {
@@ -378,6 +382,8 @@ pub struct App {
     sessions: session::Sessions,
     /// Collapsed folders in the Changes tree, keyed "S:<path>" (staged) or "U:<path>".
     changes_collapsed: HashSet<String>,
+    /// Search-in-files matches in a document: ((doc id, version, search gen), byte ranges).
+    search_marks: Option<((u64, u64, u64), SearchMarks)>,
     /// Bumped whenever `status` is replaced; keys the cached Changes rows.
     status_gen: u64,
     /// Visible Changes rows for (status_gen, tree view, collapsed folders), built once.
@@ -464,6 +470,7 @@ impl App {
             sessions: session::Sessions::new(session_writer, startup.window.clone()),
             changes_collapsed: HashSet::new(),
             status_gen: 0,
+            search_marks: None,
             changes_rows: None,
             #[cfg(feature = "tour")]
             tour: tour::Tour::from_env(),
@@ -1011,7 +1018,7 @@ impl App {
                     });
                 });
                 ui.separator();
-                goto = editor(ui, doc, settings, None, &diags, &[], 1, &[]).goto;
+                goto = editor(ui, doc, settings, None, &diags, &[], 1, &[], &[]).goto;
             });
         if close {
             self.split = None;
@@ -1366,6 +1373,39 @@ impl App {
         self.start_search(ctx);
     }
 
+    /// Byte ranges of the current search-in-files query in the document of tab `i`,
+    /// when that file is among the results (so filters and ignored folders apply).
+    /// Recomputed from the live text, cached per document version and search.
+    fn search_marks(&mut self, i: usize) -> SearchMarks {
+        let st = &self.search;
+        let (Some(Tab::File(doc)), Some(root)) = (self.tabs.get(i), &self.root) else {
+            return Arc::default();
+        };
+        if st.searched.query.is_empty() || st.results.is_empty() {
+            return Arc::default();
+        }
+        let key = (doc.id, doc.version, st.generation);
+        if let Some((k, marks)) = &self.search_marks
+            && *k == key
+        {
+            return marks.clone();
+        }
+        let rel = workspace::relative_path(root, &doc.path);
+        let found = rel.is_some_and(|rel| st.results.iter().any(|f| f.rel == rel));
+        let marks: Vec<std::ops::Range<usize>> = match (found, search::build_regex(&st.searched)) {
+            (true, Ok(re)) => re
+                .find_iter(&doc.text)
+                .filter(|m| !m.is_empty())
+                .take(10_000)
+                .map(|m| m.range())
+                .collect(),
+            _ => Vec::new(),
+        };
+        let marks = Arc::new(marks);
+        self.search_marks = Some((key, marks.clone()));
+        marks
+    }
+
     fn start_search(&mut self, ctx: &egui::Context) {
         let st = &mut self.search;
         st.cancel.store(true, Ordering::Relaxed);
@@ -1375,6 +1415,7 @@ impl App {
         st.error = None;
         st.summary.clear();
         st.searched = st.opts.clone();
+        st.generation += 1;
         if st.opts.query.is_empty() {
             st.rx = None;
             return;
@@ -2305,6 +2346,7 @@ impl App {
         self.completion_keys(&ui.ctx().clone());
         self.split_pane(ui);
         let marks: Vec<std::ops::Range<usize>> = self.find_matches().map(<[_]>::to_vec).unwrap_or_default();
+        let global_marks = self.search_marks(active);
         // .editorconfig's indent wins over the one detected from the file.
         let editorconfig_indent = match self.tabs.get(active) {
             Some(Tab::File(doc)) => self.editorconfig_indent(&doc.path),
@@ -2338,7 +2380,7 @@ impl App {
                     } else {
                         None
                     };
-                    let out = editor(ui, doc, self.settings, inline, &diags, &marks, 0, &[]);
+                    let out = editor(ui, doc, self.settings, inline, &diags, &marks, 0, &[], &global_marks);
                     if let Some(idx) = out.goto {
                         goto_at = Some(idx);
                     }
@@ -2981,6 +3023,7 @@ fn editor(
     find_marks: &[std::ops::Range<usize>],
     pane: u8,
     line_bg: &[(usize, Color32)],
+    global_marks: &[std::ops::Range<usize>],
 ) -> EditorOut {
     let id = ui.make_persistent_id(("editor", doc.id, pane));
     // A pending selection from elsewhere (search hit, go to definition): char range.
@@ -3040,6 +3083,7 @@ fn editor(
         inline: inline.as_deref(),
         squiggles: &squiggles,
         marks: &marks,
+        global_marks,
         gutter: &gutter_marks,
         line_bg,
     };

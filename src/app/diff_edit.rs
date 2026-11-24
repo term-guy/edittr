@@ -222,7 +222,7 @@ impl App {
             );
             left_top = left.top_line;
             cols[1].weak(format!("{} (working copy)", file_name(&path.to_string_lossy())));
-            out = Some(editor(&mut cols[1], doc, settings, None, &[], &[], 3, &live.right_bg));
+            out = Some(editor(&mut cols[1], doc, settings, None, &[], &[], 3, &live.right_bg, &[]));
         });
         // Keep the panes lined up: whichever one the user scrolled leads.
         let right_top = out.as_ref().map_or(live.tops.1, |o| o.top_line);
