@@ -16,7 +16,7 @@ jobs:
       matrix:
         include:
           - { os: ubuntu-latest, bin: edittr }
-          - { os: macos-latest, bin: edittr }
+          - { os: macos-15-intel, bin: edittr }
           - { os: windows-latest, bin: edittr.exe }
     runs-on: ${{ matrix.os }}
     steps:

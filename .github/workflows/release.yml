@@ -81,7 +81,10 @@ jobs:
           path: dist/*
 
   macos:
-    runs-on: macos-latest
+    # Intel runner: Apple Silicon (macos-latest) runners are often short on capacity,
+    # and the job builds the same universal app (both architectures, lipo) on either.
+    # The verify job below still runs it on Apple Silicon.
+    runs-on: macos-15-intel
     env:
       MACOSX_DEPLOYMENT_TARGET: "11.0"
     steps:
