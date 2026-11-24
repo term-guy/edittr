@@ -364,7 +364,7 @@ pub struct App {
     tree_loading: HashSet<PathBuf>,
     tree_requested: HashSet<PathBuf>,
     tree_rx: Option<Receiver<HashMap<PathBuf, DirEntries>>>,
-    expanded: HashSet<PathBuf>,
+    expanded: session::FolderSet<PathBuf>,
     /// The file last revealed in the Explorer, and one to scroll into view.
     explorer_revealed: Option<PathBuf>,
     explorer_scroll_to: Option<PathBuf>,
@@ -421,7 +421,7 @@ pub struct App {
     settings_writer: SettingsWriter,
     sessions: session::Sessions,
     /// Collapsed folders in the Changes tree, keyed "S:<path>" (staged) or "U:<path>".
-    changes_collapsed: HashSet<String>,
+    changes_collapsed: session::FolderSet<String>,
     /// Search-in-files matches in a document: ((doc id, version, search gen), byte ranges).
     search_marks: Option<((u64, u64, u64), SearchMarks)>,
     /// Bumped whenever `status` is replaced; keys the cached Changes rows.
@@ -467,7 +467,7 @@ impl App {
             tree_loading: HashSet::new(),
             tree_requested: HashSet::new(),
             tree_rx: None,
-            expanded: HashSet::new(),
+            expanded: session::FolderSet::default(),
             explorer_revealed: None,
             explorer_scroll_to: None,
             outline: Default::default(),
@@ -512,7 +512,7 @@ impl App {
             settings,
             settings_writer,
             sessions: session::Sessions::new(session_writer, startup.window.clone()),
-            changes_collapsed: HashSet::new(),
+            changes_collapsed: session::FolderSet::default(),
             status_gen: 0,
             search_marks: None,
             changes_rows: None,
@@ -559,7 +559,7 @@ impl App {
         self.update_repository(None);
         self.repo_rx = None;
         self.ignored.clear();
-        self.expanded.clear();
+        self.reset_sidebar_ui();
         self.tree.clear();
         self.tree_loading.clear();
         self.tree_requested.clear();

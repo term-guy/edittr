@@ -1,6 +1,7 @@
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, MAIN_SEPARATOR, Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -47,10 +48,63 @@ pub(crate) struct FileTab {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub(crate) struct Workspace {
+pub(crate) struct WorkspaceLayout {
     pub tabs: Vec<FileTab>,
     pub active: Option<OsString>,
     pub sidebar: Sidebar,
+}
+
+#[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct SidebarUi {
+    pub explorer_expanded: Vec<String>,
+    pub changes_collapsed: HashSet<String>,
+    /// Older sessions infer visibility from the saved include and exclude filters.
+    pub search_filters_shown: Option<bool>,
+    pub search_replace_shown: bool,
+}
+
+const MAX_EXPANDED_FOLDERS: usize = 2000;
+
+impl SidebarUi {
+    pub(crate) fn capture_expanded(root: &Path, expanded: &HashSet<PathBuf>) -> Vec<String> {
+        let mut relative: Vec<_> = expanded
+            .iter()
+            .filter_map(|path| path.strip_prefix(root).ok()?.to_str())
+            .filter(|path| !path.is_empty())
+            .collect();
+        // Keep parents ahead of their descendants when the saved list is capped.
+        relative.sort_unstable();
+        relative.truncate(MAX_EXPANDED_FOLDERS);
+        relative.into_iter().map(|path| path.replace(MAIN_SEPARATOR, "/")).collect()
+    }
+
+    /// Called by the workspace loader, off the UI thread.
+    pub(crate) fn restore_expanded(&self, root: &Path) -> HashSet<PathBuf> {
+        self.explorer_expanded
+            .iter()
+            .take(MAX_EXPANDED_FOLDERS)
+            .filter_map(|relative| {
+                let path = Path::new(relative);
+                if relative.is_empty()
+                    || (cfg!(windows) && relative.contains('\\'))
+                    || !path.components().all(|component| matches!(component, Component::Normal(_)))
+                {
+                    return None;
+                }
+                let path = root.join(path);
+                path.is_dir().then_some(path)
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
+pub(crate) struct Workspace {
+    #[serde(flatten)]
+    pub layout: WorkspaceLayout,
+    #[serde(default)]
+    pub sidebar_ui: SidebarUi,
 }
 
 impl Workspace {
@@ -283,16 +337,54 @@ mod tests {
             anchor: 10,
         };
         let workspace = Workspace {
-            active: Some(first.path.clone()),
-            tabs: vec![first, second],
-            sidebar: Sidebar {
-                side: Side::Search,
-                open: false,
-                width: 324.0,
+            layout: WorkspaceLayout {
+                active: Some(first.path.clone()),
+                tabs: vec![first, second],
+                sidebar: Sidebar {
+                    side: Side::Search,
+                    open: false,
+                    width: 324.0,
+                },
+            },
+            sidebar_ui: SidebarUi {
+                explorer_expanded: vec!["src".into(), "src/ui".into()],
+                changes_collapsed: HashSet::from(["S:src".into(), "U:src/ui".into()]),
+                search_filters_shown: Some(false),
+                search_replace_shown: true,
             },
         };
         let json = serde_json::to_string(&workspace).unwrap();
         assert_eq!(serde_json::from_str::<Workspace>(&json).unwrap(), workspace);
+    }
+
+    #[test]
+    fn legacy_workspace_loads_with_sidebar_ui_defaults() {
+        let json = r#"{"tabs":[],"active":null,"sidebar":{"side":"changes","open":true,"width":320.0}}"#;
+        let workspace: Workspace = serde_json::from_str(json).unwrap();
+        assert_eq!(workspace.layout.sidebar.side, Side::Changes);
+        assert_eq!(workspace.sidebar_ui, SidebarUi::default());
+    }
+
+    #[test]
+    fn explorer_restore_keeps_only_existing_workspace_folders() {
+        let root = std::env::temp_dir().join(format!("edittr-session-explorer-{}", std::process::id()));
+        let nested = root.join("src/ui");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(root.join("src/main.rs"), "").unwrap();
+        let vanished = root.join("removed");
+        std::fs::create_dir(&vanished).unwrap();
+        let ui = SidebarUi {
+            explorer_expanded: SidebarUi::capture_expanded(
+                &root,
+                &HashSet::from([root.clone(), nested.clone(), vanished.clone(), root.join("src/main.rs")]),
+            ),
+            ..SidebarUi::default()
+        };
+        std::fs::remove_dir(&vanished).unwrap();
+        let restored = ui.restore_expanded(&root);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(ui.explorer_expanded, ["removed", "src/main.rs", "src/ui"]);
+        assert_eq!(restored, HashSet::from([nested]));
     }
 
     #[test]

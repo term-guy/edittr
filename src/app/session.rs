@@ -1,17 +1,62 @@
 use super::{App, Confirm, DiskText, Tab, background, read_doc_text, receive, save_recent};
-use crate::session::{Debounce, Decision, FileTab, Side, Sidebar, Startup, Update, Window, Workspace, Writer};
+use crate::session::{Debounce, Decision, FileTab, Side, Sidebar, SidebarUi, Startup, Update, Window, Workspace, WorkspaceLayout, Writer};
 use crate::workspace::{self, SearchFilters};
 use eframe::egui;
+use std::borrow::Borrow;
+use std::collections::HashSet;
+use std::hash::Hash;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 const SEARCH_FILTER_DEBOUNCE: Duration = Duration::from_millis(500);
 
+/// Track folder edits so the per-frame session comparison can skip both sets.
+#[derive(Default)]
+pub(super) struct FolderSet<T> {
+    items: HashSet<T>,
+    revision: u64,
+}
+
+impl<T> Deref for FolderSet<T> {
+    type Target = HashSet<T>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.items
+    }
+}
+
+impl<T: Eq + Hash> FolderSet<T> {
+    pub(super) fn insert(&mut self, item: T) -> bool {
+        let inserted = self.items.insert(item);
+        self.revision += u64::from(inserted);
+        inserted
+    }
+
+    pub(super) fn remove<Q: Eq + Hash + ?Sized>(&mut self, item: &Q) -> bool
+    where
+        T: Borrow<Q>,
+    {
+        let removed = self.items.remove(item);
+        self.revision += u64::from(removed);
+        removed
+    }
+}
+
+#[derive(Default, PartialEq)]
+struct WorkspaceSnapshot {
+    layout: WorkspaceLayout,
+    expanded_revision: u64,
+    collapsed_revision: u64,
+    search_filters_shown: bool,
+    search_replace_shown: bool,
+}
+
 pub(super) struct Sessions {
     writer: Option<Writer>,
     loading: Option<Receiver<LoadedWorkspace>>,
-    workspace: Debounce<Workspace>,
+    workspace: Debounce<WorkspaceSnapshot>,
     saved_filters: SearchFilters,
     /// The next restore is "close folder": show the empty start page.
     start_page: bool,
@@ -27,6 +72,10 @@ struct LoadedWorkspace {
     ignored: Vec<String>,
     search_filters: SearchFilters,
     sidebar: Sidebar,
+    expanded: HashSet<PathBuf>,
+    changes_collapsed: HashSet<String>,
+    search_filters_shown: Option<bool>,
+    search_replace_shown: bool,
     tabs: Vec<(FileTab, DiskText)>,
     active: Option<PathBuf>,
     error: Option<String>,
@@ -34,9 +83,10 @@ struct LoadedWorkspace {
 
 impl LoadedWorkspace {
     fn load(root: Option<PathBuf>, file: Option<PathBuf>) -> Self {
-        let snapshot = Workspace::load(root.as_deref());
-        let mut active = snapshot.active.map(|p| workspace::plain_path(Path::new(&p)));
-        let mut tabs: Vec<_> = snapshot
+        let Workspace { layout, sidebar_ui } = Workspace::load(root.as_deref());
+        let expanded = root.as_deref().map(|root| sidebar_ui.restore_expanded(root)).unwrap_or_default();
+        let mut active = layout.active.map(|p| workspace::plain_path(Path::new(&p)));
+        let mut tabs: Vec<_> = layout
             .tabs
             .into_iter()
             .filter_map(|mut tab| {
@@ -81,7 +131,11 @@ impl LoadedWorkspace {
             root,
             ignored,
             search_filters,
-            sidebar: snapshot.sidebar,
+            sidebar: layout.sidebar,
+            expanded,
+            changes_collapsed: sidebar_ui.changes_collapsed,
+            search_filters_shown: sidebar_ui.search_filters_shown,
+            search_replace_shown: sidebar_ui.search_replace_shown,
             tabs,
             active,
             error,
@@ -94,7 +148,7 @@ impl Sessions {
         Self {
             writer,
             loading: None,
-            workspace: Debounce::new(Some(Workspace::default())),
+            workspace: Debounce::new(Some(WorkspaceSnapshot::default())),
             saved_filters: SearchFilters::default(),
             start_page: false,
             pending_filters: None,
@@ -107,6 +161,13 @@ impl Sessions {
 }
 
 impl App {
+    pub(super) fn reset_sidebar_ui(&mut self) {
+        self.expanded = FolderSet::default();
+        self.changes_collapsed = FolderSet::default();
+        self.changes_rows = None;
+        self.search_replace.shown = false;
+    }
+
     pub(super) fn start_session(&mut self, startup: Startup) {
         if !crate::session::enabled() {
             if let Some(root) = startup.root {
@@ -196,6 +257,13 @@ impl App {
                 self.clear_project();
             }
             self.apply_search_filters(loaded.search_filters);
+            // Install the tree state before the sidebar can draw for this workspace.
+            self.expanded.items = loaded.expanded;
+            self.changes_collapsed.items = loaded.changes_collapsed;
+            if let Some(shown) = loaded.search_filters_shown {
+                self.search.show_filters = shown;
+            }
+            self.search_replace.shown = loaded.search_replace_shown;
             self.side = loaded.sidebar.side;
             self.side_open = loaded.sidebar.open;
             self.sessions.width = loaded.sidebar.width.max(160.0);
@@ -222,6 +290,12 @@ impl App {
                     self.active = index;
                 }
             }
+            // The saved Explorer layout wins on reopen: the restored active file counts
+            // as revealed, so its folders aren't expanded until the user switches files.
+            self.explorer_revealed = match self.tabs.get(self.active) {
+                Some(Tab::File(doc)) => Some(doc.path.clone()),
+                _ => None,
+            };
             if let Some(error) = loaded.error {
                 self.message = error;
             }
@@ -314,7 +388,7 @@ impl App {
         if self.sessions.loading.is_some() {
             return;
         }
-        let snapshot = Workspace {
+        let layout = WorkspaceLayout {
             tabs: self
                 .tabs
                 .iter()
@@ -340,10 +414,33 @@ impl App {
                 width: self.sessions.width,
             },
         };
+        let snapshot = WorkspaceSnapshot {
+            layout,
+            expanded_revision: self.expanded.revision,
+            collapsed_revision: self.changes_collapsed.revision,
+            search_filters_shown: self.search.show_filters,
+            search_replace_shown: self.search_replace.shown,
+        };
         match self.sessions.workspace.update(snapshot, now, flush) {
             Decision::Unchanged => {}
             Decision::Wait(delay) => self.ctx.request_repaint_after(delay),
-            Decision::Write(snapshot) => writer.save(Update::Workspace(self.root.clone(), snapshot.clone()), &self.ctx),
+            Decision::Write(snapshot) => {
+                let sidebar_ui = SidebarUi {
+                    explorer_expanded: self
+                        .root
+                        .as_deref()
+                        .map(|root| SidebarUi::capture_expanded(root, &self.expanded))
+                        .unwrap_or_default(),
+                    changes_collapsed: self.changes_collapsed.items.clone(),
+                    search_filters_shown: Some(snapshot.search_filters_shown),
+                    search_replace_shown: snapshot.search_replace_shown,
+                };
+                let workspace = Workspace {
+                    layout: snapshot.layout.clone(),
+                    sidebar_ui,
+                };
+                writer.save(Update::Workspace(self.root.clone(), workspace), &self.ctx);
+            }
         }
     }
 }
