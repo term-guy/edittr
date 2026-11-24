@@ -65,9 +65,11 @@ pub struct Line {
     end: (ParseState, HighlightState),
 }
 
-/// Files with more lines than this get their first full highlight on a background
-/// thread (shown as plain text meanwhile) instead of stalling the frame that opens them.
-const BACKGROUND_LINES: usize = 2_000;
+/// Files with more lines than this get their first full highlight (and the one after a
+/// theme change) on a background thread, shown as plain text meanwhile, instead of
+/// stalling the frame. At ~25-50 us per line (Rust's grammar is among the slowest), a
+/// synchronous pass over a few hundred lines already cost a 10-20 ms frame.
+const BACKGROUND_LINES: usize = 150;
 
 #[derive(Default)]
 pub struct Cache {
