@@ -107,6 +107,39 @@ pub fn git(repo: &Path, rel: &str, text: &str) -> Result<Blame, String> {
     Ok(parse_porcelain(&String::from_utf8_lossy(&out.stdout)))
 }
 
+/// From `svn blame` lines (one per line; dates as YYYY-MM-DD).
+pub fn from_svn(lines: &[crate::vcs::BlameLine]) -> Blame {
+    let mut blame = Blame::default();
+    let mut index: std::collections::HashMap<&str, u32> = std::collections::HashMap::new();
+    for l in lines {
+        let i = *index.entry(&l.rev).or_insert_with(|| {
+            blame.commits.push(BlameLine {
+                rev: l.rev.clone(),
+                author: l.author.clone(),
+                time: date_to_epoch(&l.date).unwrap_or(0),
+                summary: l.summary.clone(),
+            });
+            (blame.commits.len() - 1) as u32
+        });
+        blame.lines.push(i);
+    }
+    blame
+}
+
+/// "YYYY-MM-DD" (anything after is ignored) to seconds since the epoch, UTC midnight.
+fn date_to_epoch(date: &str) -> Option<i64> {
+    let y: i64 = date.get(0..4)?.parse().ok()?;
+    let m: i64 = date.get(5..7)?.parse().ok()?;
+    let d: i64 = date.get(8..10)?.parse().ok()?;
+    // Days from civil (Howard Hinnant's algorithm).
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Some((era * 146_097 + doe - 719_468) * 86_400)
+}
+
 /// Parse `git blame --porcelain`.
 pub fn parse_porcelain(out: &str) -> Blame {
     let mut blame = Blame::default();
@@ -204,6 +237,22 @@ filename a.rs
         assert!(!second.uncommitted() && !second.author.is_empty() && second.time > 0);
         let new = git(root, "no/such/file.rs", "a\nb").unwrap();
         assert!(new.line(1).unwrap().uncommitted());
+    }
+
+    #[test]
+    fn svn_lines_and_dates() {
+        assert_eq!(date_to_epoch("1970-01-01"), Some(0));
+        assert_eq!(date_to_epoch("2023-11-14T22:13:20.000000Z"), Some(1_699_920_000));
+        let l = |rev: &str| crate::vcs::BlameLine {
+            rev: rev.into(),
+            author: "bob".into(),
+            date: "2024-02-29".into(),
+            summary: "s".into(),
+        };
+        let b = from_svn(&[l("r3"), l("r5"), l("r3")]);
+        assert_eq!(b.lines, vec![0, 1, 0]);
+        assert_eq!(b.line(1).unwrap().rev, "r5");
+        assert_eq!(b.line(0).unwrap().time, date_to_epoch("2024-02-29").unwrap());
     }
 
     #[test]

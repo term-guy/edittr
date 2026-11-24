@@ -2,11 +2,11 @@
 mod tour;
 
 use crate::column::{self, ColumnSel};
-use crate::git::{self, FileChange, Status};
 use crate::graph::Graph;
 use crate::icons as ic;
 use crate::search::{self, FileHits};
 use crate::settings::{Settings, SettingsWriter};
+use crate::vcs::{self, FileChange, Status, Vcs};
 use crate::{blame, highlight};
 use crate::{goto, installer, lsp, workspace};
 use eframe::egui::{self, Color32, Key, KeyboardShortcut, Modifiers, RichText};
@@ -32,7 +32,7 @@ const COMMIT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::
 const STATUS_POLL: Duration = Duration::from_secs(3);
 const ACTIVITY_POLL: Duration = Duration::from_millis(250);
 const HIGHLIGHT_LIMIT: usize = 1_000_000; // bytes; bigger files are shown as plain text
-const IGNORED_DIRS: &[&str] = &[".git", "node_modules", "target", ".venv", "__pycache__", "dist", "build"];
+const IGNORED_DIRS: &[&str] = &[".git", ".svn", "node_modules", "target", ".venv", "__pycache__", "dist", "build"];
 
 struct Doc {
     path: PathBuf,
@@ -86,7 +86,7 @@ struct InstallJob {
     rx: Receiver<Result<PathBuf, String>>,
 }
 
-struct GitRefresh {
+struct VcsRefresh {
     status: Result<Status, String>,
     branches: Vec<String>,
 }
@@ -196,12 +196,37 @@ enum SearchRow {
 struct QuickOpen {
     query: String,
     files: Vec<String>,
+    files_rx: Option<Receiver<Vec<String>>>,
     selected: usize,
 }
 
 enum Confirm {
     CloseTabs(Vec<usize>),
     Discard(FileChange),
+}
+
+type DetectedRepo = Option<(PathBuf, Vcs)>;
+
+enum VcsOperation {
+    Change(&'static str),
+    History(&'static str),
+    Commit(String, bool),
+    Discard,
+}
+
+impl VcsOperation {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Change(label) | Self::History(label) => label,
+            Self::Commit(..) => "Commit",
+            Self::Discard => "Discard",
+        }
+    }
+}
+
+struct VcsJob {
+    operation: VcsOperation,
+    rx: Receiver<Result<String, String>>,
 }
 
 pub struct App {
@@ -212,6 +237,8 @@ pub struct App {
     /// Recently opened folders, most recent first.
     recent: Vec<PathBuf>,
     repo: Option<PathBuf>,
+    vcs: Option<Vcs>,
+    repo_rx: Option<Receiver<Result<DetectedRepo, String>>>,
     side: Side,
     side_open: bool,
     tabs: Vec<Tab>,
@@ -221,7 +248,7 @@ pub struct App {
     expanded: HashSet<PathBuf>,
 
     status: Status,
-    status_rx: Option<Receiver<GitRefresh>>,
+    status_rx: Option<Receiver<VcsRefresh>>,
     last_poll: Instant,
     branches: Vec<String>,
     commit_msg: String,
@@ -230,8 +257,11 @@ pub struct App {
     graph: Option<Graph>,
     graph_sel: Option<usize>,
     graph_detail: Vec<String>,
+    graph_rx: Option<Receiver<Result<Graph, String>>>,
+    graph_detail_rx: Option<Receiver<Vec<String>>>,
+    diff_rx: Option<Receiver<DiffTab>>,
 
-    bg_task: Option<(String, Receiver<Result<String, String>>)>,
+    bg_task: Option<VcsJob>,
     message: String,
     quick_open: Option<QuickOpen>,
     confirm: Option<Confirm>,
@@ -271,6 +301,8 @@ impl App {
         let mut app = App {
             ctx: cc.egui_ctx.clone(),
             repo: None,
+            vcs: None,
+            repo_rx: None,
             root: None,
             ignored: Vec::new(),
             recent: load_recent(),
@@ -289,6 +321,9 @@ impl App {
             graph: None,
             graph_sel: None,
             graph_detail: Vec::new(),
+            graph_rx: None,
+            graph_detail_rx: None,
+            diff_rx: None,
             bg_task: None,
             message: String::new(),
             quick_open: None,
@@ -319,7 +354,12 @@ impl App {
     }
 
     fn set_root(&mut self, root: PathBuf) {
-        self.repo = git::repo_root(&root);
+        self.repo = None;
+        self.vcs = None;
+        self.repo_rx = Some(background(&self.ctx, {
+            let root = root.clone();
+            move || Ok(vcs::detect(&root))
+        }));
         self.recent.retain(|r| r != &root);
         self.recent.insert(0, root.clone());
         self.recent.truncate(10);
@@ -337,13 +377,20 @@ impl App {
         self.expanded.clear();
         self.graph = None;
         self.graph_sel = None;
+        self.graph_detail.clear();
+        self.graph_rx = None;
+        self.graph_detail_rx = None;
+        self.diff_rx = None;
+        self.bg_task = None;
+        self.amend = false;
+        self.quick_open = None;
+        self.confirm = None;
         self.status = Status::default();
         self.status_rx = None;
         self.branches.clear();
         self.reset_lsp();
         self.goto_rx = None;
         self.nav_back.clear();
-        self.refresh_git();
     }
 
     /// Folder to run tools in: the project, else the active file's folder.
@@ -405,57 +452,72 @@ impl App {
             .to_string()
     }
 
-    // ---------------------------------------------------------------- git
+    // --------------------------------------------------------- source control
 
-    fn refresh_git(&mut self) {
-        let Some(repo) = self.repo.clone() else { return };
-        let (tx, rx) = channel();
-        let ctx = self.ctx.clone();
-        std::thread::spawn(move || {
-            let _ = tx.send(GitRefresh {
-                status: git::status(&repo),
-                branches: git::branches(&repo),
-            });
-            ctx.request_repaint();
-        });
-        self.status_rx = Some(rx);
+    fn repository(&self) -> Option<(PathBuf, Vcs)> {
+        Some((self.repo.clone()?, self.vcs?))
+    }
+
+    fn refresh_vcs(&mut self) {
+        let Some((repo, vcs)) = self.repository() else { return };
+        self.status_rx = Some(background(&self.ctx, move || VcsRefresh {
+            status: vcs.status(&repo),
+            branches: vcs.branches(&repo),
+        }));
         self.last_poll = Instant::now();
-        self.ctx.request_repaint();
-        if self.graph.is_some() {
+    }
+
+    fn refresh_history(&mut self) {
+        if self.tabs.iter().any(|t| matches!(t, Tab::Graph)) {
             self.load_graph();
         }
     }
 
     fn load_graph(&mut self) {
-        let Some(repo) = &self.repo else { return };
-        match git::log(repo, 2000) {
-            Ok(commits) => self.graph = Some(Graph::build(commits)),
-            Err(e) => self.message = e,
-        }
+        let Some((repo, vcs)) = self.repository() else { return };
+        let (tx, rx) = channel();
+        let ctx = self.ctx.clone();
+        std::thread::spawn(move || {
+            let result = vcs.log(&repo, 2000, |cached| {
+                let _ = tx.send(Ok(Graph::build(cached)));
+                ctx.request_repaint();
+            });
+            let _ = tx.send(result.map(Graph::build));
+            drop(tx);
+            ctx.request_repaint();
+        });
+        self.graph_rx = Some(rx);
     }
 
-    fn git_op(&mut self, res: Result<String, String>) {
-        match res {
-            Ok(out) => self.message = out.lines().last().unwrap_or("").to_string(),
-            Err(e) => self.message = e,
-        }
-        self.refresh_git();
+    fn load_graph_detail(&mut self, row: usize) {
+        let Some((repo, vcs)) = self.repository() else { return };
+        let Some(commit) = self.graph.as_ref().and_then(|g| g.commits.get(row)) else {
+            return;
+        };
+        let hash = commit.hash.clone();
+        self.graph_sel = Some(row);
+        self.graph_detail.clear();
+        self.graph_detail_rx = Some(background(&self.ctx, move || {
+            vcs.show_commit(&repo, &hash).lines().map(str::to_string).collect()
+        }));
     }
 
-    fn spawn_remote(&mut self, label: &str, args: &'static [&'static str], ctx: &egui::Context) {
-        let Some(repo) = self.repo.clone() else { return };
+    fn spawn_vcs(&mut self, operation: VcsOperation, work: impl FnOnce(Vcs, &Path) -> Result<String, String> + Send + 'static) {
+        let Some((repo, vcs)) = self.repository() else { return };
         if self.bg_task.is_some() {
             return;
         }
-        let (tx, rx) = channel();
-        ctx.request_repaint();
-        let ctx = ctx.clone();
-        std::thread::spawn(move || {
-            let _ = tx.send(git::run(&repo, args));
-            ctx.request_repaint();
+        self.status_rx = None;
+        let rx = background(&self.ctx, move || work(vcs, &repo));
+        self.message = format!("{}…", operation.label());
+        self.bg_task = Some(VcsJob { operation, rx });
+    }
+
+    fn stage_change(&mut self, path: Option<String>, stage: bool) {
+        let label = if stage { "Stage" } else { "Unstage" };
+        self.spawn_vcs(VcsOperation::Change(label), move |vcs, repo| {
+            vcs.stage(repo, path.as_deref(), stage)
         });
-        self.message = format!("{label}…");
-        self.bg_task = Some((label.to_string(), rx));
     }
 
     /// Keep the active file's inline blame current: rerun after edits pause.
@@ -464,7 +526,9 @@ impl App {
         if !self.settings.inline_blame {
             return;
         }
-        let Some(repo) = self.repo.clone() else { return };
+        let (Some(repo), Some(vcs)) = (self.repo.clone(), self.vcs) else {
+            return;
+        };
         let Some(Tab::File(doc)) = self.tabs.get_mut(self.active) else {
             return;
         };
@@ -475,7 +539,13 @@ impl App {
             doc.blame = res.ok();
             doc.blame_version = Some(version);
         }
-        if doc.blame_rx.is_some() || doc.blame_version == Some(doc.version) || doc.text.len() > 2_000_000 {
+        // Git blames the live buffer, so it follows edits. Svn blames the saved file
+        // (it may need the server): once per open and after each save.
+        let fresh = match vcs {
+            Vcs::Git => doc.blame_version == Some(doc.version),
+            Vcs::Svn => doc.blame_version.is_some(),
+        };
+        if doc.blame_rx.is_some() || fresh || doc.text.len() > 2_000_000 {
             return;
         }
         if let Some(t) = doc.edited_at
@@ -489,7 +559,11 @@ impl App {
         let (text, version, ctx) = (doc.text.clone(), doc.version, ctx.clone());
         let (tx, rx) = channel();
         std::thread::spawn(move || {
-            let _ = tx.send((version, blame::git(&repo, &rel, &text)));
+            let res = match vcs {
+                Vcs::Git => blame::git(&repo, &rel, &text),
+                Vcs::Svn => vcs::blame(vcs, &repo, &rel).map(|lines| blame::from_svn(&lines)),
+            };
+            let _ = tx.send((version, res));
             ctx.request_repaint();
         });
         doc.blame_rx = Some(rx);
@@ -502,36 +576,109 @@ impl App {
         if let Some(err) = self.settings_writer.errors.try_iter().last() {
             self.message = format!("Could not save settings: {err}");
         }
-        if let Some(rx) = &self.status_rx {
-            match rx.try_recv() {
-                Ok(refresh) => {
-                    match refresh.status {
-                        Ok(s) => self.status = s,
-                        Err(e) => self.message = e,
-                    }
-                    self.branches = refresh.branches;
-                    self.status_rx = None;
+        self.poll_vcs(ctx);
+        if let Some(q) = &mut self.quick_open
+            && let Some(files) = receive(&mut q.files_rx)
+        {
+            q.files = files;
+        }
+    }
+
+    fn poll_vcs(&mut self, ctx: &egui::Context) {
+        if let Some(detected) = receive(&mut self.repo_rx) {
+            match detected {
+                Ok(Some((root, vcs))) => {
+                    self.repo = Some(root);
+                    self.vcs = Some(vcs);
+                    self.refresh_vcs();
+                    self.refresh_history();
                 }
-                Err(TryRecvError::Disconnected) => self.status_rx = None,
-                Err(TryRecvError::Empty) => {}
+                Ok(None) => {}
+                Err(e) => self.message = e,
             }
         }
-        if let Some((label, rx)) = &self.bg_task
-            && let Ok(res) = rx.try_recv()
-        {
-            self.message = match res {
-                Ok(_) => format!("{label} done"),
-                Err(e) => format!("{label} failed: {e}"),
+        if let Some(refresh) = receive(&mut self.status_rx) {
+            match refresh.status {
+                Ok(s) => self.status = s,
+                Err(e) => self.message = e,
+            }
+            self.branches = refresh.branches;
+        }
+        if let Some(job) = &self.bg_task {
+            let result = match job.rx.try_recv() {
+                Ok(result) => Some(result),
+                Err(TryRecvError::Disconnected) => Some(Err("Source control worker stopped".into())),
+                Err(TryRecvError::Empty) => None,
             };
-            self.bg_task = None;
-            self.refresh_git();
+            if let Some(result) = result {
+                let operation = self.bg_task.take().unwrap().operation;
+                let label = operation.label();
+                match result {
+                    Ok(out) => {
+                        self.message = out
+                            .lines()
+                            .last()
+                            .filter(|s| !s.is_empty())
+                            .map_or_else(|| format!("{label} done"), str::to_string);
+                        match operation {
+                            VcsOperation::Commit(draft, amend) => {
+                                if self.commit_msg == draft && self.amend == amend {
+                                    self.commit_msg.clear();
+                                    self.amend = false;
+                                }
+                                self.refresh_history();
+                            }
+                            VcsOperation::Discard => self.reload_clean_docs(),
+                            VcsOperation::History(_) => self.refresh_history(),
+                            VcsOperation::Change(_) => {}
+                        }
+                    }
+                    Err(e) => self.message = format!("{label} failed: {e}"),
+                }
+                self.refresh_vcs();
+            }
+        }
+        if let Some(rx) = &self.graph_rx {
+            loop {
+                match rx.try_recv() {
+                    Ok(Ok(graph)) => {
+                        self.graph_sel = self.graph_sel.and_then(|row| {
+                            let selected = &self.graph.as_ref()?.commits.get(row)?.hash;
+                            graph.commits.iter().position(|c| &c.hash == selected)
+                        });
+                        if self.graph_sel.is_none() {
+                            self.graph_detail.clear();
+                            self.graph_detail_rx = None;
+                        }
+                        self.graph = Some(graph);
+                    }
+                    Ok(Err(e)) => self.message = e,
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        self.graph_rx = None;
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some(detail) = receive(&mut self.graph_detail_rx) {
+            self.graph_detail = detail;
+        }
+        if let Some(mut tab) = receive(&mut self.diff_rx) {
+            tab.inline = matches!(self.tabs.iter().find(|t| matches!(t, Tab::Diff(_))), Some(Tab::Diff(d)) if d.inline);
+            self.show_tab(Tab::Diff(Box::new(tab)));
         }
         let focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
-        if self.repo.is_some() && focused && self.last_poll.elapsed() > STATUS_POLL && self.status_rx.is_none() {
-            self.refresh_git();
-        }
-        if self.repo.is_some() {
-            ctx.request_repaint_after(STATUS_POLL);
+        if self.repo.is_some() && focused && self.bg_task.is_none() {
+            if self.last_poll.elapsed() >= STATUS_POLL && self.status_rx.is_none() {
+                self.refresh_vcs();
+                if self.vcs == Some(Vcs::Git) && self.graph_rx.is_none() {
+                    self.refresh_history();
+                }
+            }
+            if self.status_rx.is_none() {
+                ctx.request_repaint_after(STATUS_POLL.saturating_sub(self.last_poll.elapsed()));
+            }
         }
     }
 
@@ -598,18 +745,24 @@ impl App {
     }
 
     fn open_diff(&mut self, change: &FileChange, staged: bool) {
-        let Some(repo) = &self.repo else { return };
-        let text = git::diff(repo, change, staged);
-        let title = format!("{} ({})", file_name(&change.path), if staged { "staged" } else { "working tree" });
-        let path = repo.join(&change.path);
-        let inline = matches!(self.tabs.iter().find(|t| matches!(t, Tab::Diff(_))), Some(Tab::Diff(d)) if d.inline);
-        let mut tab = DiffTab::new(title, path, &text);
-        tab.inline = inline; // keep the user's chosen layout
-        self.show_tab(Tab::Diff(Box::new(tab)));
+        let Some((repo, vcs)) = self.repository() else { return };
+        let change = change.clone();
+        self.diff_rx = Some(background(&self.ctx, move || {
+            let text = vcs.diff(&repo, &change, staged);
+            let kind = if staged {
+                "staged"
+            } else if vcs.has_index() {
+                "working tree"
+            } else {
+                "working copy"
+            };
+            let title = format!("{} ({kind})", file_name(&change.path));
+            DiffTab::new(title, repo.join(&change.path), &text)
+        }));
     }
 
     fn open_graph(&mut self) {
-        if self.graph.is_none() {
+        if self.graph_rx.is_none() {
             self.load_graph();
         }
         self.show_tab(Tab::Graph);
@@ -620,11 +773,14 @@ impl App {
             match std::fs::write(&doc.path, &doc.text) {
                 Ok(()) => {
                     doc.saved = doc.text.clone();
+                    if self.vcs == Some(Vcs::Svn) {
+                        doc.blame_version = None; // svn blames the saved file: redo it
+                    }
                     self.message = format!("Saved {}", doc.path.display());
                 }
                 Err(e) => self.message = format!("Save failed: {e}"),
             }
-            self.refresh_git();
+            self.refresh_vcs();
         }
     }
 
@@ -701,14 +857,17 @@ impl App {
     }
 
     fn start_quick_open(&mut self) {
-        let Some(root) = &self.root else {
+        let Some(root) = self.root.clone() else {
             self.message = "Open a folder to use Go to file".into();
             return;
         };
-        let files = project_files(root, self.repo.is_some(), &self.ignored);
+        let vcs = self.vcs;
+        let ignored = self.ignored.clone();
+        let files_rx = background(&self.ctx, move || project_files(&root, vcs, &ignored));
         self.quick_open = Some(QuickOpen {
             query: String::new(),
-            files,
+            files: Vec::new(),
+            files_rx: Some(files_rx),
             selected: 0,
         });
     }
@@ -786,11 +945,11 @@ impl App {
         let project = self.root.clone();
         let ignored = self.ignored.clone();
         let ignored_for_goto = ignored.clone();
-        let in_repo = self.repo.is_some();
+        let vcs = self.vcs;
         let root = project.clone().unwrap_or_else(|| self.work_dir());
         let req = goto::Request {
             root,
-            files: Box::new(move || project.map(|r| project_files(&r, in_repo, &ignored)).unwrap_or_default()),
+            files: Box::new(move || project.map(|r| project_files(&r, vcs, &ignored)).unwrap_or_default()),
             path: path.clone(),
             text,
             ignored: if self.root.is_some() { ignored_for_goto } else { Vec::new() },
@@ -928,7 +1087,7 @@ impl App {
             return;
         };
         st.cancel = Arc::new(AtomicBool::new(false));
-        let in_repo = self.repo.is_some();
+        let vcs = self.vcs;
         let ignored = self.ignored.clone();
         let list_root = root.clone();
         // Open files are searched first, from their (possibly unsaved) text; active tab first.
@@ -944,7 +1103,7 @@ impl App {
             .collect();
         st.rx = Some(search::spawn(
             root,
-            move || project_files(&list_root, in_repo, &ignored),
+            move || project_files(&list_root, vcs, &ignored),
             open,
             st.opts.clone(),
             st.cancel.clone(),
@@ -1197,11 +1356,12 @@ impl App {
         ui.vertical_centered(|ui| {
             ui.spacing_mut().item_spacing.y = 6.0;
             let n = self.status.staged.len() + self.status.unstaged.len();
-            let changes_tip = if n > 0 {
-                format!("Source control ({n} changes)")
+            let title = if self.vcs == Some(Vcs::Svn) {
+                "Subversion"
             } else {
-                "Source control".into()
+                "Source control"
             };
+            let changes_tip = if n > 0 { format!("{title} ({n} changes)") } else { title.into() };
             for (side, icon, tip) in [
                 (Side::Explorer, ic::FILES, "Explorer".to_string()),
                 (Side::Search, ic::MAGNIFYING_GLASS, "Search in files (Ctrl/Cmd+Shift+F)".to_string()),
@@ -1283,7 +1443,7 @@ impl App {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if icon_button(ui, ic::ARROWS_CLOCKWISE).on_hover_text("Refresh").clicked() {
                     self.tree.clear();
-                    self.refresh_git();
+                    self.refresh_vcs();
                 }
             });
         });
@@ -1314,7 +1474,7 @@ impl App {
         ui.label(RichText::new("NO FOLDER OPENED").small().strong());
         ui.separator();
         ui.add_space(6.0);
-        ui.weak("Open a folder to browse its files, search it and use git.");
+        ui.weak("Open a folder to browse its files, search it and use source control.");
         ui.add_space(8.0);
         if ui
             .add(egui::Button::new(format!("{} Open Folder…", ic::FOLDER_OPEN)).min_size(egui::vec2(ui.available_width(), 28.0)))
@@ -1412,60 +1572,80 @@ impl App {
     }
 
     fn changes(&mut self, ui: &mut egui::Ui) {
+        let heading = match self.vcs {
+            Some(Vcs::Svn) => "SOURCE CONTROL · SUBVERSION",
+            _ => "SOURCE CONTROL",
+        };
+        ui.label(RichText::new(heading).small().strong());
+        ui.separator();
         let Some(root) = self.root.clone() else {
-            ui.label(RichText::new("SOURCE CONTROL").small().strong());
-            ui.separator();
-            ui.weak("Open a folder to see its git changes.");
+            ui.weak("Open a folder to see its changes.");
             ui.add_space(6.0);
             if ui.button(format!("{} Open Folder…", ic::FOLDER_OPEN)).clicked() {
                 self.request_open_folder();
             }
             return;
         };
-        let Some(repo) = self.repo.clone() else {
-            ui.label("Not a git repository.");
-            if ui.button("Initialize repository").clicked() {
-                let r = git::run(&root, &["init"]);
-                self.git_op(r);
-                self.repo = git::repo_root(&root);
-                self.refresh_git();
+        if self.repo_rx.is_some() {
+            ui.weak("Detecting source control…");
+            return;
+        }
+        let Some((repo, vcs)) = self.repository() else {
+            ui.label("No Git or Subversion repository found.");
+            if ui.button("Initialize Git repository").clicked() {
+                self.repo_rx = Some(background(&self.ctx, move || {
+                    vcs::init_git(&root)?;
+                    Ok(vcs::detect(&root))
+                }));
             }
             return;
         };
+        let busy = self.bg_task.is_some();
+        let has_index = vcs.has_index();
 
         ui.horizontal(|ui| {
-            let current = self.status.branch.clone();
-            egui::ComboBox::from_id_salt("branch")
-                .selected_text(format!("{} {current}", ic::GIT_BRANCH))
-                .width(140.0)
-                .show_ui(ui, |ui| {
-                    for b in self.branches.clone() {
-                        if ui.selectable_label(b == current, &b).clicked() && b != current {
-                            let r = git::switch(&repo, &b);
-                            self.git_op(r);
+            if has_index {
+                let current = self.status.branch.clone();
+                ui.add_enabled_ui(!busy, |ui| {
+                    egui::ComboBox::from_id_salt("branch")
+                        .selected_text(format!("{} {current}", ic::GIT_BRANCH))
+                        .width(140.0)
+                        .show_ui(ui, |ui| {
+                            for b in self.branches.clone() {
+                                if ui.selectable_label(b == current, &b).clicked() && b != current {
+                                    self.spawn_vcs(VcsOperation::History("Switch branch"), move |vcs, repo| vcs.switch(repo, &b));
+                                }
+                            }
+                        });
+                });
+                ui.weak(&self.status.ahead_behind);
+            } else {
+                ui.label(format!("{} {}", ic::GIT_BRANCH, self.status.branch));
+            }
+        });
+        ui.horizontal(|ui| {
+            if has_index {
+                ui.add_enabled_ui(!busy, |ui| {
+                    for (icon, tip, label, args) in [
+                        (ic::CLOUD_ARROW_DOWN, "Fetch all", "Fetch", &["fetch", "--all", "--prune"][..]),
+                        (ic::ARROW_DOWN, "Pull (fast-forward only)", "Pull", &["pull", "--ff-only"][..]),
+                        (ic::ARROW_UP, "Push", "Push", &["push"][..]),
+                    ] {
+                        if icon_button(ui, icon).on_hover_text(tip).clicked() {
+                            self.spawn_vcs(VcsOperation::History(label), move |vcs, repo| vcs.remote(repo, args));
                         }
                     }
                 });
-            ui.weak(&self.status.ahead_behind);
-        });
-        ui.horizontal(|ui| {
-            let busy = self.bg_task.is_some();
-            ui.add_enabled_ui(!busy, |ui| {
-                if icon_button(ui, ic::CLOUD_ARROW_DOWN).on_hover_text("Fetch all").clicked() {
-                    self.spawn_remote("Fetch", &["fetch", "--all", "--prune"], ui.ctx());
-                }
-                if icon_button(ui, ic::ARROW_DOWN).on_hover_text("Pull (fast-forward only)").clicked() {
-                    self.spawn_remote("Pull", &["pull", "--ff-only"], ui.ctx());
-                }
-                if icon_button(ui, ic::ARROW_UP).on_hover_text("Push").clicked() {
-                    self.spawn_remote("Push", &["push"], ui.ctx());
-                }
-            });
+            }
             if busy {
                 ui.spinner();
             }
-            if icon_button(ui, ic::ARROWS_CLOCKWISE).on_hover_text("Refresh").clicked() {
-                self.refresh_git();
+            if icon_button(ui, ic::ARROWS_CLOCKWISE)
+                .on_hover_text(format!("Refresh {}", vcs.name()))
+                .clicked()
+            {
+                self.refresh_vcs();
+                self.refresh_history();
             }
             let (icon, tip) = if self.settings.changes_tree {
                 (ic::LIST, "View as list")
@@ -1476,7 +1656,7 @@ impl App {
                 self.settings.changes_tree = !self.settings.changes_tree;
                 self.save_settings(ui.ctx());
             }
-            if icon_button(ui, ic::TREE_STRUCTURE).on_hover_text("Git graph").clicked() {
+            if icon_button(ui, ic::TREE_STRUCTURE).on_hover_text(vcs.history_title()).clicked() {
                 self.open_graph();
             }
         });
@@ -1489,16 +1669,24 @@ impl App {
         );
         let commit_key = ui.input_mut(|i| i.consume_shortcut(&COMMIT));
         ui.horizontal(|ui| {
-            let can = !self.commit_msg.trim().is_empty() && (!self.status.staged.is_empty() || self.amend);
-            let clicked = ui.add_enabled(can, egui::Button::new(format!("{} Commit", ic::CHECK))).clicked();
-            ui.checkbox(&mut self.amend, "Amend");
-            if (clicked || (commit_key && can)) && can {
-                let r = git::commit(&repo, self.commit_msg.trim(), self.amend);
-                if r.is_ok() {
-                    self.commit_msg.clear();
-                    self.amend = false;
-                }
-                self.git_op(r);
+            let can = !busy
+                && !self.commit_msg.trim().is_empty()
+                && if has_index {
+                    !self.status.staged.is_empty() || self.amend
+                } else {
+                    !self.status.unstaged.is_empty()
+                };
+            let commit = ui.add_enabled(can, egui::Button::new(format!("{} Commit", ic::CHECK)));
+            if has_index {
+                ui.checkbox(&mut self.amend, "Amend");
+            }
+            if can && (commit.clicked() || commit_key) {
+                let draft = self.commit_msg.clone();
+                let amend = has_index && self.amend;
+                let message = draft.trim().to_string();
+                self.spawn_vcs(VcsOperation::Commit(draft, amend), move |vcs, repo| {
+                    vcs.commit(repo, &message, amend)
+                });
             }
         });
         ui.separator();
@@ -1507,29 +1695,36 @@ impl App {
         let unstaged = self.status.unstaged.clone();
         let mut actions = Vec::new();
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.strong(format!("Staged ({})", staged.len()));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if !staged.is_empty() && icon_button(ui, ic::MINUS).on_hover_text("Unstage all").clicked() {
-                        let r = git::unstage_all(&repo);
-                        self.git_op(r);
-                    }
+            if has_index {
+                ui.horizontal(|ui| {
+                    ui.strong(format!("Staged ({})", staged.len()));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if !busy && !staged.is_empty() && icon_button(ui, ic::MINUS).on_hover_text("Unstage all").clicked() {
+                            self.stage_change(None, false);
+                        }
+                    });
                 });
-            });
-            if let Some(a) = change_section(ui, &staged, true, self.settings.changes_tree, &self.changes_collapsed) {
-                actions.push(a);
+                if let Some(a) = change_section(ui, &staged, true, !busy, self.settings.changes_tree, &self.changes_collapsed) {
+                    actions.push(a);
+                }
+                ui.add_space(8.0);
             }
-            ui.add_space(8.0);
             ui.horizontal(|ui| {
                 ui.strong(format!("Changes ({})", unstaged.len()));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if !unstaged.is_empty() && icon_button(ui, ic::PLUS).on_hover_text("Stage all").clicked() {
-                        let r = git::stage_all(&repo);
-                        self.git_op(r);
+                    if has_index && !busy && !unstaged.is_empty() && icon_button(ui, ic::PLUS).on_hover_text("Stage all").clicked() {
+                        self.stage_change(None, true);
                     }
                 });
             });
-            if let Some(a) = change_section(ui, &unstaged, false, self.settings.changes_tree, &self.changes_collapsed) {
+            if let Some(a) = change_section(
+                ui,
+                &unstaged,
+                false,
+                has_index && !busy,
+                self.settings.changes_tree,
+                &self.changes_collapsed,
+            ) {
                 actions.push(a);
             }
         });
@@ -1537,15 +1732,10 @@ impl App {
             match action {
                 ChangeAction::OpenDiff(c, staged) => self.open_diff(&c, staged),
                 ChangeAction::OpenFile(path) => self.open_file(&repo.join(path)),
-                ChangeAction::Stage(path) => {
-                    let r = git::stage(&repo, &path);
-                    self.git_op(r);
-                }
-                ChangeAction::Unstage(path) => {
-                    let r = git::unstage(&repo, &path);
-                    self.git_op(r);
-                }
-                ChangeAction::Discard(c) => self.confirm = Some(Confirm::Discard(c)),
+                ChangeAction::Stage(path) => self.stage_change(Some(path), true),
+                ChangeAction::Unstage(path) => self.stage_change(Some(path), false),
+                ChangeAction::Discard(c) if !busy => self.confirm = Some(Confirm::Discard(c)),
+                ChangeAction::Discard(_) => {}
                 ChangeAction::ToggleFolder(key) => {
                     if !self.changes_collapsed.remove(&key) {
                         self.changes_collapsed.insert(key);
@@ -1566,7 +1756,7 @@ impl App {
                     let title = match tab {
                         Tab::File(d) => format!("{}{}", d.name(), if d.dirty() { " ●" } else { "" }),
                         Tab::Diff(d) => format!("{} {}", ic::GIT_DIFF, d.title),
-                        Tab::Graph => format!("{} Git Graph", ic::TREE_STRUCTURE),
+                        Tab::Graph => format!("{} {}", ic::TREE_STRUCTURE, self.vcs.unwrap_or(Vcs::Git).history_title()),
                     };
                     let r = ui.selectable_label(i == self.active, title);
                     #[cfg(feature = "tour")]
@@ -1654,7 +1844,11 @@ impl App {
         let mut goto_at = None;
         match &mut self.tabs[active] {
             Tab::File(doc) => {
-                let inline = if self.settings.inline_blame && doc.blame_version == Some(doc.version) {
+                let fresh = match self.vcs {
+                    Some(Vcs::Svn) => doc.blame_version.is_some() && !doc.dirty(),
+                    _ => doc.blame_version == Some(doc.version),
+                };
+                let inline = if self.settings.inline_blame && fresh {
                     let line = goto::line_col16(&doc.text, doc.cursor).0;
                     doc.blame.as_ref().and_then(|b| b.line(line)).map(|l| l.describe(blame::now()))
                 } else {
@@ -1707,7 +1901,11 @@ impl App {
             }
             Tab::Graph => {
                 let Some(graph) = &self.graph else {
-                    ui.label("No history to show.");
+                    ui.label(if self.graph_rx.is_some() {
+                        "Loading history…"
+                    } else {
+                        "No history to show."
+                    });
                     return;
                 };
                 let mut clicked = None;
@@ -1715,7 +1913,9 @@ impl App {
                     .resizable(true)
                     .default_size(260.0)
                     .show(ui, |ui| {
-                        if self.graph_detail.is_empty() {
+                        if self.graph_detail_rx.is_some() {
+                            ui.weak("Loading commit details…");
+                        } else if self.graph_detail.is_empty() {
                             ui.weak("Select a commit to see its details.");
                         } else {
                             diff_view(ui, &self.graph_detail, "detail");
@@ -1725,11 +1925,7 @@ impl App {
                     clicked = graph.ui(ui, self.graph_sel);
                 });
                 if let Some(r) = clicked {
-                    self.graph_sel = Some(r);
-                    let hash = graph.commits[r].hash.clone();
-                    if let Some(repo) = &self.repo {
-                        self.graph_detail = git::show_commit(repo, &hash).lines().map(str::to_string).collect();
-                    }
+                    self.load_graph_detail(r);
                 }
             }
         }
@@ -1769,11 +1965,16 @@ impl App {
             }
         }
 
-        if let Some((label, _)) = &self.bg_task {
-            activity.push((format!("{label}…"), None));
+        if let Some(job) = &self.bg_task {
+            activity.push((format!("{}…", job.operation.label()), None));
         }
-        if self.status_rx.is_some() {
-            activity.push(("Refreshing Git…".into(), None));
+        if self.status_rx.is_some()
+            && let Some(vcs) = self.vcs
+        {
+            activity.push((format!("Refreshing {}…", vcs.name()), None));
+        }
+        if self.diff_rx.is_some() {
+            activity.push(("Loading diff…".into(), None));
         }
         activity
     }
@@ -2019,11 +2220,7 @@ impl App {
                     match c {
                         Confirm::CloseTabs(idx) => self.close_tabs(idx, true),
                         Confirm::Discard(f) => {
-                            if let Some(repo) = self.repo.clone() {
-                                let r = git::discard(&repo, &f);
-                                self.git_op(r);
-                                self.reload_clean_docs();
-                            }
+                            self.spawn_vcs(VcsOperation::Discard, move |vcs, repo| vcs.discard(repo, &f));
                         }
                     }
                 }
@@ -2740,26 +2937,28 @@ fn change_section(
     ui: &mut egui::Ui,
     items: &[FileChange],
     staged: bool,
+    show_stage: bool,
     as_tree: bool,
     collapsed: &HashSet<String>,
 ) -> Option<ChangeAction> {
     let mut action = None;
     let mut file_row = |ui: &mut egui::Ui, c: &FileChange, depth: usize, show_dir: bool| {
-        let buttons: &[(&str, &str)] = if staged {
-            &[(ic::MINUS, "Unstage")]
+        const UNSTAGED_BUTTONS: &[(&str, &str)] = &[
+            (ic::PLUS, "Stage"),
+            (ic::ARROW_U_UP_LEFT, "Discard changes"),
+            (ic::ARROW_SQUARE_OUT, "Open file"),
+        ];
+        let buttons = if staged {
+            if show_stage { &[(ic::MINUS, "Unstage")][..] } else { &[] }
         } else {
-            &[
-                (ic::PLUS, "Stage"),
-                (ic::ARROW_U_UP_LEFT, "Discard changes"),
-                (ic::ARROW_SQUARE_OUT, "Open file"),
-            ]
+            &UNSTAGED_BUTTONS[usize::from(!show_stage)..]
         };
-        match (change_row(ui, c, buttons, depth, show_dir), staged) {
-            (RowAction::Open, _) => action = Some(ChangeAction::OpenDiff(c.clone(), staged)),
-            (RowAction::Button(0), true) => action = Some(ChangeAction::Unstage(c.path.clone())),
-            (RowAction::Button(0), false) => action = Some(ChangeAction::Stage(c.path.clone())),
-            (RowAction::Button(1), false) => action = Some(ChangeAction::Discard(c.clone())),
-            (RowAction::Button(2), false) => action = Some(ChangeAction::OpenFile(c.path.clone())),
+        match change_row(ui, c, buttons, depth, show_dir) {
+            RowAction::Open => action = Some(ChangeAction::OpenDiff(c.clone(), staged)),
+            RowAction::Button(0) if staged => action = Some(ChangeAction::Unstage(c.path.clone())),
+            RowAction::Button(0) if show_stage => action = Some(ChangeAction::Stage(c.path.clone())),
+            RowAction::Button(i) if i == usize::from(show_stage) => action = Some(ChangeAction::Discard(c.clone())),
+            RowAction::Button(_) => action = Some(ChangeAction::OpenFile(c.path.clone())),
             _ => {}
         }
     };
@@ -2799,7 +2998,7 @@ fn change_section(
                         } else {
                             (ic::PLUS, "Stage folder")
                         };
-                        if icon_button(ui, icon).on_hover_text(tip).clicked() {
+                        if show_stage && icon_button(ui, icon).on_hover_text(tip).clicked() {
                             folder_action = Some(if staged {
                                 ChangeAction::Unstage(path.clone())
                             } else {
@@ -2914,7 +3113,7 @@ fn read_dir_sorted(dir: &Path) -> Vec<(PathBuf, bool)> {
     let mut v: Vec<(PathBuf, bool)> = std::fs::read_dir(dir)
         .map(|rd| {
             rd.filter_map(Result::ok)
-                .filter(|e| e.file_name() != ".git")
+                .filter(|e| e.file_name() != ".git" && e.file_name() != ".svn")
                 .map(|e| {
                     let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
                     (e.path(), is_dir)
@@ -2926,10 +3125,35 @@ fn read_dir_sorted(dir: &Path) -> Vec<(PathBuf, bool)> {
     v
 }
 
+fn background<T: Send + 'static>(ctx: &egui::Context, work: impl FnOnce() -> T + Send + 'static) -> Receiver<T> {
+    let (tx, rx) = channel();
+    let ctx = ctx.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send(work());
+        drop(tx);
+        ctx.request_repaint();
+    });
+    rx
+}
+
+fn receive<T>(rx: &mut Option<Receiver<T>>) -> Option<T> {
+    match rx.as_ref()?.try_recv() {
+        Ok(value) => {
+            *rx = None;
+            Some(value)
+        }
+        Err(TryRecvError::Disconnected) => {
+            *rx = None;
+            None
+        }
+        Err(TryRecvError::Empty) => None,
+    }
+}
+
 /// Files under `root` as root-relative paths: git's view (tracked + untracked, minus
 /// ignored) inside a repo, otherwise a directory walk that skips common build dirs.
-fn project_files(root: &Path, in_repo: bool, ignored: &[String]) -> Vec<String> {
-    if let Some(mut files) = in_repo.then(|| git::list_files(root)).flatten() {
+fn project_files(root: &Path, vcs: Option<Vcs>, ignored: &[String]) -> Vec<String> {
+    if let Some(mut files) = vcs::list_files(root, vcs) {
         if !ignored.is_empty() {
             files.retain(|rel| !workspace::is_ignored(rel, ignored));
         }

@@ -143,7 +143,17 @@ impl Tour {
                 _ => {}
             }
         }
-        let ready = app.search.rx.is_none() && app.goto_rx.is_none() && app.status_rx.is_none();
+        if name == "git-graph" && app.graph_sel.is_none() {
+            app.load_graph_detail(1);
+        }
+        let ready = app.search.rx.is_none()
+            && app.goto_rx.is_none()
+            && app.repo_rx.is_none()
+            && app.status_rx.is_none()
+            && app.diff_rx.is_none()
+            && app.graph_rx.is_none()
+            && app.graph_detail_rx.is_none()
+            && app.quick_open.as_ref().is_none_or(|q| q.files_rx.is_none());
         let elapsed = self.started.elapsed();
         let min_frames = if name == "column-select" { 40 } else { 10 };
         if self.frames < min_frames || elapsed < std::time::Duration::from_millis(800) || (!ready && elapsed.as_secs() < 20) {
@@ -197,7 +207,7 @@ impl Tour {
             "source-control" => {
                 app.side = Side::Changes;
                 app.settings.changes_tree = false;
-                app.refresh_git();
+                app.refresh_vcs();
             }
             "source-control-tree" => app.settings.changes_tree = true,
             "diff-side-by-side" => {
@@ -210,15 +220,7 @@ impl Tour {
                     d.inline = true;
                 }
             }
-            "git-graph" => {
-                app.open_graph();
-                app.graph_sel = Some(1);
-                if let (Some(g), Some(repo)) = (&app.graph, &app.repo)
-                    && let Some(c) = g.commits.get(1)
-                {
-                    app.graph_detail = git::show_commit(repo, &c.hash).lines().map(str::to_string).collect();
-                }
-            }
+            "git-graph" => app.open_graph(),
             "tab-menu" => {
                 app.side = Side::Explorer;
                 app.active = 0;

@@ -14,7 +14,9 @@ mod installer;
 mod lsp;
 mod search;
 mod settings;
+mod svn;
 mod tree;
+pub mod vcs;
 mod workspace;
 
 use std::path::PathBuf;
