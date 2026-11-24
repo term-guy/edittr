@@ -34,11 +34,7 @@ pub fn lane_color(i: usize) -> Color32 {
 impl Graph {
     pub fn build(commits: Vec<Commit>) -> Self {
         use std::collections::HashMap;
-        let index: HashMap<&str, usize> = commits
-            .iter()
-            .enumerate()
-            .map(|(i, c)| (c.hash.as_str(), i))
-            .collect();
+        let index: HashMap<&str, usize> = commits.iter().enumerate().map(|(i, c)| (c.hash.as_str(), i)).collect();
 
         let mut lanes: Vec<Option<usize>> = Vec::new();
         let mut rows = Vec::with_capacity(commits.len());
@@ -59,11 +55,7 @@ impl Graph {
             lanes[col] = None;
 
             // Parents outside the loaded window are simply dropped.
-            let parents: Vec<usize> = c
-                .parents
-                .iter()
-                .filter_map(|p| index.get(p.as_str()).copied())
-                .collect();
+            let parents: Vec<usize> = c.parents.iter().filter_map(|p| index.get(p.as_str()).copied()).collect();
             for (n, &p) in parents.iter().enumerate() {
                 if lanes.contains(&Some(p)) {
                     continue; // already tracked: we'll draw an edge into that lane
@@ -75,10 +67,18 @@ impl Graph {
                 lanes.pop();
             }
             max_lanes = max_lanes.max(lanes.len()).max(col + 1);
-            rows.push(Row { col, before, after: lanes.clone() });
+            rows.push(Row {
+                col,
+                before,
+                after: lanes.clone(),
+            });
         }
 
-        Graph { commits, rows, lanes: max_lanes }
+        Graph {
+            commits,
+            rows,
+            lanes: max_lanes,
+        }
     }
 
     /// Paint the graph cell for row `r` into `rect`.
@@ -91,7 +91,11 @@ impl Graph {
         // Top half: lanes coming in from the row above.
         for (lane, v) in row.before.iter().enumerate() {
             let Some(target) = *v else { continue };
-            let end = if target == r { Pos2::new(x(row.col), mid) } else { Pos2::new(x(lane), mid) };
+            let end = if target == r {
+                Pos2::new(x(row.col), mid)
+            } else {
+                Pos2::new(x(lane), mid)
+            };
             let color = lane_color(if target == r { row.col } else { lane });
             painter.line_segment([Pos2::new(x(lane), top), end], Stroke::new(w, color));
         }
@@ -101,10 +105,7 @@ impl Graph {
             let Some(target) = *v else { continue };
             let passes = row.before.get(lane).copied().flatten() == Some(target) && lane != row.col;
             if passes {
-                painter.line_segment(
-                    [Pos2::new(x(lane), mid), Pos2::new(x(lane), bot)],
-                    Stroke::new(w, lane_color(lane)),
-                );
+                painter.line_segment([Pos2::new(x(lane), mid), Pos2::new(x(lane), bot)], Stroke::new(w, lane_color(lane)));
             }
             if parents.iter().any(|p| *p == self.commits[target].hash) {
                 painter.line_segment(
@@ -155,20 +156,30 @@ impl Graph {
                     for rf in &c.refs {
                         let (label, color) = ref_style(rf);
                         let galley = painter.layout_no_wrap(label, mono.clone(), Color32::WHITE);
-                        let bg = Rect::from_min_size(
-                            Pos2::new(px, cy - galley.size().y / 2.0 - 1.0),
-                            galley.size() + Vec2::new(8.0, 2.0),
-                        );
+                        let bg = Rect::from_min_size(Pos2::new(px, cy - galley.size().y / 2.0 - 1.0), galley.size() + Vec2::new(8.0, 2.0));
                         painter.rect_filled(bg, 3.0, color);
                         painter.galley(bg.min + Vec2::new(4.0, 1.0), galley, Color32::WHITE);
                         px = bg.right() + 4.0;
                     }
                     let right = rect.right();
-                    painter.text(Pos2::new(right - 8.0, cy), egui::Align2::RIGHT_CENTER, &c.hash[..7.min(c.hash.len())], mono.clone(), weak);
+                    painter.text(
+                        Pos2::new(right - 8.0, cy),
+                        egui::Align2::RIGHT_CENTER,
+                        &c.hash[..7.min(c.hash.len())],
+                        mono.clone(),
+                        weak,
+                    );
                     painter.text(Pos2::new(right - 74.0, cy), egui::Align2::RIGHT_CENTER, &c.date, font.clone(), weak);
-                    painter.text(Pos2::new(right - 210.0, cy), egui::Align2::RIGHT_CENTER, &c.author, font.clone(), weak);
+                    painter.text(
+                        Pos2::new(right - 210.0, cy),
+                        egui::Align2::RIGHT_CENTER,
+                        &c.author,
+                        font.clone(),
+                        weak,
+                    );
                     let subj_clip = Rect::from_x_y_ranges(px..=right - 330.0, rect.y_range());
-                    ui.painter_at(subj_clip).text(Pos2::new(px, cy), egui::Align2::LEFT_CENTER, &c.subject, font, text_col);
+                    ui.painter_at(subj_clip)
+                        .text(Pos2::new(px, cy), egui::Align2::LEFT_CENTER, &c.subject, font, text_col);
 
                     if resp.clicked() {
                         clicked = Some(r);

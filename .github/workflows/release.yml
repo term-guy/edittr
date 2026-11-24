@@ -1,5 +1,11 @@
 # Builds edittr for Windows, macOS and Linux and publishes a GitHub release.
 #
+# Every platform gets two flavors from the same binary:
+#   light  the app only; language servers are installed on demand
+#   full   (-full in the file name) also bundles rust-analyzer, clangd, gopls,
+#          the TypeScript and Python servers and a Node.js runtime, so code
+#          intelligence works offline (see .github/scripts/bundle-servers.sh)
+#
 # Trigger: push a version tag, e.g.  git tag v0.2.0 && git push origin v0.2.0
 # Manual runs (Actions tab -> release -> Run workflow) build everything and keep
 # the files as workflow artifacts without publishing a release.
@@ -16,12 +22,17 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  GITHUB_TOKEN: ${{ github.token }} # GitHub API rate limits in bundle-servers.sh
 
 jobs:
   windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: lts/* }
+      - uses: actions/setup-go@v5
+        with: { go-version: stable, cache: false }
       - name: Version
         shell: bash
         run: ./.github/scripts/version.sh
@@ -29,7 +40,7 @@ jobs:
       - run: cargo build --release --locked
       - name: Install Inno Setup
         run: choco install innosetup --no-progress -y
-      - name: Package (portable exe, portable zip, installer)
+      - name: Package light (portable exe, portable zip, installer)
         shell: bash
         run: |
           mkdir -p dist
@@ -41,6 +52,24 @@ jobs:
             "//DAppVersion=${VERSION}" \
             "//DSourceExe=$(cygpath -w "$PWD/target/release/edittr.exe")" \
             "//DOutputDir=$(cygpath -w "$PWD/dist")" \
+            packaging/windows/edittr.iss
+      - name: Bundle language servers
+        shell: bash
+        run: ./.github/scripts/bundle-servers.sh windows-x64 servers
+      - name: Package full (portable zip, installer)
+        shell: bash
+        run: |
+          FULL="edittr-${VERSION}-windows-x64-full"
+          mkdir -p "pkg/$FULL"
+          cp target/release/edittr.exe README.md "pkg/$FULL/"
+          cp -R servers "pkg/$FULL/servers"
+          (cd pkg && 7z a -tzip -mx=7 "../dist/$FULL-portable.zip" "$FULL" > /dev/null)
+          "/c/Program Files (x86)/Inno Setup 6/ISCC.exe" \
+            "//DAppVersion=${VERSION}" \
+            "//DSourceExe=$(cygpath -w "$PWD/target/release/edittr.exe")" \
+            "//DOutputDir=$(cygpath -w "$PWD/dist")" \
+            "//DServersDir=$(cygpath -w "$PWD/servers")" \
+            "//DFlavor=-full" \
             packaging/windows/edittr.iss
           ls -la dist
       - uses: actions/upload-artifact@v4
@@ -54,26 +83,41 @@ jobs:
       MACOSX_DEPLOYMENT_TARGET: "11.0"
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: lts/* }
+      - uses: actions/setup-go@v5
+        with: { go-version: stable, cache: false }
       - name: Version
         run: ./.github/scripts/version.sh
       - run: rustup update stable --no-self-update && rustup target add aarch64-apple-darwin x86_64-apple-darwin
       - run: cargo build --release --locked --target aarch64-apple-darwin
       - run: cargo build --release --locked --target x86_64-apple-darwin
-      - name: Package (universal .app in .dmg and .zip)
+      - name: Build the .app
         run: |
-          APP=pkg/edittr.app
+          APP=pkg/light/edittr.app
           mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" dist
           lipo -create -output "$APP/Contents/MacOS/edittr" \
             target/aarch64-apple-darwin/release/edittr target/x86_64-apple-darwin/release/edittr
           sed "s/__VERSION__/${VERSION}/g" packaging/macos/Info.plist > "$APP/Contents/Info.plist"
           cp packaging/macos/edittr.icns "$APP/Contents/Resources/edittr.icns"
-          # Ad-hoc signature so Apple Silicon will run it (not notarized).
-          codesign --force --deep --sign - "$APP"
-          ln -s /Applications pkg/Applications
-          hdiutil create -volname "edittr ${VERSION}" -srcfolder pkg -ov -format UDZO \
-            "dist/edittr-${VERSION}-macos-universal.dmg"
-          rm pkg/Applications
-          (cd pkg && ditto -c -k --keepParent edittr.app "../dist/edittr-${VERSION}-macos-universal.zip")
+      - name: Bundle language servers
+        run: ./.github/scripts/bundle-servers.sh macos-universal servers
+      - name: Package light and full (universal .app in .dmg and .zip)
+        run: |
+          mkdir -p pkg/full
+          cp -R pkg/light/edittr.app pkg/full/edittr.app
+          cp -R servers pkg/full/edittr.app/Contents/Resources/servers
+          for flavor in light full; do
+            suffix=""; [ "$flavor" = full ] && suffix="-full"
+            NAME="edittr-${VERSION}-macos-universal${suffix}"
+            # Ad-hoc signature so Apple Silicon will run it (not notarized).
+            codesign --force --deep --sign - "pkg/$flavor/edittr.app"
+            ln -s /Applications "pkg/$flavor/Applications"
+            # LZMA (ULMO, macOS 10.15+): the full dmg is ~220 MB instead of ~330 MB with zlib.
+            hdiutil create -volname "edittr ${VERSION}" -srcfolder "pkg/$flavor" -ov -format ULMO "dist/$NAME.dmg"
+            rm "pkg/$flavor/Applications"
+            (cd "pkg/$flavor" && ditto -c -k --keepParent edittr.app "../../dist/$NAME.zip")
+          done
           ls -la dist
       - uses: actions/upload-artifact@v4
         with:
@@ -90,6 +134,10 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: lts/* }
+      - uses: actions/setup-go@v5
+        with: { go-version: stable, cache: false }
       - name: Version
         run: ./.github/scripts/version.sh
       - name: System packages
@@ -99,27 +147,24 @@ jobs:
             libx11-dev libxcursor-dev libxrandr-dev libxi-dev
       - run: rustup update stable --no-self-update
       - run: cargo build --release --locked
-      - name: Package (.tar.gz and .deb)
+      - name: Package light (.tar.gz and .deb)
         run: |
           NAME="edittr-${VERSION}-linux-${{ matrix.arch }}"
           mkdir -p "pkg/$NAME" dist
-          cp target/release/edittr README.md packaging/linux/edittr.desktop "pkg/$NAME/"
+          cp target/release/edittr README.md packaging/linux/edittr.desktop packaging/linux/install.sh "pkg/$NAME/"
           cp assets/icon-256.png "pkg/$NAME/edittr.png"
-          cat > "pkg/$NAME/install.sh" <<'SH'
-          #!/bin/sh
-          # Installs edittr for the current user into ~/.local
-          set -e
-          cd "$(dirname "$0")"
-          mkdir -p ~/.local/bin ~/.local/share/applications ~/.local/share/icons/hicolor/256x256/apps
-          cp edittr ~/.local/bin/edittr
-          cp edittr.desktop ~/.local/share/applications/edittr.desktop
-          cp edittr.png ~/.local/share/icons/hicolor/256x256/apps/edittr.png
-          echo "Installed. Make sure ~/.local/bin is on your PATH."
-          SH
           chmod +x "pkg/$NAME/install.sh" "pkg/$NAME/edittr"
           tar -C pkg -czf "dist/$NAME.tar.gz" "$NAME"
           cargo install cargo-deb --locked
           cargo deb --no-build --no-strip --output "dist/"
+      - name: Bundle language servers
+        run: ./.github/scripts/bundle-servers.sh linux-${{ matrix.arch }} servers
+      - name: Package full (.tar.gz)
+        run: |
+          NAME="edittr-${VERSION}-linux-${{ matrix.arch }}"
+          cp -R "pkg/$NAME" "pkg/$NAME-full"
+          cp -R servers "pkg/$NAME-full/servers"
+          tar -C pkg -czf "dist/$NAME-full.tar.gz" "$NAME-full"
           ls -la dist
       - uses: actions/upload-artifact@v4
         with:

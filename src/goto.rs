@@ -39,18 +39,37 @@ pub fn run(req: Request) -> Outcome {
     let mut lsp_note = String::new();
     if let Some(client) = &req.client {
         let (line, col16) = line_col16(&req.text, req.char_idx);
-        match client.definition(&req.path, &req.text, line, col16, LSP_TIMEOUT) {
+        let mut result = client.definition(&req.path, &req.text, line, col16, LSP_TIMEOUT);
+        // Right after a file is opened, the TypeScript server answers with the
+        // `import` line until it has loaded the project; ask again a few times.
+        for _ in 0..6 {
+            let points_at_import = matches!(&result, Ok(locs) if locs.first().is_some_and(|l| {
+                l.path == req.path && req.text.split('\n').nth(l.line).is_some_and(is_import_line)
+            }));
+            if !points_at_import {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+            result = client.definition(&req.path, &req.text, line, col16, LSP_TIMEOUT);
+        }
+        match result {
             Ok(locs) => {
                 if let Some(loc) = locs.into_iter().next() {
                     let line_text = if loc.path == req.path {
                         req.text.split('\n').nth(loc.line).map(str::to_string)
                     } else {
-                        std::fs::read_to_string(&loc.path).ok().and_then(|t| t.split('\n').nth(loc.line).map(str::to_string))
+                        std::fs::read_to_string(&loc.path)
+                            .ok()
+                            .and_then(|t| t.split('\n').nth(loc.line).map(str::to_string))
                     }
                     .unwrap_or_default();
                     let cols = col16_to_char(&line_text, loc.col16.start)..col16_to_char(&line_text, loc.col16.end);
                     return Outcome::Found {
-                        target: Target { path: loc.path, line: loc.line, cols },
+                        target: Target {
+                            path: loc.path,
+                            line: loc.line,
+                            cols,
+                        },
                         via: client.name.to_string(),
                     };
                 }
@@ -61,9 +80,18 @@ pub fn run(req: Request) -> Outcome {
     }
     let (cursor_line, _) = line_col16(&req.text, req.char_idx);
     match heuristic(&req.root, (req.files)(), &req.path, &req.text, cursor_line, &word) {
-        Some(target) => Outcome::Found { target, via: format!("{lsp_note}text search") },
+        Some(target) => Outcome::Found {
+            target,
+            via: format!("{lsp_note}text search"),
+        },
         None => Outcome::NotFound(format!("{lsp_note}no definition found for `{word}`")),
     }
+}
+
+/// `import { x } from "./y"` and friends (JS/TS, Python).
+fn is_import_line(line: &str) -> bool {
+    let t = line.trim_start();
+    t.starts_with("import ") || t.starts_with("import{") || (t.starts_with("from ") && t.contains(" import ")) || t.starts_with("export {")
 }
 
 // ------------------------------------------------------------- positions
@@ -146,7 +174,10 @@ fn patterns(name: &str) -> Vec<(Regex, u8)> {
     let kw = r"fn|function|def|class|struct|enum|trait|type|interface|const|let|var|val|mod|module|namespace|func|union|typedef|macro_rules!|record|object|protocol|static|alias|local";
     [
         // `fn name`, `class Name`, `let mut name`, `func (r *T) name`, `function* name`
-        (format!(r"(?:^|[^\w.$])(?:{kw})\s+(?:mut\s+|async\s+|\*\s*)?(?:\([^)]*\)\s*)?({n})\b"), 4),
+        (
+            format!(r"(?:^|[^\w.$])(?:{kw})\s+(?:mut\s+|async\s+|\*\s*)?(?:\([^)]*\)\s*)?({n})\b"),
+            4,
+        ),
         (format!(r"^\s*#\s*define\s+({n})\b"), 4),
         // C/C++/Java/C# style `Type name(` or `Type name =` at line start
         (format!(r"^\s*(?:[\w:<>,\[\]\*&]+\s+)+[\*&]*({n})\s*(?:\(|=[^=]|;|\[)"), 2),
@@ -160,14 +191,19 @@ fn patterns(name: &str) -> Vec<(Regex, u8)> {
     .collect()
 }
 
-const NOT_DEFINITIONS: &[&str] = &["return ", "else ", "if ", "while ", "case ", "new ", "await ", "throw ", "yield ", "delete "];
+const NOT_DEFINITIONS: &[&str] = &[
+    "return ", "else ", "if ", "while ", "case ", "new ", "await ", "throw ", "yield ", "delete ",
+];
 
 /// Best definition-looking match of `name` in one file's text: (score, line, char cols).
 fn best_in_text(pats: &[(Regex, u8)], text: &str) -> Vec<(u8, usize, Range<usize>)> {
     let mut out = Vec::new();
     for (line_no, line) in text.split('\n').enumerate() {
         let t = line.trim_start();
-        let is_comment = t.starts_with("//") || t.starts_with("/*") || t.starts_with("* ") || t.starts_with("--")
+        let is_comment = t.starts_with("//")
+            || t.starts_with("/*")
+            || t.starts_with("* ")
+            || t.starts_with("--")
             || (t.starts_with('#') && !t.trim_start_matches(['#', ' ']).starts_with("define"));
         if is_comment || NOT_DEFINITIONS.iter().any(|k| t.starts_with(k)) {
             continue;
@@ -194,10 +230,14 @@ fn heuristic(root: &Path, files: Vec<String>, current: &Path, text: &str, cursor
         let dist = if above { cursor_line - line } else { usize::MAX / 2 + line };
         (*score, above, std::cmp::Reverse(dist))
     });
-    if let Some((score, line, cols)) = pick {
-        if *score >= 2 {
-            return Some(Target { path: current.to_path_buf(), line: *line, cols: cols.clone() });
-        }
+    if let Some((score, line, cols)) = pick
+        && *score >= 2
+    {
+        return Some(Target {
+            path: current.to_path_buf(),
+            line: *line,
+            cols: cols.clone(),
+        });
     }
 
     // 2) Other files in the project with a related extension.
@@ -210,10 +250,10 @@ fn heuristic(root: &Path, files: Vec<String>, current: &Path, text: &str, cursor
             continue;
         }
         let fext = Path::new(&rel).extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
-        if let Some(group) = related {
-            if !group.contains(&fext.as_str()) {
-                continue;
-            }
+        if let Some(group) = related
+            && !group.contains(&fext.as_str())
+        {
+            continue;
         }
         if std::fs::metadata(&path).map(|m| m.len() > 2_000_000).unwrap_or(true) {
             continue;
@@ -222,20 +262,30 @@ fn heuristic(root: &Path, files: Vec<String>, current: &Path, text: &str, cursor
         if !content.contains(name) {
             continue;
         }
-        if let Some((score, line, cols)) = best_in_text(&pats, &content).into_iter().max_by_key(|(s, l, _)| (*s, std::cmp::Reverse(*l))) {
-            if best.as_ref().is_none_or(|(s, _)| score > *s) {
-                best = Some((score, Target { path, line, cols }));
-                if score >= 4 {
-                    break;
-                }
+        if let Some((score, line, cols)) = best_in_text(&pats, &content)
+            .into_iter()
+            .max_by_key(|(s, l, _)| (*s, std::cmp::Reverse(*l)))
+            && best.as_ref().is_none_or(|(s, _)| score > *s)
+        {
+            best = Some((score, Target { path, line, cols }));
+            if score >= 4 {
+                break;
             }
         }
     }
     // 3) A weak match in the current file beats a weak match elsewhere.
     match (pick, best) {
-        (Some((ls, line, cols)), Some((bs, _))) if *ls >= bs => Some(Target { path: current.to_path_buf(), line: *line, cols: cols.clone() }),
+        (Some((ls, line, cols)), Some((bs, _))) if *ls >= bs => Some(Target {
+            path: current.to_path_buf(),
+            line: *line,
+            cols: cols.clone(),
+        }),
         (_, Some((_, t))) => Some(t),
-        (Some((_, line, cols)), None) => Some(Target { path: current.to_path_buf(), line: *line, cols: cols.clone() }),
+        (Some((_, line, cols)), None) => Some(Target {
+            path: current.to_path_buf(),
+            line: *line,
+            cols: cols.clone(),
+        }),
         (None, None) => None,
     }
 }
@@ -246,6 +296,15 @@ mod tests {
 
     fn find_local(src: &str, cursor_line: usize, name: &str) -> Option<(usize, Range<usize>)> {
         heuristic(Path::new("/nonexistent"), vec![], Path::new("/x/a.rs"), src, cursor_line, name).map(|t| (t.line, t.cols))
+    }
+
+    #[test]
+    fn recognizes_import_lines() {
+        assert!(is_import_line("import { greet } from \"./util\";"));
+        assert!(is_import_line("  from util import greet"));
+        assert!(is_import_line("export { greet } from \"./util\";"));
+        assert!(!is_import_line("const important = 1;"));
+        assert!(!is_import_line("fn import_all() {}"));
     }
 
     #[test]
@@ -307,14 +366,24 @@ mod tests {
             std::fs::write(p, body).unwrap();
         }
         let dir = std::fs::canonicalize(&dir).unwrap();
-        let spec = lsp::servers_for(ext).into_iter().find(|s| lsp::resolve(s.command).is_some()).expect("server not installed");
+        let spec = lsp::servers_for(ext)
+            .into_iter()
+            .find(|s| lsp::resolve(s.command).is_some())
+            .expect("server not installed");
         let client = lsp::Client::start(&spec, &dir).unwrap();
         let text = std::fs::read_to_string(dir.join(main)).unwrap();
         let idx = text.find(symbol).map(|b| text[..b].chars().count()).unwrap() + 1;
         // Indexing can take a moment: retry until the server answers with a location.
         let start = std::time::Instant::now();
         let target = loop {
-            let req = Request { root: dir.clone(), files: Box::new(Vec::new), path: dir.join(main), text: text.clone(), char_idx: idx, client: Some(client.clone()) };
+            let req = Request {
+                root: dir.clone(),
+                files: Box::new(Vec::new),
+                path: dir.join(main),
+                text: text.clone(),
+                char_idx: idx,
+                client: Some(client.clone()),
+            };
             match run(req) {
                 Outcome::Found { target, via } if via == spec.name => break target,
                 _ if start.elapsed() < Duration::from_secs(90) => std::thread::sleep(Duration::from_millis(500)),
@@ -333,7 +402,10 @@ mod tests {
             &[
                 ("util.h", "#pragma once\nint add(int a, int b);\n"),
                 ("util.c", "#include \"util.h\"\n\nint add(int a, int b) { return a + b; }\n"),
-                ("main.c", "#include \"util.h\"\nint main(void) {\n  int total = add(1, 2);\n  return total;\n}\n"),
+                (
+                    "main.c",
+                    "#include \"util.h\"\nint main(void) {\n  int total = add(1, 2);\n  return total;\n}\n",
+                ),
                 ("compile_flags.txt", "-I.\n"),
             ],
             "main.c",
@@ -349,12 +421,74 @@ mod tests {
             "rs",
             &[
                 ("Cargo.toml", "[package]\nname = \"t\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
-                ("src/util.rs", "pub struct Point { pub x: i32 }\n\npub fn make() -> Point { Point { x: 1 } }\n"),
-                ("src/main.rs", "mod util;\nfn main() {\n    let p = util::make();\n    println!(\"{}\", p.x);\n}\n"),
+                (
+                    "src/util.rs",
+                    "pub struct Point { pub x: i32 }\n\npub fn make() -> Point { Point { x: 1 } }\n",
+                ),
+                (
+                    "src/main.rs",
+                    "mod util;\nfn main() {\n    let p = util::make();\n    println!(\"{}\", p.x);\n}\n",
+                ),
             ],
             "src/main.rs",
             "make()",
             ("src/util.rs", 2),
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn lsp_round_trip_ts() {
+        lsp_round_trip(
+            "ts",
+            &[
+                ("tsconfig.json", "{ \"compilerOptions\": { \"strict\": true } }\n"),
+                (
+                    "util.ts",
+                    "export const VERSION = 1;\n\nexport function greet(name: string) {\n  return `hi ${name}`;\n}\n",
+                ),
+                ("main.ts", "import { greet } from \"./util\";\n\nconsole.log(greet(\"x\"));\n"),
+            ],
+            "main.ts",
+            "greet(\"x\")",
+            ("util.ts", 2),
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn lsp_round_trip_py() {
+        lsp_round_trip(
+            "py",
+            &[
+                ("util.py", "import os\n\n\ndef greet(name):\n    return f\"hi {name}\"\n"),
+                ("main.py", "from util import greet\n\nprint(greet(\"x\"))\n"),
+            ],
+            "main.py",
+            "greet(\"x\")",
+            ("util.py", 3),
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn lsp_round_trip_go() {
+        lsp_round_trip(
+            "go",
+            &[
+                ("go.mod", "module example.com/t\n\ngo 1.21\n"),
+                (
+                    "util.go",
+                    "package main\n\n// Greet says hi.\nfunc Greet(name string) string { return \"hi \" + name }\n",
+                ),
+                (
+                    "main.go",
+                    "package main\n\nimport \"fmt\"\n\nfunc main() { fmt.Println(Greet(\"x\")) }\n",
+                ),
+            ],
+            "main.go",
+            "Greet(\"x\")",
+            ("util.go", 3),
         );
     }
 }

@@ -1,5 +1,6 @@
 ; Inno Setup script for the Windows installer.
 ; Built in CI with: iscc /DAppVersion=1.2.3 /DSourceExe=path\to\edittr.exe /DOutputDir=dist packaging\windows\edittr.iss
+; Full installer: also pass /DServersDir=path\to\servers /DFlavor=-full (bundles the language servers).
 
 #ifndef AppVersion
   #define AppVersion "0.0.0"
@@ -9,6 +10,9 @@
 #endif
 #ifndef OutputDir
   #define OutputDir "..\..\dist"
+#endif
+#ifndef Flavor
+  #define Flavor ""
 #endif
 
 [Setup]
@@ -25,7 +29,7 @@ PrivilegesRequiredOverridesAllowed=dialog
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 OutputDir={#OutputDir}
-OutputBaseFilename=edittr-{#AppVersion}-windows-x64-setup
+OutputBaseFilename=edittr-{#AppVersion}-windows-x64{#Flavor}-setup
 SetupIconFile=..\..\assets\icon.ico
 UninstallDisplayIcon={app}\edittr.exe
 Compression=lzma2/max
@@ -41,6 +45,15 @@ Name: "addtopath"; Description: "Add edittr to PATH (run ""edittr ."" from a ter
 [Files]
 Source: "{#SourceExe}"; DestDir: "{app}"; DestName: "edittr.exe"; Flags: ignoreversion
 Source: "..\..\README.md"; DestDir: "{app}"; Flags: ignoreversion
+#ifdef ServersDir
+Source: "{#ServersDir}\*"; DestDir: "{app}\servers"; Flags: ignoreversion recursesubdirs createallsubdirs
+#endif
+
+#ifndef ServersDir
+[InstallDelete]
+; Light install over a previous full install: drop the old bundled servers.
+Type: filesandordirs; Name: "{app}\servers"
+#endif
 
 [Icons]
 Name: "{autoprograms}\edittr"; Filename: "{app}\edittr.exe"

@@ -26,7 +26,11 @@ pub const MOON: &str = "\u{E330}";
 pub const PLUS: &str = "\u{E3D4}";
 pub const SUN: &str = "\u{E472}";
 pub const TREE_STRUCTURE: &str = "\u{E67C}";
+pub const TREE_VIEW: &str = "\u{EE48}";
+pub const LIST: &str = "\u{E2F0}";
 pub const X: &str = "\u{E4F6}";
+pub const COLUMNS: &str = "\u{E1E2}";
+pub const ROWS: &str = "\u{E5A2}";
 
 pub fn install(ctx: &eframe::egui::Context) {
     let mut fonts = FontDefinitions::default();

@@ -44,7 +44,11 @@ pub enum Msg {
 }
 
 pub fn build_regex(opts: &Options) -> Result<Regex, String> {
-    let mut pat = if opts.regex { opts.query.clone() } else { regex::escape(&opts.query) };
+    let mut pat = if opts.regex {
+        opts.query.clone()
+    } else {
+        regex::escape(&opts.query)
+    };
     if opts.whole_word {
         pat = format!(r"\b(?:{pat})\b");
     }
@@ -104,7 +108,10 @@ pub fn spawn(
                 break;
             }
         }
-        let _ = tx.send(Msg::Done { files: searched, truncated });
+        let _ = tx.send(Msg::Done {
+            files: searched,
+            truncated,
+        });
         ctx.request_repaint();
     });
     rx
@@ -137,7 +144,13 @@ fn make_hit(line_no: usize, line: &str, m: Range<usize>) -> Hit {
     let before = line[from..m.start].chars().count();
     let mut prefix = "";
     if before > SNIPPET_BEFORE {
-        from = m.start - line[..m.start].chars().rev().take(SNIPPET_BEFORE).map(char::len_utf8).sum::<usize>();
+        from = m.start
+            - line[..m.start]
+                .chars()
+                .rev()
+                .take(SNIPPET_BEFORE)
+                .map(char::len_utf8)
+                .sum::<usize>();
         prefix = "…";
     }
     let rest = &line[from..];
@@ -158,7 +171,10 @@ mod tests {
     use super::*;
 
     fn opts(q: &str) -> Options {
-        Options { query: q.into(), ..Default::default() }
+        Options {
+            query: q.into(),
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -208,7 +224,13 @@ mod tests {
         std::fs::write(dir.join("sub/b.rs"), "fn hello() {}").unwrap();
         std::fs::write(dir.join("bin.dat"), b"hello\0\0").unwrap();
         let files = vec!["a.txt".to_string(), "sub/b.rs".into(), "bin.dat".into(), "missing".into()];
-        let rx = spawn(dir.clone(), move || files, opts("hello"), Arc::new(AtomicBool::new(false)), egui::Context::default());
+        let rx = spawn(
+            dir.clone(),
+            move || files,
+            opts("hello"),
+            Arc::new(AtomicBool::new(false)),
+            egui::Context::default(),
+        );
         let mut found = Vec::new();
         loop {
             match rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap() {
@@ -222,9 +244,12 @@ mod tests {
             }
         }
         std::fs::remove_dir_all(&dir).ok();
-        assert_eq!(found, vec![
-            ("a.txt".to_string(), vec![(0, 0..5), (1, 6..11)]),
-            ("sub/b.rs".to_string(), vec![(0, 3..8)]),
-        ]);
+        assert_eq!(
+            found,
+            vec![
+                ("a.txt".to_string(), vec![(0, 0..5), (1, 6..11)]),
+                ("sub/b.rs".to_string(), vec![(0, 3..8)]),
+            ]
+        );
     }
 }

@@ -35,9 +35,7 @@ pub fn run(repo: &Path, args: &[&str]) -> Result<String, String> {
 
 /// Returns the repository top-level directory containing `dir`, if any.
 pub fn repo_root(dir: &Path) -> Option<PathBuf> {
-    run(dir, &["rev-parse", "--show-toplevel"])
-        .ok()
-        .map(|s| PathBuf::from(s.trim()))
+    run(dir, &["rev-parse", "--show-toplevel"]).ok().map(|s| PathBuf::from(s.trim()))
 }
 
 #[derive(Clone, Debug)]
@@ -91,7 +89,10 @@ pub fn status(repo: &Path) -> Result<Status, String> {
             continue;
         }
         if x != ' ' {
-            st.staged.push(FileChange { path: path.clone(), code: x });
+            st.staged.push(FileChange {
+                path: path.clone(),
+                code: x,
+            });
         }
         if y != ' ' {
             st.unstaged.push(FileChange { path, code: y });
@@ -100,16 +101,22 @@ pub fn status(repo: &Path) -> Result<Status, String> {
     Ok(st)
 }
 
+/// Enough context that the diff contains the whole file (for the side-by-side view).
+const FULL_CONTEXT: &str = "--unified=1000000";
+
 pub fn diff(repo: &Path, change: &FileChange, staged: bool) -> String {
     let res = if change.code == '?' {
         // Untracked: diff against nothing. Exit code 1 is expected here.
-        run_raw(repo, &["diff", "--no-color", "--no-index", "--", "/dev/null", &change.path])
-            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-            .map_err(|e| e.to_string())
+        run_raw(
+            repo,
+            &["diff", "--no-color", FULL_CONTEXT, "--no-index", "--", "/dev/null", &change.path],
+        )
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .map_err(|e| e.to_string())
     } else if staged {
-        run(repo, &["diff", "--no-color", "--cached", "--", &change.path])
+        run(repo, &["diff", "--no-color", FULL_CONTEXT, "--cached", "--", &change.path])
     } else {
-        run(repo, &["diff", "--no-color", "--", &change.path])
+        run(repo, &["diff", "--no-color", FULL_CONTEXT, "--", &change.path])
     };
     res.unwrap_or_else(|e| e)
 }
@@ -122,8 +129,7 @@ pub fn stage_all(repo: &Path) -> Result<String, String> {
 }
 pub fn unstage(repo: &Path, path: &str) -> Result<String, String> {
     // `restore --staged` fails before the first commit; `rm --cached` works there.
-    run(repo, &["restore", "--staged", "--", path])
-        .or_else(|_| run(repo, &["rm", "--cached", "-q", "--", path]))
+    run(repo, &["restore", "--staged", "--", path]).or_else(|_| run(repo, &["rm", "--cached", "-r", "-q", "--", path]))
 }
 pub fn unstage_all(repo: &Path) -> Result<String, String> {
     run(repo, &["reset", "-q"])
@@ -212,11 +218,7 @@ pub fn log(repo: &Path, limit: usize) -> Result<Vec<Commit>, String> {
                 parents: f[1].split_whitespace().map(str::to_string).collect(),
                 author: f[2].to_string(),
                 date: f[3].to_string(),
-                refs: f[4]
-                    .split(", ")
-                    .filter(|r| !r.is_empty())
-                    .map(str::to_string)
-                    .collect(),
+                refs: f[4].split(", ").filter(|r| !r.is_empty()).map(str::to_string).collect(),
                 subject: f[5].to_string(),
             })
         })

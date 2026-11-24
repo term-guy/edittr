@@ -22,11 +22,26 @@ pub struct ServerSpec {
 
 /// Candidate servers for a file extension, in order of preference.
 pub fn servers_for(ext: &str) -> Vec<ServerSpec> {
-    let s = |name, command, args, language_id| ServerSpec { name, command, args, language_id };
+    let s = |name, command, args, language_id| ServerSpec {
+        name,
+        command,
+        args,
+        language_id,
+    };
     match ext {
         "rs" => vec![s("rust-analyzer", "rust-analyzer", &[][..], "rust")],
-        "ts" | "tsx" | "mts" | "cts" => vec![s("typescript", "typescript-language-server", &["--stdio"][..], if ext == "tsx" { "typescriptreact" } else { "typescript" })],
-        "js" | "jsx" | "mjs" | "cjs" => vec![s("typescript", "typescript-language-server", &["--stdio"][..], if ext == "jsx" { "javascriptreact" } else { "javascript" })],
+        "ts" | "tsx" | "mts" | "cts" => vec![s(
+            "typescript",
+            "typescript-language-server",
+            &["--stdio"][..],
+            if ext == "tsx" { "typescriptreact" } else { "typescript" },
+        )],
+        "js" | "jsx" | "mjs" | "cjs" => vec![s(
+            "typescript",
+            "typescript-language-server",
+            &["--stdio"][..],
+            if ext == "jsx" { "javascriptreact" } else { "javascript" },
+        )],
         "py" | "pyi" => vec![
             s("pyright", "pyright-langserver", &["--stdio"][..], "python"),
             s("basedpyright", "basedpyright-langserver", &["--stdio"][..], "python"),
@@ -58,16 +73,17 @@ pub fn which(cmd: &str) -> Option<PathBuf> {
         vec![String::new()]
     };
     let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path).find_map(|dir| {
-        exts.iter()
-            .map(|e| dir.join(format!("{cmd}{e}")))
-            .find(|p| p.is_file())
-    })
+    std::env::split_paths(&path).find_map(|dir| exts.iter().map(|e| dir.join(format!("{cmd}{e}"))).find(|p| p.is_file()))
 }
 
-/// A server on PATH wins over one edittr installed itself.
-pub fn resolve(cmd: &str) -> Option<PathBuf> {
-    which(cmd).or_else(|| crate::installer::find_installed(cmd))
+/// Lookup order: PATH (the user's own), then a server bundled in a "full"
+/// download, then one edittr installed on demand.
+pub fn resolve(cmd: &str) -> Option<crate::bundled::Launch> {
+    use crate::bundled::Launch;
+    which(cmd)
+        .map(|exe| Launch { exe, args: Vec::new() })
+        .or_else(|| crate::bundled::find(cmd))
+        .or_else(|| crate::installer::find_installed(cmd).map(|exe| Launch { exe, args: Vec::new() }))
 }
 
 pub struct Location {
@@ -105,9 +121,10 @@ impl Drop for Client {
 impl Client {
     /// Spawn the server and start the `initialize` handshake in the background.
     pub fn start(spec: &ServerSpec, root: &Path) -> Result<Arc<Client>, String> {
-        let exe = resolve(spec.command).ok_or_else(|| format!("{} is not installed", spec.command))?;
-        let mut cmd = Command::new(exe);
-        cmd.args(spec.args)
+        let launch = resolve(spec.command).ok_or_else(|| format!("{} is not installed", spec.command))?;
+        let mut cmd = Command::new(&launch.exe);
+        cmd.args(&launch.args)
+            .args(spec.args)
             .current_dir(root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -257,7 +274,13 @@ impl Client {
                     "textDocument/didOpen",
                     json!({"textDocument": {"uri": uri, "languageId": self.language_id, "version": 1, "text": text}}),
                 );
-                docs.insert(uri, Synced { version: 1, text_hash: hash });
+                docs.insert(
+                    uri,
+                    Synced {
+                        version: 1,
+                        text_hash: hash,
+                    },
+                );
             }
         }
     }
@@ -271,10 +294,10 @@ impl Client {
             "position": {"line": line, "character": col16},
         });
         let mut locs = parse_locations(&self.request("textDocument/definition", params.clone(), timeout)?);
-        if locs.is_empty() {
-            if let Ok(v) = self.request("textDocument/declaration", params, timeout) {
-                locs = parse_locations(&v);
-            }
+        if locs.is_empty()
+            && let Ok(v) = self.request("textDocument/declaration", params, timeout)
+        {
+            locs = parse_locations(&v);
         }
         Ok(locs)
     }
@@ -316,8 +339,16 @@ fn parse_locations(v: &Value) -> Vec<Location> {
             let end = &range["end"];
             let line = start["line"].as_u64()? as usize;
             let c0 = start["character"].as_u64()? as usize;
-            let c1 = if end["line"].as_u64() == Some(line as u64) { end["character"].as_u64()? as usize } else { c0 };
-            Some(Location { path: uri_to_path(uri)?, line, col16: c0..c1.max(c0) })
+            let c1 = if end["line"].as_u64() == Some(line as u64) {
+                end["character"].as_u64()? as usize
+            } else {
+                c0
+            };
+            Some(Location {
+                path: uri_to_path(uri)?,
+                line,
+                col16: c0..c1.max(c0),
+            })
         })
         .collect()
 }

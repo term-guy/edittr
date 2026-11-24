@@ -1,0 +1,44 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Priorities
+
+- The editor must be as fast and lightweight to use as possible. Binary size is not a concern; UI responsiveness is.
+- Never block the UI thread: git, search, language servers and downloads run on background threads and report back over channels polled in `App::poll_background`. Long lists use virtualized `ScrollArea::show_rows`.
+- egui/eframe are 0.37 and their API differs from most docs/examples (`App::ui` not `update`, `egui::Panel::left(..).show(ui)`, `egui::Modal`, `Ui::close()`). Check the crate source under `~/.cargo/registry/src/` instead of relying on memory.
+
+## Commands
+
+- Build/test: `cargo build --release`, `cargo test --release`.
+- Real-network / real-server tests are `#[ignore]`d. Run them with a throwaway servers dir, never the real one: `EDITTR_SERVERS_DIR=<tmp dir> cargo test --release -- --ignored` (downloads rust-analyzer and clangd; `lsp_round_trip_c` needs `clangd` on PATH).
+- App icon assets are generated: `python3 packaging/make_icon.py` (rewrites `assets/icon*` and `packaging/macos/edittr.icns`).
+- Formatting/lint: `rustfmt.toml` sets `max_width = 140` (a hook formats edited `.rs` files). CI fails on `cargo fmt --check` or `cargo clippy --all-targets -- -D warnings`; run both before pushing.
+
+## Local GUI testing (macOS)
+
+- Keep at most ONE edittr window open while testing or taking screenshots, and close it when done (hooks in `.claude/settings.json` enforce this). Never touch copies the user launched themselves.
+- `target/release/edittr` with no argument starts an empty project; pass a folder (or a file) to open it.
+- `screencapture` usually doesn't show the window (it opens on another Space); don't retry in a loop.
+- For screenshots, use the built-in tour instead of `screencapture`: `cargo build --release --features tour && EDITTR_TOUR_OUT=<dir> EDITTR_TOUR_DEMO=<git repo> target/release/edittr` saves one PNG per feature and quits (steps in `src/app/tour.rs`). Rebuild without `--features tour` afterwards.
+- Temporary test hooks (env var `EDITTR_TEST`) must be removed before finishing: `grep -n EDITTR_TEST src/`.
+
+## Git and releases
+
+- Commit identity for this repo is `termguy <hello@termg.com>` (local git config); keep it.
+- Commit directly on `main`; push only when asked. The remote uses the SSH host alias `github-term-guy`.
+- Release = push a `vX.Y.Z` tag. `.github/workflows/release.yml` builds the Windows installer + portable exe, macOS universal dmg/zip and Linux deb/tar.gz, and publishes them; the version comes from the tag (`.github/scripts/version.sh`).
+- `gh` is not logged in; check Actions runs via the public API (`curl https://api.github.com/repos/term-guy/edittr/actions/runs`).
+
+## Language servers
+
+- Lookup order (`lsp::resolve`): PATH, then a bundle (`src/bundled.rs`: `servers/servers.json` next to the exe, in `Contents/Resources`, or `../lib/edittr`), then on-demand installs (`src/installer.rs`). `edittr --list-servers` prints what each language resolves to.
+- Full downloads are assembled by `.github/scripts/bundle-servers.sh <platform> <dest>` (runs on macOS locally too). To test a bundle against the real servers: symlink it to `target/release/deps/servers` and run `cargo test --release -- --ignored lsp_round_trip`.
+- `typescript` must stay pinned to `@6` (installer + bundle script): TypeScript 7 dropped the `tsserver.js` that typescript-language-server needs.
+
+## Gotchas
+
+- Every spawned process needs `CREATE_NO_WINDOW` on Windows (see `git::cmd`), or a console window flashes.
+- Downloads use ureq with `RootCerts::PlatformVerifier` (OS trust store). Don't switch back to bundled webpki roots: that broke clangd downloads.
+- `rfd` is pinned to `=0.18.0` because Linux portal-failure detection in `app.rs` hooks its internal log target.
+- egui's default fonts lack most symbols (they render as boxes); use the Phosphor constants in `src/icons.rs`.

@@ -14,9 +14,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub enum Method {
     /// Asset of the latest GitHub release whose name `matches`; `.gz` or `.zip`.
-    Github { repo: &'static str, matches: fn(&str) -> bool },
-    Npm { packages: &'static [&'static str] },
-    Go { package: &'static str },
+    Github {
+        repo: &'static str,
+        matches: fn(&str) -> bool,
+    },
+    Npm {
+        packages: &'static [&'static str],
+    },
+    Go {
+        package: &'static str,
+    },
 }
 
 pub struct Installable {
@@ -51,11 +58,42 @@ impl Progress {
 pub fn installable(command: &str) -> Option<Installable> {
     let i = |command, method, source| Some(Installable { command, method, source });
     match command {
-        "rust-analyzer" => i("rust-analyzer", Method::Github { repo: "rust-lang/rust-analyzer", matches: rust_analyzer_asset }, "GitHub release of rust-lang/rust-analyzer (about 15 MB)"),
-        "clangd" => i("clangd", Method::Github { repo: "clangd/clangd", matches: clangd_asset }, "GitHub release of clangd/clangd (about 30-120 MB)"),
-        "typescript-language-server" => i("typescript-language-server", Method::Npm { packages: &["typescript-language-server", "typescript"] }, "npm (needs Node.js installed)"),
-        "pyright-langserver" => i("pyright-langserver", Method::Npm { packages: &["pyright"] }, "npm (needs Node.js installed)"),
-        "gopls" => i("gopls", Method::Go { package: "golang.org/x/tools/gopls@latest" }, "`go install` (needs Go installed)"),
+        "rust-analyzer" => i(
+            "rust-analyzer",
+            Method::Github {
+                repo: "rust-lang/rust-analyzer",
+                matches: rust_analyzer_asset,
+            },
+            "GitHub release of rust-lang/rust-analyzer (about 15 MB)",
+        ),
+        "clangd" => i(
+            "clangd",
+            Method::Github {
+                repo: "clangd/clangd",
+                matches: clangd_asset,
+            },
+            "GitHub release of clangd/clangd (about 30-120 MB)",
+        ),
+        "typescript-language-server" => i(
+            "typescript-language-server",
+            Method::Npm {
+                // TypeScript 7 (the native port) no longer ships the tsserver.js this server needs.
+                packages: &["typescript-language-server", "typescript@6"],
+            },
+            "npm (needs Node.js installed)",
+        ),
+        "pyright-langserver" => i(
+            "pyright-langserver",
+            Method::Npm { packages: &["pyright"] },
+            "npm (needs Node.js installed)",
+        ),
+        "gopls" => i(
+            "gopls",
+            Method::Go {
+                package: "golang.org/x/tools/gopls@latest",
+            },
+            "`go install` (needs Go installed)",
+        ),
         _ => None,
     }
 }
@@ -117,10 +155,21 @@ pub fn install(inst: &Installable, progress: &Progress) -> Result<PathBuf, Strin
             let npm = crate::lsp::which("npm").ok_or("npm was not found. Install Node.js first, then try again")?;
             progress.stage(format!("Installing {} with npm…", inst.command));
             let prefix = dir.join("node");
-            run(Command::new(npm).arg("install").arg("--prefix").arg(&prefix).args(["--no-fund", "--no-audit", "--loglevel=error"]).args(*packages))?;
+            run(Command::new(npm)
+                .arg("install")
+                .arg("--prefix")
+                .arg(&prefix)
+                .args(["--no-fund", "--no-audit", "--loglevel=error"])
+                .args(*packages))?;
             let bin = prefix.join("node_modules").join(".bin");
-            let p = if cfg!(windows) { bin.join(format!("{}.cmd", inst.command)) } else { bin.join(inst.command) };
-            p.is_file().then_some(p).ok_or("npm finished but the server executable is missing")?
+            let p = if cfg!(windows) {
+                bin.join(format!("{}.cmd", inst.command))
+            } else {
+                bin.join(inst.command)
+            };
+            p.is_file()
+                .then_some(p)
+                .ok_or("npm finished but the server executable is missing")?
         }
         Method::Go { package } => {
             let go = crate::lsp::which("go").ok_or("go was not found. Install Go first, then try again")?;
@@ -147,16 +196,45 @@ fn run(cmd: &mut Command) -> Result<(), String> {
         Ok(())
     } else {
         let err = String::from_utf8_lossy(&out.stderr);
-        Err(err.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("install command failed").to_string())
+        Err(err
+            .lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("install command failed")
+            .to_string())
     }
 }
 
+/// HTTP client that trusts the operating system's certificate store (like browsers,
+/// git and curl do), so corporate TLS proxies and newly issued roots work.
+fn agent() -> &'static ureq::Agent {
+    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    AGENT.get_or_init(|| {
+        use ureq::tls::{RootCerts, TlsConfig};
+        ureq::Agent::config_builder()
+            .tls_config(TlsConfig::builder().root_certs(RootCerts::PlatformVerifier).build())
+            .build()
+            .into()
+    })
+}
+
 fn http_get(url: &str) -> Result<ureq::http::Response<ureq::Body>, String> {
-    ureq::get(url)
+    agent()
+        .get(url)
         .header("User-Agent", "edittr-editor")
         .header("Accept", "application/vnd.github+json, application/octet-stream")
         .call()
-        .map_err(|e| format!("download failed: {e}"))
+        .map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("certificate") {
+                format!(
+                    "download failed: {msg}. Your network may be intercepting HTTPS; \
+                         make sure its certificate is trusted by the system, or set HTTPS_PROXY"
+                )
+            } else {
+                format!("download failed: {msg}")
+            }
+        })
 }
 
 fn install_github(command: &str, repo: &str, matches: fn(&str) -> bool, dir: &Path, progress: &Progress) -> Result<PathBuf, String> {
@@ -172,7 +250,10 @@ fn install_github(command: &str, repo: &str, matches: fn(&str) -> bool, dir: &Pa
         .ok_or_else(|| format!("no {command} build for {}/{}", std::env::consts::OS, std::env::consts::ARCH))?;
     let name = asset["name"].as_str().unwrap_or_default().to_string();
     let url = asset["browser_download_url"].as_str().ok_or("release asset has no download URL")?;
-    let expected = asset["digest"].as_str().and_then(|d| d.strip_prefix("sha256:")).map(str::to_lowercase);
+    let expected = asset["digest"]
+        .as_str()
+        .and_then(|d| d.strip_prefix("sha256:"))
+        .map(str::to_lowercase);
 
     // Download to a temp file while hashing.
     let target = dir.join(command);
@@ -197,11 +278,11 @@ fn install_github(command: &str, repo: &str, matches: fn(&str) -> bool, dir: &Pa
     }
     drop(file);
     let actual: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
-    if let Some(expected) = expected {
-        if expected != actual {
-            let _ = std::fs::remove_dir_all(&target);
-            return Err(format!("checksum mismatch for {name}; not installing"));
-        }
+    if let Some(expected) = expected
+        && expected != actual
+    {
+        let _ = std::fs::remove_dir_all(&target);
+        return Err(format!("checksum mismatch for {name}; not installing"));
     }
 
     progress.stage(format!("Unpacking {command}…"));
@@ -257,7 +338,12 @@ mod tests {
             "rust-analyzer-linux-x64.vsix",
         ];
         assert_eq!(names.iter().filter(|n| rust_analyzer_asset(n)).count(), 1);
-        let clangd = ["clangd-mac-23.1.0.zip", "clangd-linux-23.1.0.zip", "clangd-windows-23.1.0.zip", "clangd_indexing_tools-mac-23.1.0.zip"];
+        let clangd = [
+            "clangd-mac-23.1.0.zip",
+            "clangd-linux-23.1.0.zip",
+            "clangd-windows-23.1.0.zip",
+            "clangd_indexing_tools-mac-23.1.0.zip",
+        ];
         assert_eq!(clangd.iter().filter(|n| clangd_asset(n)).count(), 1);
     }
 
@@ -272,5 +358,26 @@ mod tests {
         assert_eq!(find_installed("rust-analyzer"), Some(path.clone()));
         let out = std::process::Command::new(&path).arg("--version").output().unwrap();
         assert!(String::from_utf8_lossy(&out.stdout).starts_with("rust-analyzer"));
+    }
+
+    /// TLS check against GitHub's release download host. Run with --ignored.
+    #[test]
+    #[ignore]
+    fn tls_to_release_assets() {
+        let url = "https://github.com/clangd/clangd/releases/download/23.1.0/clangd-windows-23.1.0.zip";
+        let resp = http_get(url).expect("request failed");
+        let mut buf = [0u8; 4];
+        resp.into_body().into_reader().read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"PK\x03\x04");
+    }
+
+    /// Real clangd download (~100 MB). Run with EDITTR_SERVERS_DIR set and --ignored.
+    #[test]
+    #[ignore]
+    fn downloads_clangd() {
+        assert!(std::env::var_os("EDITTR_SERVERS_DIR").is_some(), "set EDITTR_SERVERS_DIR");
+        let path = install(&installable("clangd").unwrap(), &Progress::default()).unwrap();
+        let out = std::process::Command::new(&path).arg("--version").output().unwrap();
+        assert!(String::from_utf8_lossy(&out.stdout).contains("clangd version"));
     }
 }

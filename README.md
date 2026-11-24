@@ -16,7 +16,7 @@ Git runs through your installed `git`, so your config, credential helpers, SSH k
 
 ## Language servers
 
-edittr uses the standard Language Server Protocol, like VS Code and Zed. If a server is on your `PATH`, edittr uses it. If not, the first time you go to a definition edittr offers to install it (it always asks first):
+edittr uses the standard Language Server Protocol, like VS Code and Zed. It uses a server on your `PATH` first, then one bundled in a **full** download (see Install), and otherwise, the first time you go to a definition, offers to install it (it always asks first):
 
 | Language | Server | Installed from |
 | --- | --- | --- |
@@ -26,15 +26,22 @@ edittr uses the standard Language Server Protocol, like VS Code and Zed. If a se
 | Python | pyright | npm (needs Node.js) |
 | Go | gopls | `go install` (needs Go) |
 
+Run `edittr --list-servers` to see which server each language uses and where it comes from.
+
 Servers edittr installs go into its own folder (`~/Library/Application Support/edittr/servers` on macOS, `~/.local/share/edittr/servers` on Linux, `%LOCALAPPDATA%\edittr\servers` on Windows; override it with `EDITTR_SERVERS_DIR`). edittr also starts servers it finds on `PATH` for Java (jdtls), Ruby (ruby-lsp), PHP (intelephense), Lua, Zig and C#.
 
 ## Install
 
-Download from the [Releases](https://github.com/term-guy/edittr/releases) page:
+Download from the [Releases](https://github.com/term-guy/edittr/releases) page. Every platform comes in two flavors:
 
-- **Windows**: `…-setup.exe` (installer: Start menu, optional "Open with edittr" right-click menu and PATH entry; no admin rights needed) or `…-portable.exe` / `…-portable.zip` (no install)
-- **macOS**: `…-macos-universal.dmg` (Apple Silicon and Intel). The app isn't notarized yet, so the first time, right-click the app, choose **Open**, then confirm
-- **Linux**: `.deb` (Debian/Ubuntu) or `.tar.gz` (any distro; run `./install.sh` to install into `~/.local`), for x86_64 and aarch64
+- **Light** (about 5–10 MB): just the editor. Language servers are installed on demand, only for the languages you use.
+- **Full** (`-full` in the file name, about 100–220 MB): also bundles rust-analyzer, clangd, gopls, the TypeScript and Python servers and a Node.js runtime for the last two, so go to definition works offline from the first launch. clangd has no arm64 Linux build, so the Linux aarch64 full download leaves it out.
+
+Files:
+
+- **Windows**: `…-setup.exe` / `…-full-setup.exe` (installer: Start menu, optional "Open with edittr" right-click menu and PATH entry; no admin rights needed; installing one flavor over the other switches in place), `…-portable.exe` (light only) or `…-portable.zip` / `…-full-portable.zip` (no install)
+- **macOS**: `…-macos-universal.dmg` / `…-macos-universal-full.dmg` (Apple Silicon and Intel). The app isn't notarized yet, so the first time, right-click the app, choose **Open**, then confirm
+- **Linux**: `.deb` (Debian/Ubuntu, light) or `.tar.gz` / `-full.tar.gz` (any distro; run `./install.sh` to install into `~/.local`), for x86_64 and aarch64
 
 Windows may show a SmartScreen warning because the binaries aren't code-signed yet.
 
