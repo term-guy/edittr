@@ -1,6 +1,6 @@
 use super::{App, Side, Tab, VcsOperation, background, fuzzy_filter, project_files, receive};
 use crate::commands::{self, COMMANDS, Command};
-use crate::{lsp, symbols, workspace};
+use crate::{symbols, workspace};
 use eframe::egui::{self, Key, Modifiers};
 use std::path::Path;
 use std::sync::Arc;
@@ -337,13 +337,10 @@ impl App {
                     id: doc.id,
                     version: doc.version,
                 });
-                let (path, text, ext, revision) = (doc.path.clone(), doc.text.clone(), doc.ext(), (doc.id, doc.version));
-                let names: Vec<&str> = lsp::servers_for(&ext).iter().map(|spec| spec.name).collect();
-                let client = (!self.path_is_ignored(&path))
-                    .then(|| self.lsp.clients().find(|client| names.contains(&client.name)).cloned())
-                    .flatten();
+                let (path, text, revision) = (doc.path.clone(), doc.text.clone(), (doc.id, doc.version));
+                let client = self.document_symbol_client(doc).cloned();
                 picker.rx = Some(background(&self.ctx, move || {
-                    symbols::document(&path, &text, revision, client)
+                    symbols::flatten(symbols::document(&path, &text, revision, client))
                         .into_iter()
                         .map(|symbol| Row::symbol(symbol, None))
                         .collect()

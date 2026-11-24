@@ -1,5 +1,5 @@
 use crate::{goto, lsp, workspace};
-use std::ops::Range;
+use std::ops::{Range, RangeInclusive};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -8,6 +8,7 @@ use std::time::Duration;
 pub(crate) const LIMIT: usize = 200;
 const TIMEOUT: Duration = Duration::from_secs(2);
 
+#[derive(Clone)]
 pub(crate) enum Columns {
     Chars(Range<usize>),
     Utf16(Range<usize>),
@@ -38,8 +39,12 @@ pub(crate) struct Symbol {
     pub(crate) kind: &'static str,
     pub(crate) container: Option<String>,
     pub(crate) path: PathBuf,
+    /// Location of the symbol name, used for navigation.
     pub(crate) line: usize,
     pub(crate) cols: Columns,
+    /// Full symbol span, in zero-based lines.
+    pub(crate) lines: RangeInclusive<usize>,
+    pub(crate) children: Vec<Symbol>,
 }
 
 impl Symbol {
@@ -51,6 +56,8 @@ impl Symbol {
             path: path.to_path_buf(),
             line: def.line,
             cols: Columns::Chars(def.cols),
+            lines: def.line..=def.line,
+            children: Vec::new(),
         }
     }
 }
@@ -64,6 +71,8 @@ impl From<lsp::Symbol> for Symbol {
             path: symbol.location.path,
             line: symbol.location.line,
             cols: Columns::Utf16(symbol.location.col16),
+            lines: symbol.lines,
+            children: symbol.children.into_iter().map(Self::from).collect(),
         }
     }
 }
@@ -72,16 +81,93 @@ pub(crate) fn document(path: &Path, text: &str, revision: lsp::Revision, client:
     if let Some(client) = client
         && let Ok(symbols) = client.document_symbols(path, text, revision, TIMEOUT)
     {
-        let symbols: Vec<_> = symbols
-            .into_iter()
-            .filter(|symbol| symbol.location.path == path)
-            .map(Symbol::from)
-            .collect();
+        let symbols = document_symbols(path, symbols);
         if !symbols.is_empty() {
             return symbols;
         }
     }
-    goto::definitions(text).map(|def| Symbol::from_definition(path, def)).collect()
+    fallback_document(path, text)
+}
+
+fn document_symbols(path: &Path, symbols: Vec<lsp::Symbol>) -> Vec<Symbol> {
+    let mut result = Vec::new();
+    for mut symbol in symbols {
+        let children = document_symbols(path, std::mem::take(&mut symbol.children));
+        if symbol.location.path == path {
+            let mut symbol = Symbol::from(symbol);
+            symbol.children = children;
+            result.push(symbol);
+        } else {
+            result.extend(children);
+        }
+    }
+    result
+}
+
+/// Approximate scope from indentation and aligned closing braces when no server supplies ranges.
+fn fallback_document(path: &Path, text: &str) -> Vec<Symbol> {
+    fn append(roots: &mut Vec<Symbol>, scopes: &mut [(usize, Symbol)], mut symbol: Symbol) {
+        if let Some((_, parent)) = scopes.last_mut() {
+            symbol.container = Some(parent.name.clone());
+            parent.children.push(symbol);
+        } else {
+            roots.push(symbol);
+        }
+    }
+
+    let mut definitions = goto::definitions(text).peekable();
+    let mut roots = Vec::new();
+    let mut scopes = Vec::<(usize, Symbol)>::new();
+    let mut last_line = 0;
+    for (line, source) in text.split('\n').enumerate() {
+        let trimmed = source.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let indent = source.len() - source.trim_start().len();
+        while scopes.last().is_some_and(|(level, _)| *level >= indent) {
+            let (level, mut symbol) = scopes.pop().unwrap();
+            let end = if level == indent && trimmed.starts_with('}') {
+                line
+            } else {
+                last_line
+            };
+            symbol.lines = symbol.line..=end;
+            append(&mut roots, &mut scopes, symbol);
+        }
+        if definitions.peek().is_some_and(|def| def.line == line) {
+            let symbol = Symbol::from_definition(path, definitions.next().unwrap());
+            let opens_scope = if trimmed.contains('{') {
+                !trimmed.ends_with('}')
+            } else {
+                !trimmed.ends_with(';')
+            };
+            if opens_scope {
+                scopes.push((indent, symbol));
+            } else {
+                append(&mut roots, &mut scopes, symbol);
+            }
+        }
+        last_line = line;
+    }
+    while let Some((_, mut symbol)) = scopes.pop() {
+        symbol.lines = symbol.line..=last_line;
+        append(&mut roots, &mut scopes, symbol);
+    }
+    roots
+}
+
+pub(crate) fn flatten(symbols: Vec<Symbol>) -> Vec<Symbol> {
+    fn append(symbols: Vec<Symbol>, rows: &mut Vec<Symbol>) {
+        for mut symbol in symbols {
+            let children = std::mem::take(&mut symbol.children);
+            rows.push(symbol);
+            append(children, rows);
+        }
+    }
+    let mut rows = Vec::new();
+    append(symbols, &mut rows);
+    rows
 }
 
 pub(crate) fn project(

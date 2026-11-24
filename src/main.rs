@@ -16,6 +16,7 @@ mod highlight;
 mod icons;
 mod installer;
 mod lsp;
+mod outline;
 mod replace;
 mod search;
 mod session;

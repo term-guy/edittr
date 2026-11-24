@@ -2,6 +2,7 @@ mod document_save;
 mod find;
 mod gutter;
 mod navigation;
+mod outline;
 mod problems;
 mod search_replace;
 mod session;
@@ -308,6 +309,7 @@ pub struct App {
     tree_requested: HashSet<PathBuf>,
     tree_rx: Option<Receiver<HashMap<PathBuf, DirEntries>>>,
     expanded: HashSet<PathBuf>,
+    outline: outline::Outline,
 
     status: Status,
     status_rx: Option<Receiver<VcsRefresh>>,
@@ -391,6 +393,7 @@ impl App {
             tree_requested: HashSet::new(),
             tree_rx: None,
             expanded: HashSet::new(),
+            outline: Default::default(),
             status: Status::default(),
             status_rx: None,
             refresh_pending: false,
@@ -723,6 +726,7 @@ impl App {
         self.poll_goto();
         self.poll_problems();
         self.poll_picker();
+        self.poll_outline();
         self.poll_search(ctx);
         self.poll_project_replace(ctx);
         self.poll_find_edit();
@@ -1650,8 +1654,9 @@ impl App {
     }
 
     fn explorer(&mut self, ui: &mut egui::Ui) {
+        self.show_outline(ui);
         let Some(root) = self.root.clone() else {
-            self.welcome(ui);
+            egui::ScrollArea::vertical().show(ui, |ui| self.welcome(ui));
             return;
         };
         ui.horizontal(|ui| {
@@ -2544,6 +2549,7 @@ impl eframe::App for App {
         self.open_requested_folder(frame);
         self.dialogs(&ctx);
         self.sync_active_document();
+        self.refresh_outline();
         self.project_replace_modal(&ctx);
         self.record_session(false);
         #[cfg(feature = "tour")]

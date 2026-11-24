@@ -21,6 +21,8 @@ pub(crate) struct Settings {
     pub(crate) minimap: bool,
     /// Color nested brackets by depth.
     pub(crate) bracket_colors: bool,
+    pub(crate) show_outline: bool,
+    pub(crate) outline_expanded: bool,
     pub(crate) restore_previous_session: bool,
 }
 
@@ -34,6 +36,8 @@ impl Default for Settings {
             inline_blame: true,
             minimap: true,
             bracket_colors: true,
+            show_outline: true,
+            outline_expanded: true,
             restore_previous_session: true,
         }
     }
@@ -93,6 +97,8 @@ impl Settings {
                     "inline_blame" => settings.inline_blame = value,
                     "minimap" => settings.minimap = value,
                     "bracket_colors" => settings.bracket_colors = value,
+                    "show_outline" => settings.show_outline = value,
+                    "outline_expanded" => settings.outline_expanded = value,
                     "restore_previous_session" => settings.restore_previous_session = value,
                     _ => {}
                 }
@@ -107,7 +113,16 @@ impl Settings {
             if !matches!(
                 entry(line),
                 Some((
-                    "changes_tree" | "highlight_line" | "show_whitespace" | "inline_blame" | "restore_previous_session" | "format_on_save",
+                    "changes_tree"
+                        | "highlight_line"
+                        | "show_whitespace"
+                        | "inline_blame"
+                        | "minimap"
+                        | "bracket_colors"
+                        | "restore_previous_session"
+                        | "format_on_save"
+                        | "show_outline"
+                        | "outline_expanded",
                     _
                 ))
             ) {
@@ -123,6 +138,8 @@ impl Settings {
         text.push_str(&format!("bracket_colors={}\n", self.bracket_colors));
         text.push_str(&format!("restore_previous_session={}\n", self.restore_previous_session));
         text.push_str(&format!("format_on_save={}\n", self.format_on_save));
+        text.push_str(&format!("show_outline={}\n", self.show_outline));
+        text.push_str(&format!("outline_expanded={}\n", self.outline_expanded));
         text
     }
 }
@@ -163,6 +180,26 @@ fn entry(line: &str) -> Option<(&str, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn outline_visibility_and_expansion_round_trip_independently() {
+        let defaults = Settings::parse("show_outline=maybe\noutline_expanded=maybe");
+        assert!(defaults.show_outline && defaults.outline_expanded);
+        for show_outline in [false, true] {
+            for outline_expanded in [false, true] {
+                let settings = Settings {
+                    show_outline,
+                    outline_expanded,
+                    ..defaults
+                };
+                let text = settings.format(" show_outline = false\noutline_expanded=false\n");
+                assert_eq!(text.matches("show_outline=").count(), 1);
+                assert_eq!(text.matches("outline_expanded=").count(), 1);
+                let parsed = Settings::parse(&text);
+                assert_eq!((parsed.show_outline, parsed.outline_expanded), (show_outline, outline_expanded));
+            }
+        }
+    }
 
     #[test]
     fn format_on_save_round_trip_and_default_off() {
@@ -210,7 +247,7 @@ mod tests {
         let text = settings.format(previous);
         assert_eq!(
             text,
-            "future_key=one=two\nfuture_key = three\n# A comment\nchanges_tree=false\nhighlight_line=false\nshow_whitespace=false\ninline_blame=true\nminimap=true\nbracket_colors=true\nrestore_previous_session=true\nformat_on_save=false\n"
+            "future_key=one=two\nfuture_key = three\n# A comment\nchanges_tree=false\nhighlight_line=false\nshow_whitespace=false\ninline_blame=true\nminimap=true\nbracket_colors=true\nrestore_previous_session=true\nformat_on_save=false\nshow_outline=true\noutline_expanded=true\n"
         );
         assert!(!Settings::parse(&text).changes_tree);
     }
@@ -219,6 +256,13 @@ mod tests {
     fn missing_or_invalid_value_defaults_to_list_view() {
         assert!(!Settings::parse("").changes_tree);
         assert!(!Settings::parse("changes_tree=maybe").changes_tree);
+    }
+
+    #[test]
+    fn saving_twice_keeps_one_line_per_key() {
+        let s = Settings::default();
+        let once = s.format("");
+        assert_eq!(s.format(&once), once);
     }
 
     #[test]

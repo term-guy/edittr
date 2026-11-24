@@ -121,6 +121,8 @@ pub(crate) struct Symbol {
     pub(crate) kind: &'static str,
     pub(crate) container: Option<String>,
     pub(crate) location: Location,
+    pub(crate) lines: std::ops::RangeInclusive<usize>,
+    pub(crate) children: Vec<Symbol>,
 }
 
 struct Synced {
@@ -725,15 +727,36 @@ fn collect_symbols(value: &Value, document: Option<&Path>, parent: Option<&str>,
             None => document.and_then(|path| location_at(path.to_path_buf(), &item["selectionRange"])),
         };
         if let (Some(name), Some(location)) = (name, location) {
+            let range = item.get("range").unwrap_or(&item["location"]["range"]);
+            let mut children = Vec::new();
+            collect_symbols(&item["children"], document, Some(name), &mut children);
             out.push(Symbol {
                 name: name.to_owned(),
                 kind: symbol_kind(item["kind"].as_u64()),
                 container: item["containerName"].as_str().or(parent).map(str::to_owned),
+                lines: symbol_lines(range, location.line),
                 location,
+                children,
             });
+        } else {
+            collect_symbols(&item["children"], document, name.or(parent), out);
         }
-        collect_symbols(&item["children"], document, name.or(parent), out);
     }
+}
+
+fn symbol_lines(range: &Value, selection_line: usize) -> std::ops::RangeInclusive<usize> {
+    let start = range["start"]["line"]
+        .as_u64()
+        .and_then(|n| usize::try_from(n).ok())
+        .unwrap_or(selection_line);
+    let mut end = range["end"]["line"]
+        .as_u64()
+        .and_then(|n| usize::try_from(n).ok())
+        .unwrap_or(selection_line);
+    if end > start && range["end"]["character"].as_u64() == Some(0) {
+        end -= 1; // LSP positions are end-exclusive.
+    }
+    start.min(selection_line)..=end.max(selection_line)
 }
 
 fn symbol_kind(kind: Option<u64>) -> &'static str {
@@ -810,12 +833,17 @@ mod tests {
             }]),
             Some(&file),
         );
-        assert_eq!(symbols.len(), 2);
+        assert_eq!(symbols.len(), 1);
         assert_eq!((&*symbols[0].name, symbols[0].kind), ("Model", "Struct"));
         assert_eq!(symbols[0].location.col16, 7..12);
-        assert_eq!(symbols[1].container.as_deref(), Some("Model"));
-        assert_eq!(symbols[1].location.path, file);
-        assert_eq!((symbols[1].location.line, symbols[1].location.col16.clone()), (2, 6..11));
+        assert_eq!(symbols[0].lines, 0..=6);
+        let [field] = symbols[0].children.as_slice() else {
+            panic!("expected one child")
+        };
+        assert_eq!(field.container.as_deref(), Some("Model"));
+        assert_eq!(field.location.path, file);
+        assert_eq!((field.location.line, field.location.col16.clone()), (2, 6..11));
+        assert_eq!(field.lines, 2..=2);
     }
 
     #[test]
@@ -842,6 +870,7 @@ mod tests {
             );
             assert_eq!(symbols[0].location.path, file);
             assert_eq!((symbols[0].location.line, symbols[0].location.col16.clone()), (5, 3..3));
+            assert_eq!(symbols[0].lines, 5..=6);
         }
         assert!(parse_symbols(&Value::Null, None).is_empty());
     }

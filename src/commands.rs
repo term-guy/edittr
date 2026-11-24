@@ -38,6 +38,7 @@ pub(crate) enum Setting {
     FormatOnSave,
     Minimap,
     BracketColors,
+    ShowOutline,
 }
 
 impl Setting {
@@ -51,6 +52,7 @@ impl Setting {
             Self::FormatOnSave => "Format on save",
             Self::Minimap => "Show minimap",
             Self::BracketColors => "Color nested brackets",
+            Self::ShowOutline => "Show outline",
         }
     }
 
@@ -64,6 +66,7 @@ impl Setting {
             Self::FormatOnSave => &mut settings.format_on_save,
             Self::Minimap => &mut settings.minimap,
             Self::BracketColors => &mut settings.bracket_colors,
+            Self::ShowOutline => &mut settings.show_outline,
         }
     }
 }
@@ -153,6 +156,7 @@ pub(crate) const COMMANDS: &[Entry] = &[
     Entry::new(ToggleSetting(Setting::FormatOnSave), "Toggle format on save", &[]),
     Entry::new(ToggleSetting(Setting::Minimap), "Toggle minimap", &[]),
     Entry::new(ToggleSetting(Setting::BracketColors), "Toggle bracket pair colors", &[]),
+    Entry::new(ToggleSetting(Setting::ShowOutline), "Show outline", &[]),
     Entry::new(
         FormatDocument,
         "Format document",
