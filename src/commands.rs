@@ -7,6 +7,7 @@ pub(crate) enum Command {
     OpenFolder,
     CloseFolder,
     QuickOpen,
+    GoToLine,
     Find,
     Replace,
     FindInFiles,
@@ -149,6 +150,8 @@ pub(crate) const COMMANDS: &[Entry] = &[
     Entry::new(OpenFolder, "Open folder", &[]),
     Entry::new(CloseFolder, "Close folder (back to the start page)", &[]),
     Entry::new(QuickOpen, "Go to file", &[KeyboardShortcut::new(CMD, Key::P)]),
+    // Ctrl+G on every platform (also on macOS, like VS Code).
+    Entry::new(GoToLine, "Go to line…", &[KeyboardShortcut::new(Modifiers::CTRL, Key::G)]),
     Entry::new(Find, "Find in file", &[KeyboardShortcut::new(CMD, Key::F)]),
     Entry::new(
         Replace,

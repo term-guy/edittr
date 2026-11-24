@@ -5,6 +5,7 @@ mod commit_view;
 mod diff_edit;
 mod document_save;
 mod find;
+mod goto_line;
 mod graph_menu;
 mod gutter;
 mod navigation;
@@ -394,6 +395,7 @@ pub struct App {
     find: find::Find,
     search_replace: search_replace::SearchReplace,
     c_flags: c_flags::CFlags,
+    goto_line: Option<goto_line::GotoLine>,
 
     lsp: problems::LanguageServers,
     problems: problems::Problems,
@@ -489,6 +491,7 @@ impl App {
             find: find::Find::default(),
             search_replace: search_replace::SearchReplace::default(),
             c_flags: c_flags::CFlags::default(),
+            goto_line: None,
             goto_rx: None,
             nav_back: Vec::new(),
             nav_forward: Vec::new(),
@@ -2566,7 +2569,8 @@ impl App {
                         || self.install_prompt.is_some()
                         || self.open_folder.is_some()
                         || self.search_replace.confirming()
-                        || self.c_flags.is_open();
+                        || self.c_flags.is_open()
+                        || self.goto_line.is_some();
                     self.find.bar(ui, doc, dialog_open);
                     disk_action = disk_changed_bar(ui, doc);
                     let fresh = match self.vcs {
@@ -2845,6 +2849,7 @@ impl App {
     }
 
     fn dialogs(&mut self, ctx: &egui::Context) {
+        self.goto_line_dialog(ctx);
         self.graph_dialog(ctx);
         self.c_flags_dialogs(ctx);
         // Quick open

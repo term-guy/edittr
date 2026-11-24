@@ -151,6 +151,7 @@ On Linux you need the usual windowing dev packages (see `.github/workflows/build
 | --- | --- |
 | `Ctrl/Cmd+Shift+P`, `F1` | Command palette |
 | `Ctrl/Cmd+P` | Go to file |
+| `Ctrl+G` | Go to line (`line` or `line:column`) |
 | `Ctrl/Cmd+Shift+O` | Go to symbol in file |
 | `Ctrl/Cmd+T` | Go to symbol in workspace |
 | `Ctrl/Cmd+F` | Find in file (the selection, if any) |

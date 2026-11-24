@@ -245,6 +245,7 @@ impl App {
             Command::OpenFolder => self.request_open_folder(),
             Command::CloseFolder => self.close_folder(false),
             Command::QuickOpen => self.start_quick_open(),
+            Command::GoToLine => self.open_goto_line(),
             Command::Find => self.show_find(false),
             Command::Replace => self.show_find(true),
             Command::FindInFiles => {
