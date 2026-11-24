@@ -20,6 +20,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Keep at most ONE edittr window open while testing or taking screenshots, and close it when done (hooks in `.claude/settings.json` enforce this). Never touch copies the user launched themselves.
 - `target/release/edittr` with no argument starts an empty project; pass a folder (or a file) to open it.
 - `screencapture` usually doesn't show the window (it opens on another Space); don't retry in a loop.
+- The tour opens `src/ui/graph.rs` of the demo repo; `EDITTR_TOUR_FILE=<path relative to the demo>` opens another file (e.g. a C file to see clangd hover/completion/diagnostics).
 - For screenshots, use the built-in tour instead of `screencapture`: `cargo build --release --features tour && EDITTR_TOUR_OUT=<dir> EDITTR_TOUR_DEMO=<git repo> target/release/edittr` saves one PNG per feature and quits (steps in `src/app/tour.rs`). Rebuild without `--features tour` afterwards.
 - Temporary test hooks (env var `EDITTR_TEST`) must be removed before finishing: `grep -n EDITTR_TEST src/`.
 
@@ -38,6 +39,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Gotchas
 
+- The editor is a custom widget (`src/editor/`: `buffer.rs` text model + undo, `fold.rs`, `mod.rs` widget) that lays out only visible lines; don't reintroduce `egui::TextEdit` for code. Its keyboard behavior is covered by headless widget tests in `src/editor/mod.rs` (drive the real widget with injected events).
 - Editor text changes must bump `Doc::version` (use `Doc::reload` / `Doc::mark_saved`): highlighting, blame, dirty state and the gutter are cached per version. Syntax highlighting is incremental (`src/highlight.rs`), not egui_extras' whole-buffer highlighter.
 - VCS calls go through `src/vcs.rs` (Git or Subversion) on background workers; refreshes are driven by the file watcher (`src/watch.rs`), not a timer. `svn` is not installed on the dev Mac: svn code is only unit-tested against sample XML.
 - To measure frame times, time `App::ui` temporarily and run the tour against a demo repo containing a ~20k-line file; remove the timer afterwards.
