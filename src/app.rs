@@ -759,9 +759,21 @@ impl App {
         st.cancel = Arc::new(AtomicBool::new(false));
         let in_repo = self.repo.is_some();
         let list_root = root.clone();
+        // Open files are searched first, from their (possibly unsaved) text; active tab first.
+        let order = std::iter::once(self.active).chain((0..self.tabs.len()).filter(|&i| i != self.active));
+        let open = order
+            .filter_map(|i| match self.tabs.get(i) {
+                Some(Tab::File(d)) => {
+                    let rel = d.path.strip_prefix(&root).ok()?.to_string_lossy().replace('\\', "/");
+                    Some((rel, d.text.clone()))
+                }
+                _ => None,
+            })
+            .collect();
         st.rx = Some(search::spawn(
             root,
             move || project_files(&list_root, in_repo),
+            open,
             st.opts.clone(),
             st.cancel.clone(),
             ctx.clone(),

@@ -2,10 +2,13 @@
 
 use eframe::egui;
 use regex::{Regex, RegexBuilder};
+use std::collections::{BTreeMap, HashSet};
+use std::fs::File;
+use std::io::Read;
 use std::ops::Range;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, channel};
 
 const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
@@ -54,14 +57,20 @@ pub fn build_regex(opts: &Options) -> Result<Regex, String> {
     }
     RegexBuilder::new(&pat)
         .case_insensitive(!opts.match_case)
+        .multi_line(true)
+        .crlf(true)
         .build()
         .map_err(|e| e.to_string().lines().last().unwrap_or("invalid regex").to_string())
 }
 
-/// Search `files` (paths relative to `base`). Results stream back as each file finishes.
+/// Search open editor buffers first (`open`: relative path and in-memory text, so
+/// unsaved edits count), then `files` (paths relative to `base`, listed on the
+/// background thread) on several threads. Results stream back in a stable order:
+/// open files, then project order.
 pub fn spawn(
     base: PathBuf,
     files: impl FnOnce() -> Vec<String> + Send + 'static,
+    open: Vec<(String, String)>,
     opts: Options,
     cancel: Arc<AtomicBool>,
     ctx: egui::Context,
@@ -76,37 +85,83 @@ pub fn spawn(
                 return;
             }
         };
-        let files = files();
         let mut total = 0;
-        let mut truncated = false;
         let mut searched = 0;
-        for rel in files {
-            if cancel.load(Ordering::Relaxed) {
-                return;
-            }
-            let path = base.join(&rel);
-            if std::fs::metadata(&path).map(|m| m.len() > MAX_FILE_BYTES).unwrap_or(true) {
+        let send = |rel: String, mut hits: Vec<Hit>, total: &mut usize| -> bool {
+            hits.truncate(MAX_HITS - *total);
+            *total += hits.len();
+            let ok = tx.send(Msg::File(FileHits { rel, hits })).is_ok();
+            ctx.request_repaint();
+            ok
+        };
+
+        // 1. Open files, from memory: instant results for what the user is working on.
+        let mut seen = HashSet::new();
+        for (rel, text) in open {
+            if !seen.insert(rel.clone()) {
                 continue;
-            }
-            let Ok(bytes) = std::fs::read(&path) else { continue };
-            if bytes.iter().take(8000).any(|&b| b == 0) {
-                continue; // binary
             }
             searched += 1;
-            let text = String::from_utf8_lossy(&bytes);
-            let hits = search_text(&re, &text, MAX_HITS_PER_FILE.min(MAX_HITS - total));
-            if hits.is_empty() {
-                continue;
+            if total < MAX_HITS && re.is_match(&text) {
+                let hits = search_text(&re, &text, MAX_HITS_PER_FILE);
+                if !hits.is_empty() && !send(rel, hits, &mut total) {
+                    return;
+                }
             }
-            total += hits.len();
-            if tx.send(Msg::File(FileHits { rel, hits })).is_err() {
-                return;
+        }
+
+        // 2. The rest of the project, in parallel.
+        let files: Vec<String> = files().into_iter().filter(|f| !seen.contains(f)).collect();
+        let next = AtomicUsize::new(0);
+        let stop = AtomicBool::new(false);
+        let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(1, 12);
+        let (wtx, wrx) = channel::<(usize, Option<Vec<Hit>>)>();
+        let mut truncated = false;
+        std::thread::scope(|s| {
+            for _ in 0..threads {
+                let wtx = wtx.clone();
+                let (files, next, stop, cancel, re, base) = (&files, &next, &stop, &cancel, &re, &base);
+                s.spawn(move || {
+                    loop {
+                        if stop.load(Ordering::Relaxed) || cancel.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(rel) = files.get(i) else { return };
+                        let result = search_file(&base.join(rel), re);
+                        if wtx.send((i, result)).is_err() {
+                            return;
+                        }
+                    }
+                });
             }
-            ctx.request_repaint();
-            if total >= MAX_HITS {
-                truncated = true;
-                break;
+            drop(wtx);
+            // Re-order: forward results in file-list order as soon as the prefix is complete.
+            let mut pending: BTreeMap<usize, Option<Vec<Hit>>> = BTreeMap::new();
+            let mut emit = 0;
+            for (i, r) in wrx {
+                pending.insert(i, r);
+                while let Some(r) = pending.remove(&emit) {
+                    let rel = &files[emit];
+                    emit += 1;
+                    let Some(hits) = r else { continue };
+                    searched += 1;
+                    if hits.is_empty() || truncated {
+                        continue;
+                    }
+                    if !send(rel.clone(), hits, &mut total) || cancel.load(Ordering::Relaxed) {
+                        stop.store(true, Ordering::Relaxed);
+                        return;
+                    }
+                    if total >= MAX_HITS {
+                        truncated = true;
+                        stop.store(true, Ordering::Relaxed);
+                    }
+                }
             }
+        });
+        if cancel.load(Ordering::Relaxed) {
+            return;
         }
         let _ = tx.send(Msg::Done {
             files: searched,
@@ -115,6 +170,29 @@ pub fn spawn(
         ctx.request_repaint();
     });
     rx
+}
+
+/// `None`: skipped (unreadable, too big or binary). Opens the file once: on Windows
+/// every open is expensive (antivirus filters), so no separate metadata call.
+fn search_file(path: &Path, re: &Regex) -> Option<Vec<Hit>> {
+    let mut f = File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    if len > MAX_FILE_BYTES {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(len as usize + 1);
+    f.read_to_end(&mut bytes).ok()?;
+    if bytes[..bytes.len().min(8000)].contains(&0) {
+        return None; // binary
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    // Most files don't match: one pass over the whole buffer rejects them, instead
+    // of running the regex line by line. Sound because the regex is multi-line with
+    // CRLF-aware anchors, so any per-line match is also a whole-text match.
+    if !re.is_match(&text) {
+        return Some(Vec::new());
+    }
+    Some(search_text(re, &text, MAX_HITS_PER_FILE))
 }
 
 fn search_text(re: &Regex, text: &str, limit: usize) -> Vec<Hit> {
@@ -207,6 +285,18 @@ mod tests {
     }
 
     #[test]
+    fn anchors_work_per_line_and_in_the_whole_text_prefilter() {
+        let mut o = opts("^world$");
+        o.regex = true;
+        let re = build_regex(&o).unwrap();
+        let text = "hello\r\nworld\r\nx world";
+        assert!(re.is_match(text));
+        let hits = search_text(&re, text, 10);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].line, 1);
+    }
+
+    #[test]
     fn long_lines_get_trimmed_with_unicode() {
         let line = format!("{}needle", "é".repeat(100));
         let re = build_regex(&opts("needle")).unwrap();
@@ -227,6 +317,7 @@ mod tests {
         let rx = spawn(
             dir.clone(),
             move || files,
+            vec![("sub/b.rs".into(), "unsaved hello\nhello".into())],
             opts("hello"),
             Arc::new(AtomicBool::new(false)),
             egui::Context::default(),
@@ -236,7 +327,7 @@ mod tests {
             match rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap() {
                 Msg::File(f) => found.push((f.rel, f.hits.iter().map(|h| (h.line, h.cols.clone())).collect::<Vec<_>>())),
                 Msg::Done { files, truncated } => {
-                    assert_eq!(files, 2); // binary + missing skipped
+                    assert_eq!(files, 2); // open b.rs + a.txt; binary and missing skipped
                     assert!(!truncated);
                     break;
                 }
@@ -247,8 +338,9 @@ mod tests {
         assert_eq!(
             found,
             vec![
+                // Open file first, searched from its unsaved text, not from disk.
+                ("sub/b.rs".to_string(), vec![(0, 8..13), (1, 0..5)]),
                 ("a.txt".to_string(), vec![(0, 0..5), (1, 6..11)]),
-                ("sub/b.rs".to_string(), vec![(0, 3..8)]),
             ]
         );
     }
