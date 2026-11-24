@@ -34,7 +34,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::time::{Duration, Instant};
 
-const SEARCH_DEBOUNCE: Duration = Duration::from_millis(250);
 const SAFETY_POLL: Duration = Duration::from_secs(30);
 const FALLBACK_POLL: Duration = Duration::from_secs(3);
 const ACTIVITY_POLL: Duration = Duration::from_millis(250);
@@ -237,7 +236,6 @@ struct SearchState {
     opts: search::Options,
     /// Options of the search currently shown / running.
     searched: search::Options,
-    edited: Option<Instant>,
     results: Vec<FileHits>,
     total: usize,
     collapsed: HashSet<usize>,
@@ -482,8 +480,8 @@ impl App {
         self.refresh_symbol_cache();
         self.search.cancel.store(true, Ordering::Relaxed);
         let opts = std::mem::take(&mut self.search.opts);
+        // The query is kept; it runs in the new folder when submitted (Enter).
         self.search = SearchState {
-            edited: (!opts.query.is_empty()).then(Instant::now),
             opts,
             ..SearchState::default()
         };
@@ -1377,7 +1375,6 @@ impl App {
         st.error = None;
         st.summary.clear();
         st.searched = st.opts.clone();
-        st.edited = None;
         if st.opts.query.is_empty() {
             st.rx = None;
             return;
@@ -1414,14 +1411,7 @@ impl App {
         ctx.request_repaint();
     }
 
-    fn poll_search(&mut self, ctx: &egui::Context) {
-        if let Some(t) = self.search.edited {
-            if t.elapsed() >= SEARCH_DEBOUNCE {
-                self.start_search(ctx);
-            } else {
-                ctx.request_repaint_after(SEARCH_DEBOUNCE - t.elapsed());
-            }
-        }
+    fn poll_search(&mut self, _ctx: &egui::Context) {
         let st = &mut self.search;
         let Some(rx) = &st.rx else { return };
         while let Ok(msg) = rx.try_recv() {
@@ -1509,9 +1499,10 @@ impl App {
         if filter_enter {
             self.start_search(ui.ctx());
         }
-        let st = &mut self.search;
-        if st.opts != st.searched && st.edited.is_none() {
-            st.edited = Some(Instant::now());
+        // Searching runs only when submitted (Enter); until then say so.
+        let st = &self.search;
+        if !st.opts.query.is_empty() && st.opts != st.searched && st.rx.is_none() {
+            ui.weak("Press Enter to search");
         }
         if enter {
             self.start_search(ui.ctx());
