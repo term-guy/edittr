@@ -187,8 +187,10 @@ impl App {
                         let details = format!("{}  {}", symbol.kind, symbol.line.saturating_add(1));
                         let selected = selected == Some(index);
                         let (button, tooltip) = if let Some(detail) = &symbol.detail {
+                            // The value goes on the right, like the kind/line of other rows,
+                            // so names stay left-aligned.
                             (
-                                egui::Button::selectable(selected, (&symbol.name, RichText::new(detail).small().weak())),
+                                egui::Button::selectable(selected, &symbol.name).shortcut_text(RichText::new(detail).small().weak()),
                                 format!("{}  {detail}\n{details}", symbol.name),
                             )
                         } else {

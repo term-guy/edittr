@@ -124,14 +124,15 @@ impl Tour {
         if name == "diff-side-by-side" {
             // The right pane is the real editor: click into a line and type, once the
             // diff (loaded in the background) is showing.
-            if !matches!(app.tabs.get(app.active), Some(Tab::Diff(_))) {
+            if app.diff_rx.is_some() {
                 self.frames = 1;
             }
+            let showing = matches!(app.tabs.get(app.active), Some(Tab::Diff(_)));
             let at = egui::pos2(900.0, 209.0);
             match self.frames {
-                20 => self.click(at, egui::PointerButton::Primary, true),
-                21 => self.click(at, egui::PointerButton::Primary, false),
-                23 => self.inject.push(egui::Event::Text(" // edited in the diff".into())),
+                20 if showing => self.click(at, egui::PointerButton::Primary, true),
+                21 if showing => self.click(at, egui::PointerButton::Primary, false),
+                23 if showing => self.inject.push(egui::Event::Text(" // edited in the diff".into())),
                 _ => {}
             }
         }
