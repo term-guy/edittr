@@ -269,6 +269,10 @@ enum Confirm {
     CloseTabs(Vec<usize>),
     SwitchWorkspace(PathBuf),
     Discard(FileChange),
+    /// Discard every change under a folder (path, the changes).
+    DiscardFolder(String, Vec<FileChange>),
+    /// Stage (true) or unstage a folder (path, number of files).
+    StageFolder(String, usize, bool),
 }
 
 type DetectedRepo = Option<(PathBuf, Vcs)>;
@@ -2038,6 +2042,8 @@ impl App {
         let mut actions = Vec::new();
         let (mut stage_all, mut unstage_all) = (false, false);
         let status = &self.status;
+        // A solid scroll bar takes its own space instead of floating over the row icons.
+        ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show_rows(ui, row_height, rows.len(), |ui, range| {
@@ -2073,7 +2079,7 @@ impl App {
                                 ChangeRow::Gap => {}
                                 row => {
                                     let show_stage = if row.staged() { !busy } else { has_index && !busy };
-                                    if let Some(a) = draw_change_row(ui, row, status, show_stage) {
+                                    if let Some(a) = draw_change_row(ui, row, status, show_stage, !busy) {
                                         actions.push(a);
                                     }
                                 }
@@ -2095,6 +2101,18 @@ impl App {
                 ChangeAction::Stage(path) => self.stage_change(Some(path), true),
                 ChangeAction::Unstage(path) => self.stage_change(Some(path), false),
                 ChangeAction::Discard(c) if !busy => self.confirm = Some(Confirm::Discard(c)),
+                ChangeAction::DiscardFolder(path) if !busy => {
+                    let changes: Vec<FileChange> = self.status.unstaged.iter().filter(|c| in_folder(&c.path, &path)).cloned().collect();
+                    if !changes.is_empty() {
+                        self.confirm = Some(Confirm::DiscardFolder(path, changes));
+                    }
+                }
+                ChangeAction::StageFolder(path, stage) if !busy => {
+                    let list = if stage { &self.status.unstaged } else { &self.status.staged };
+                    let count = list.iter().filter(|c| in_folder(&c.path, &path)).count();
+                    self.confirm = Some(Confirm::StageFolder(path, count, stage));
+                }
+                ChangeAction::DiscardFolder(_) | ChangeAction::StageFolder(..) => {}
                 ChangeAction::Discard(_) => {}
                 ChangeAction::ToggleFolder(key) => {
                     if !self.changes_collapsed.remove(&key) {
@@ -2668,12 +2686,39 @@ impl App {
                 }
                 Confirm::SwitchWorkspace(_) => "Discard unsaved changes and open the folder?".into(),
                 Confirm::Discard(f) => format!("Discard all changes to {}?\nThis cannot be undone.", f.path),
+                Confirm::DiscardFolder(path, changes) => {
+                    let new = changes.iter().filter(|c| c.code == '?').count();
+                    let files = if changes.len() == 1 {
+                        "1 file".to_owned()
+                    } else {
+                        format!("{} files", changes.len())
+                    };
+                    let deleted = match new {
+                        0 => String::new(),
+                        1 => "\n1 new (untracked) file will be deleted.".into(),
+                        n => format!("\n{n} new (untracked) files will be deleted."),
+                    };
+                    format!("Discard all changes in {path}/ ({files})?{deleted}\nThis cannot be undone.")
+                }
+                Confirm::StageFolder(path, count, stage) => {
+                    let files = if *count == 1 {
+                        "1 file".to_owned()
+                    } else {
+                        format!("{count} files")
+                    };
+                    format!("{} {files} in {path}/?", if *stage { "Stage" } else { "Unstage" })
+                }
+            };
+            let button = match c {
+                Confirm::StageFolder(_, _, true) => "Stage",
+                Confirm::StageFolder(_, _, false) => "Unstage",
+                Confirm::CloseTabs(_) | Confirm::SwitchWorkspace(_) | Confirm::Discard(_) | Confirm::DiscardFolder(..) => "Discard",
             };
             let mut answer = None;
             egui::Modal::new(egui::Id::unique("confirm")).show(ctx, |ui| {
                 ui.label(text);
                 ui.horizontal(|ui| {
-                    if ui.button("Discard").clicked() {
+                    if ui.button(button).clicked() {
                         answer = Some(true);
                     }
                     if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
@@ -2693,6 +2738,13 @@ impl App {
                                 self.spawn_vcs(VcsOperation::Discard(path), move |vcs, repo| vcs.discard(repo, &f));
                             }
                         }
+                        Confirm::DiscardFolder(path, changes) => {
+                            if let Some(repo) = &self.repo {
+                                let path = repo.join(&path);
+                                self.spawn_vcs(VcsOperation::Discard(path), move |vcs, repo| vcs.discard_many(repo, &changes));
+                            }
+                        }
+                        Confirm::StageFolder(path, _, stage) => self.stage_change(Some(path), stage),
                     }
                 }
             }
@@ -3263,6 +3315,8 @@ enum ChangeAction {
     Stage(String),
     Unstage(String),
     Discard(FileChange),
+    DiscardFolder(String),
+    StageFolder(String, bool),
     ToggleFolder(String),
 }
 
@@ -3299,6 +3353,11 @@ impl ChangeRow {
 
 fn collapse_key(staged: bool, path: &str) -> String {
     format!("{}{path}", if staged { "S:" } else { "U:" })
+}
+
+/// Whether `path` is inside the repo-relative folder `folder`.
+fn in_folder(path: &str, folder: &str) -> bool {
+    path.strip_prefix(folder).is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// The visible rows of both sections, as a flat list or a folder tree.
@@ -3357,7 +3416,7 @@ fn change_rows(status: &Status, has_index: bool, as_tree: bool, collapsed: &Hash
     rows
 }
 
-fn draw_change_row(ui: &mut egui::Ui, row: &ChangeRow, status: &Status, show_stage: bool) -> Option<ChangeAction> {
+fn draw_change_row(ui: &mut egui::Ui, row: &ChangeRow, status: &Status, show_stage: bool, can_discard: bool) -> Option<ChangeAction> {
     match row {
         ChangeRow::File {
             staged,
@@ -3403,16 +3462,20 @@ fn draw_change_row(ui: &mut egui::Ui, row: &ChangeRow, status: &Status, show_sta
             };
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let (icon, tip) = if *staged {
-                    (ic::MINUS, "Unstage folder")
+                    (ic::MINUS, "Unstage folder…")
                 } else {
-                    (ic::PLUS, "Stage folder")
+                    (ic::PLUS, "Stage folder…")
                 };
                 if show_stage && icon_button(ui, icon).on_hover_text(tip).clicked() {
-                    action = Some(if *staged {
-                        ChangeAction::Unstage(path.clone())
-                    } else {
-                        ChangeAction::Stage(path.clone())
-                    });
+                    action = Some(ChangeAction::StageFolder(path.clone(), !*staged));
+                }
+                if !*staged
+                    && can_discard
+                    && icon_button(ui, ic::ARROW_U_UP_LEFT)
+                        .on_hover_text("Discard folder changes…")
+                        .clicked()
+                {
+                    action = Some(ChangeAction::DiscardFolder(path.clone()));
                 }
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                     let text = format!("{caret} {folder} {label}");
@@ -3739,6 +3802,15 @@ mod tests {
         let m = fuzzy_filter(&many, "mod5file9", 200);
         assert_eq!(m.len(), 200);
         eprintln!("fuzzy_filter over 100k paths: {:?}", t.elapsed());
+    }
+
+    #[test]
+    fn folder_membership_is_by_whole_path_components() {
+        use super::in_folder;
+        assert!(in_folder("src/ui/a.rs", "src"));
+        assert!(in_folder("src/ui/a.rs", "src/ui"));
+        assert!(!in_folder("src2/a.rs", "src"));
+        assert!(!in_folder("src", "src"));
     }
 
     #[test]

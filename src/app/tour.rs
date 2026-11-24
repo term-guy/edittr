@@ -34,6 +34,7 @@ const STEPS: &[&str] = &[
     "command-palette",
     "source-control",
     "source-control-tree",
+    "discard-folder",
     "diff-side-by-side",
     "diff-inline",
     "git-graph",
@@ -318,7 +319,19 @@ impl Tour {
                 app.refresh_vcs();
             }
             "source-control-tree" => app.settings.changes_tree = true,
+            "discard-folder" => {
+                // Only the confirmation is shown; the next step cancels it.
+                let changes: Vec<_> = app
+                    .status
+                    .unstaged
+                    .iter()
+                    .filter(|c| super::in_folder(&c.path, "src/ui"))
+                    .cloned()
+                    .collect();
+                app.confirm = Some(super::Confirm::DiscardFolder("src/ui".into(), changes));
+            }
             "diff-side-by-side" => {
+                app.confirm = None;
                 if let Some(c) = app.status.unstaged.iter().find(|c| c.path == "a.rs").cloned() {
                     app.open_diff(&c, false);
                 }

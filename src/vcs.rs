@@ -98,6 +98,21 @@ impl Vcs {
         }
     }
 
+    /// Discard several changes at once (a folder): batched where the VCS allows it.
+    pub fn discard_many(self, root: &Path, changes: &[FileChange]) -> Result<String, String> {
+        match self {
+            Self::Git => git::discard_many(root, changes),
+            Self::Svn => {
+                let errors: Vec<String> = changes.iter().filter_map(|c| svn::discard(root, c).err()).collect();
+                if errors.is_empty() {
+                    Ok(String::new())
+                } else {
+                    Err(errors.join("\n"))
+                }
+            }
+        }
+    }
+
     pub fn commit(self, root: &Path, msg: &str, amend: bool) -> Result<String, String> {
         match self {
             Self::Git => git::commit(root, msg, amend),

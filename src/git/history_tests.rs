@@ -282,3 +282,31 @@ fn graph_history_actions_on_a_real_git_repository() {
     assert_eq!(git(&["rev-parse", "CHERRY_PICK_HEAD"]), feature);
     assert_eq!(status(&repo.0).unwrap().unstaged[0].code, 'U');
 }
+
+#[test]
+fn discards_a_folder_in_one_batch() {
+    let repo = std::env::temp_dir().join(format!("edittr-discard-folder-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&repo);
+    fs::create_dir_all(repo.join("src/ui")).unwrap();
+    let git = |args: &[&str]| run(&repo, args).unwrap();
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "t@t"]);
+    git(&["config", "user.name", "t"]);
+    for (path, text) in [("src/a.rs", "a\n"), ("src/ui/b.rs", "b\n"), ("keep.rs", "k\n")] {
+        fs::write(repo.join(path), text).unwrap();
+    }
+    git(&["add", "."]);
+    git(&["commit", "-qm", "init"]);
+    fs::write(repo.join("src/a.rs"), "changed\n").unwrap();
+    fs::write(repo.join("src/ui/b.rs"), "changed\n").unwrap();
+    fs::write(repo.join("src/ui/new.rs"), "new\n").unwrap();
+    fs::write(repo.join("keep.rs"), "outside the folder\n").unwrap();
+    let changes =
+        [('M', "src/a.rs"), ('M', "src/ui/b.rs"), ('?', "src/ui/new.rs")].map(|(code, path)| FileChange { code, path: path.into() });
+    Vcs::Git.discard_many(&repo, &changes).unwrap();
+    assert_eq!(fs::read_to_string(repo.join("src/a.rs")).unwrap(), "a\n");
+    assert_eq!(fs::read_to_string(repo.join("src/ui/b.rs")).unwrap(), "b\n");
+    assert!(!repo.join("src/ui/new.rs").exists());
+    assert_eq!(fs::read_to_string(repo.join("keep.rs")).unwrap(), "outside the folder\n");
+    fs::remove_dir_all(&repo).ok();
+}

@@ -144,6 +144,30 @@ pub fn discard(repo: &Path, change: &FileChange) -> Result<String, String> {
         run(repo, &["restore", "--", &change.path])
     }
 }
+/// Discard many changes: new (untracked) files are deleted, the rest restored with
+/// one `git restore` per 500 paths.
+pub fn discard_many(repo: &Path, changes: &[FileChange]) -> Result<String, String> {
+    let mut errors = Vec::new();
+    for change in changes.iter().filter(|c| c.code == '?') {
+        if let Err(e) = std::fs::remove_file(repo.join(&change.path)) {
+            errors.push(format!("{}: {e}", change.path));
+        }
+    }
+    let tracked: Vec<&str> = changes.iter().filter(|c| c.code != '?').map(|c| c.path.as_str()).collect();
+    for chunk in tracked.chunks(500) {
+        let mut args = vec!["restore", "--"];
+        args.extend(chunk);
+        if let Err(e) = run(repo, &args) {
+            errors.push(e);
+        }
+    }
+    if errors.is_empty() {
+        Ok(String::new())
+    } else {
+        Err(errors.join("\n"))
+    }
+}
+
 pub fn commit(repo: &Path, msg: &str, amend: bool) -> Result<String, String> {
     let mut args = vec!["commit", "-m", msg];
     if amend {
