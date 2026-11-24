@@ -185,7 +185,9 @@ impl Tour {
                 app.set_root(demo.clone());
                 app.expanded.insert(demo.join("src"));
                 app.expanded.insert(demo.join("src/ui"));
-                app.open_file(&demo.join("src/ui/graph.rs"));
+                // EDITTR_TOUR_FILE: open another file (relative to the demo repo) instead.
+                let file = std::env::var("EDITTR_TOUR_FILE").unwrap_or_else(|_| "src/ui/graph.rs".into());
+                app.open_file(&demo.join(file));
             }
             "go-to-file" => {
                 app.start_quick_open();

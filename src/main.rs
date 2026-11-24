@@ -3,6 +3,7 @@
 mod app;
 mod blame;
 mod bundled;
+mod diagnostics;
 mod diff;
 mod editor;
 mod git;

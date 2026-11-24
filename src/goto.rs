@@ -18,7 +18,8 @@ pub struct Request {
     /// Ignored folders, relative to `root`: never a source of definitions.
     pub ignored: Vec<String>,
     pub char_idx: usize,
-    pub client: Option<Arc<lsp::Client>>,
+    pub client: Option<Arc<lsp::Launch>>,
+    pub revision: lsp::Revision,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -40,9 +41,9 @@ pub fn run(req: Request) -> Outcome {
     };
     let ignored = |p: &Path| workspace::relative_path(&req.root, p).is_some_and(|rel| workspace::is_ignored(&rel, &req.ignored));
     let mut lsp_note = String::new();
-    if let Some(client) = &req.client {
+    if let Some(client) = req.client.as_ref().and_then(|launch| launch.wait()) {
         let (line, col16) = line_col16(&req.text, req.char_idx);
-        let mut result = client.definition(&req.path, &req.text, line, col16, LSP_TIMEOUT);
+        let mut result = client.definition(&req.path, &req.text, req.revision, (line, col16), LSP_TIMEOUT);
         // Right after a file is opened, the TypeScript server answers with the
         // `import` line until it has loaded the project; ask again a few times.
         for _ in 0..6 {
@@ -53,7 +54,7 @@ pub fn run(req: Request) -> Outcome {
                 break;
             }
             std::thread::sleep(Duration::from_millis(500));
-            result = client.definition(&req.path, &req.text, line, col16, LSP_TIMEOUT);
+            result = client.definition(&req.path, &req.text, req.revision, (line, col16), LSP_TIMEOUT);
         }
         match result {
             Ok(locs) => {
@@ -142,7 +143,7 @@ pub fn line_col16(text: &str, idx: usize) -> (usize, usize) {
     (line, col)
 }
 
-fn col16_to_char(line: &str, col16: usize) -> usize {
+pub(crate) fn col16_to_char(line: &str, col16: usize) -> usize {
     let mut units = 0;
     for (i, c) in line.chars().enumerate() {
         if units >= col16 {
@@ -379,11 +380,12 @@ mod tests {
             std::fs::write(p, body).unwrap();
         }
         let dir = std::fs::canonicalize(&dir).unwrap();
-        let spec = lsp::servers_for(ext)
+        let (spec, command) = lsp::servers_for(ext)
             .into_iter()
-            .find(|s| lsp::resolve(s.command).is_some())
+            .find_map(|spec| lsp::resolve(spec.command).map(|command| (spec, command)))
             .expect("server not installed");
-        let client = lsp::Client::start(&spec, &dir, &[], None).unwrap();
+        let launch = Arc::new(lsp::Launch::default());
+        launch.finish(Some(lsp::Client::start(&spec, command, &dir, &[], None).unwrap()));
         let text = std::fs::read_to_string(dir.join(main)).unwrap();
         let idx = text.find(symbol).map(|b| text[..b].chars().count()).unwrap() + 1;
         // Indexing can take a moment: retry until the server answers with a location.
@@ -396,7 +398,8 @@ mod tests {
                 text: text.clone(),
                 ignored: Vec::new(),
                 char_idx: idx,
-                client: Some(client.clone()),
+                client: Some(launch.clone()),
+                revision: (0, 0),
             };
             match run(req) {
                 Outcome::Found { target, via } if via == spec.name => break target,

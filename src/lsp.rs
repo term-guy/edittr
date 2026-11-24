@@ -1,15 +1,14 @@
-//! Minimal Language Server Protocol client: just enough for go-to-definition.
-//!
-//! One server process per language per project folder, started lazily on first use.
-//! Documents are synced lazily too: before each request we send the current buffer.
+//! Language Server Protocol client for go-to-definition and diagnostics.
 
+use crate::diagnostics::{self, ByPath};
+pub use crate::diagnostics::{Diagnostic, Severity};
 use crate::workspace;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -112,9 +111,66 @@ pub struct Location {
     pub col16: std::ops::Range<usize>,
 }
 
+/// Document id and edit version, ordered across reopening the same file.
+pub type Revision = (u64, u64);
+
 struct Synced {
     version: i64,
-    text_hash: u64,
+    revision: Revision,
+    text: Arc<str>,
+}
+
+#[derive(Clone, Copy)]
+enum SyncKind {
+    None,
+    Full,
+    Incremental,
+}
+
+impl SyncKind {
+    fn from_initialize(result: &Value) -> Self {
+        let sync = &result["capabilities"]["textDocumentSync"];
+        match sync.as_u64().or_else(|| sync["change"].as_u64()) {
+            Some(2) => Self::Incremental,
+            Some(0) => Self::None,
+            _ => Self::Full,
+        }
+    }
+}
+
+/// Shares a background launch between diagnostics and navigation.
+#[derive(Default)]
+pub struct Launch {
+    result: OnceLock<Option<Arc<Client>>>,
+    cancelled: AtomicBool,
+}
+
+impl Launch {
+    pub fn finish(&self, client: Option<Arc<Client>>) {
+        let _ = self.result.set(client);
+        self.retire_if_cancelled();
+    }
+
+    pub fn wait(&self) -> Option<&Client> {
+        let client = self.result.wait().as_deref()?;
+        (!self.cancelled.load(Ordering::Acquire)).then_some(client)
+    }
+
+    pub fn get(&self) -> Option<&Option<Arc<Client>>> {
+        self.result.get()
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    pub fn retire_if_cancelled(&self) {
+        if self.cancelled.load(Ordering::Acquire)
+            && let Some(Some(client)) = self.get()
+        {
+            client.retire();
+        }
+    }
 }
 
 #[derive(Eq, Hash, PartialEq)]
@@ -181,9 +237,12 @@ pub struct Client {
     child: Mutex<Child>,
     next_id: AtomicI64,
     pending: Arc<Mutex<HashMap<i64, Sender<Value>>>>,
-    ready: OnceLock<Result<(), String>>,
+    ready: OnceLock<Result<SyncKind, String>>,
     progress: Mutex<HashMap<ProgressToken, Progress>>,
-    docs: Mutex<HashMap<String, Synced>>,
+    sync_write: Mutex<()>,
+    docs: Mutex<HashMap<PathBuf, Synced>>,
+    diagnostics: Mutex<ByPath>,
+    diagnostics_generation: AtomicU64,
 }
 
 impl Drop for Client {
@@ -199,11 +258,11 @@ impl Client {
     /// Spawn the server and start the `initialize` handshake in the background.
     pub fn start(
         spec: &ServerSpec,
+        launch: crate::bundled::Launch,
         root: &Path,
         ignored: &[String],
         repaint: Option<Arc<dyn Fn() + Send + Sync>>,
     ) -> Result<Arc<Client>, String> {
-        let launch = resolve(spec.command).ok_or_else(|| format!("{} is not installed", spec.command))?;
         let mut cmd = Command::new(&launch.exe);
         cmd.args(&launch.args)
             .args(spec.args)
@@ -233,7 +292,10 @@ impl Client {
             pending: Arc::new(Mutex::new(HashMap::new())),
             ready: OnceLock::new(),
             progress: Mutex::new(HashMap::new()),
+            sync_write: Mutex::new(()),
             docs: Mutex::new(HashMap::new()),
+            diagnostics: Mutex::new(HashMap::new()),
+            diagnostics_generation: AtomicU64::new(0),
         });
 
         let weak = Arc::downgrade(&client);
@@ -270,6 +332,14 @@ impl Client {
                             repaint();
                         }
                     }
+                    (None, Some("textDocument/publishDiagnostics")) => {
+                        let Some(c) = weak.upgrade() else { break };
+                        if c.publish_diagnostics(&msg["params"])
+                            && let Some(repaint) = &reader_repaint
+                        {
+                            repaint();
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -299,6 +369,7 @@ impl Client {
                         "synchronization": {"dynamicRegistration": false},
                         "definition": {"linkSupport": true},
                         "declaration": {"linkSupport": true},
+                        "publishDiagnostics": {"versionSupport": true},
                     },
                     "workspace": {"workspaceFolders": true, "configuration": true},
                 },
@@ -306,19 +377,16 @@ impl Client {
             if let Some(options) = initialization_options {
                 params["initializationOptions"] = options;
             }
-            let res = c
-                .request("initialize", params, Duration::from_secs(60))
-                .map(|_| c.notify("initialized", json!({})));
+            let res = c.request("initialize", params, Duration::from_secs(60)).map(|result| {
+                c.notify("initialized", json!({}));
+                SyncKind::from_initialize(&result)
+            });
             let _ = c.ready.set(res);
             if let Some(repaint) = repaint {
                 repaint();
             }
         });
         Ok(client)
-    }
-
-    pub fn alive(&self) -> bool {
-        self.child.lock().map(|mut c| matches!(c.try_wait(), Ok(None))).unwrap_or(false)
     }
 
     pub fn is_available(&self) -> bool {
@@ -395,7 +463,7 @@ impl Client {
         Ok(msg["result"].clone())
     }
 
-    fn wait_ready(&self, timeout: Duration) -> Result<(), String> {
+    fn wait_ready(&self, timeout: Duration) -> Result<SyncKind, String> {
         let start = std::time::Instant::now();
         loop {
             if let Some(r) = self.ready.get() {
@@ -408,49 +476,146 @@ impl Client {
         }
     }
 
-    /// Make sure the server sees the current buffer contents.
-    fn sync(&self, path: &Path, text: &str) {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        text.hash(&mut h);
-        let hash = h.finish();
-        let uri = path_to_uri(path);
-        let mut docs = self.docs.lock().unwrap();
-        match docs.get_mut(&uri) {
-            Some(s) if s.text_hash == hash => {}
-            Some(s) => {
-                s.version += 1;
-                s.text_hash = hash;
-                self.notify(
-                    "textDocument/didChange",
-                    json!({"textDocument": {"uri": uri, "version": s.version}, "contentChanges": [{"text": text}]}),
-                );
+    pub fn diagnostics_generation(&self) -> u64 {
+        self.diagnostics_generation.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn diagnostics_snapshot(&self) -> ByPath {
+        self.diagnostics.lock().unwrap().clone()
+    }
+
+    fn ignores(&self, path: &Path) -> bool {
+        !self.ignored.is_empty() && workspace::relative_path(&self.root, path).is_some_and(|rel| workspace::is_ignored(&rel, &self.ignored))
+    }
+
+    fn publish_diagnostics(&self, params: &Value) -> bool {
+        let Some(path) = params["uri"].as_str().and_then(uri_to_path) else {
+            return false;
+        };
+        let Some(items) = params["diagnostics"].as_array() else {
+            return false;
+        };
+        if self.ignores(&path) {
+            return false;
+        }
+        let version = params["version"].as_i64();
+        let stale = |doc: &Synced| version.is_some_and(|v| v < doc.version);
+        let text = {
+            let docs = self.docs.lock().unwrap();
+            let doc = docs.get(&path);
+            if doc.is_some_and(stale) {
+                return false;
             }
-            None => {
-                self.notify(
-                    "textDocument/didOpen",
-                    json!({"textDocument": {"uri": uri, "languageId": self.language_id, "version": 1, "text": text}}),
-                );
-                docs.insert(
-                    uri,
-                    Synced {
-                        version: 1,
-                        text_hash: hash,
-                    },
-                );
-            }
+            doc.map(|doc| doc.text.clone())
+        };
+        let disk = if text.is_none() && !items.is_empty() && path.is_file() {
+            std::fs::read_to_string(&path).ok()
+        } else {
+            None
+        };
+        let diagnostics = diagnostics::parse(items, text.as_deref().or(disk.as_deref()));
+        let docs = self.docs.lock().unwrap();
+        if docs.get(&path).is_some_and(stale) {
+            return false;
+        }
+        let mut all = self.diagnostics.lock().unwrap();
+        let changed = if diagnostics.is_empty() {
+            all.remove(&path).is_some()
+        } else if all.get(&path) == Some(&diagnostics) {
+            false
+        } else {
+            all.insert(path, diagnostics);
+            true
+        };
+        if changed {
+            self.diagnostics_generation.fetch_add(1, Ordering::Release);
+        }
+        changed
+    }
+
+    pub fn sync_ready(&self, path: &Path, text: &str, revision: Revision) {
+        if self.is_available()
+            && let Some(Ok(kind)) = self.ready.get()
+        {
+            self.sync(path, text, revision, *kind);
         }
     }
 
+    /// Serialize document notifications, releasing the document lock before writing to the pipe.
+    fn sync(&self, path: &Path, text: &str, revision: Revision, kind: SyncKind) -> bool {
+        let _write = self.sync_write.lock().unwrap();
+        let uri = path_to_uri(path);
+        let mut docs = self.docs.lock().unwrap();
+        let (method, params) = match docs.get_mut(path) {
+            Some(s) if s.revision > revision => return false,
+            Some(s) if s.revision == revision => return true,
+            Some(s) => {
+                s.revision = revision;
+                if s.text.as_ref() == text || matches!(kind, SyncKind::None) {
+                    return true;
+                }
+                s.version += 1;
+                let previous = std::mem::replace(&mut s.text, text.into());
+                let version = s.version;
+                drop(docs);
+                let change = match kind {
+                    SyncKind::Incremental => {
+                        let line = previous.bytes().filter(|&b| b == b'\n').count();
+                        let character = previous.rsplit('\n').next().unwrap_or_default().encode_utf16().count();
+                        json!({"range": {"start": {"line": 0, "character": 0}, "end": {"line": line, "character": character}}, "text": text})
+                    }
+                    _ => json!({"text": text}),
+                };
+                (
+                    "textDocument/didChange",
+                    json!({"textDocument": {"uri": uri, "version": version}, "contentChanges": [change]}),
+                )
+            }
+            None => {
+                docs.insert(
+                    path.to_path_buf(),
+                    Synced {
+                        version: 1,
+                        revision,
+                        text: text.into(),
+                    },
+                );
+                drop(docs);
+                let language_id = path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .and_then(|ext| {
+                        servers_for(&ext.to_ascii_lowercase())
+                            .into_iter()
+                            .find(|spec| spec.name == self.name)
+                    })
+                    .map_or(self.language_id, |spec| spec.language_id);
+                (
+                    "textDocument/didOpen",
+                    json!({"textDocument": {"uri": uri, "languageId": language_id, "version": 1, "text": text}}),
+                )
+            }
+        };
+        self.notify(method, params);
+        true
+    }
+
     /// Go to definition; falls back to declaration if the server returns nothing.
-    pub fn definition(&self, path: &Path, text: &str, line: usize, col16: usize, timeout: Duration) -> Result<Vec<Location>, String> {
-        if !self.ignored.is_empty()
-            && workspace::relative_path(&self.root, path).is_some_and(|rel| workspace::is_ignored(&rel, &self.ignored))
-        {
+    pub fn definition(
+        &self,
+        path: &Path,
+        text: &str,
+        revision: Revision,
+        (line, col16): (usize, usize),
+        timeout: Duration,
+    ) -> Result<Vec<Location>, String> {
+        if self.ignores(path) {
             return Ok(Vec::new());
         }
-        self.wait_ready(timeout)?;
-        self.sync(path, text);
+        let kind = self.wait_ready(timeout)?;
+        if !self.sync(path, text, revision, kind) {
+            return Err("The document changed".into());
+        }
         let params = json!({
             "textDocument": {"uri": path_to_uri(path)},
             "position": {"line": line, "character": col16},
@@ -545,6 +710,52 @@ mod tests {
         let raw = format!("Content-Length: {}\r\nContent-Type: x\r\n\r\n{body}", body.len());
         let msg = read_message(&mut std::io::Cursor::new(raw)).unwrap();
         assert_eq!(msg["id"], 1);
+    }
+
+    #[test]
+    #[ignore = "requires clangd on PATH"]
+    fn clangd_publishes_and_clears_diagnostics() {
+        let dir = std::env::temp_dir().join(format!("edittr-clangd-diagnostics-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        let path = dir.join("main.c");
+        let broken = "int main(void) { /* 😀 */ return missing; }\n";
+        std::fs::write(&path, broken).unwrap();
+
+        let spec = &servers_for("c")[0];
+        let command = resolve(spec.command).expect("clangd is not installed");
+        let (tx, rx) = channel();
+        let client = Client::start(
+            spec,
+            command,
+            &dir,
+            &[],
+            Some(Arc::new(move || {
+                let _ = tx.send(());
+            })),
+        )
+        .unwrap();
+        client.wait_ready(Duration::from_secs(10)).unwrap();
+        let wait_for = |generation| {
+            let start = std::time::Instant::now();
+            while client.diagnostics_generation() <= generation {
+                let remaining = Duration::from_secs(10).saturating_sub(start.elapsed());
+                rx.recv_timeout(remaining).expect("no diagnostics publication");
+            }
+        };
+
+        client.sync_ready(&path, broken, (0, 0));
+        wait_for(0);
+        let snapshot = client.diagnostics_snapshot();
+        let diagnostic = snapshot[&path].iter().find(|d| d.message.contains("missing")).unwrap();
+        assert_eq!(diagnostic.col_start, broken.split("missing").next().unwrap().chars().count());
+
+        let generation = client.diagnostics_generation();
+        client.sync_ready(&path, "int main(void) { return 0; }\n", (0, 1));
+        wait_for(generation);
+        assert!(!client.diagnostics_snapshot().contains_key(&path));
+        drop(client);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

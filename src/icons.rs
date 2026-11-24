@@ -29,6 +29,10 @@ pub const SUN: &str = "\u{E472}";
 pub const TREE_STRUCTURE: &str = "\u{E67C}";
 pub const TREE_VIEW: &str = "\u{EE48}";
 pub const LIST: &str = "\u{E2F0}";
+pub const INFO: &str = "\u{E2CE}";
+pub const LIGHTBULB: &str = "\u{E2DC}";
+pub const WARNING: &str = "\u{E4E0}";
+pub const X_CIRCLE: &str = "\u{E4F8}";
 pub const X: &str = "\u{E4F6}";
 pub const COLUMNS: &str = "\u{E1E2}";
 pub const ROWS: &str = "\u{E5A2}";
@@ -43,4 +47,29 @@ pub fn install(ctx: &eframe::egui::Context) {
         fonts.families.entry(family).or_default().push("phosphor".into());
     }
     ctx.set_fonts(fonts);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eframe::egui::{Context, FontId};
+
+    #[test]
+    fn phosphor_contains_problem_icons() {
+        let ctx = Context::default();
+        let mut fonts = FontDefinitions::empty();
+        fonts.font_data.insert(
+            "phosphor".into(),
+            Arc::new(FontData::from_static(include_bytes!("../assets/Phosphor.ttf"))),
+        );
+        fonts.families.insert(FontFamily::Proportional, vec!["phosphor".into()]);
+        ctx.set_fonts(fonts);
+        let _ = ctx.run_ui(Default::default(), |ui| {
+            ui.fonts_mut(|fonts| {
+                for icon in [INFO, LIGHTBULB, WARNING, X_CIRCLE] {
+                    assert!(fonts.has_glyphs(&FontId::proportional(14.0), icon), "missing glyph {icon:?}");
+                }
+            });
+        });
+    }
 }

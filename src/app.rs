@@ -1,3 +1,4 @@
+mod problems;
 #[cfg(feature = "tour")]
 mod tour;
 
@@ -217,6 +218,7 @@ enum Side {
     Explorer,
     Changes,
     Search,
+    Problems,
 }
 
 #[derive(Default)]
@@ -333,8 +335,8 @@ pub struct App {
     open_folder: Option<String>,
     search: SearchState,
 
-    lsp: HashMap<&'static str, Arc<lsp::Client>>,
-    lsp_failed: HashSet<&'static str>,
+    lsp: problems::LanguageServers,
+    problems: problems::Problems,
     goto_rx: Option<Receiver<goto::Outcome>>,
     /// Where we jumped from, for "go back".
     nav_back: Vec<(PathBuf, usize)>,
@@ -404,8 +406,8 @@ impl App {
             open_folder_requested: false,
             open_folder: None,
             search: SearchState::default(),
-            lsp: HashMap::new(),
-            lsp_failed: HashSet::new(),
+            lsp: problems::LanguageServers::default(),
+            problems: problems::Problems::default(),
             goto_rx: None,
             nav_back: Vec::new(),
             install: None,
@@ -713,6 +715,7 @@ impl App {
 
     fn poll_background(&mut self, ctx: &egui::Context) {
         self.poll_goto();
+        self.poll_problems();
         self.poll_search(ctx);
         if let Some(err) = self.settings_writer.errors.try_iter().last() {
             self.message = format!("Could not save settings: {err}");
@@ -921,11 +924,6 @@ impl App {
             line_col_cache: std::cell::Cell::new((u64::MAX, 0, (0, 0))),
         }));
         self.next_doc_id += 1;
-        // Warm up the language server so the first go-to-definition is fast.
-        let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
-        if !self.path_is_ignored(path) {
-            self.client_for(&ext);
-        }
         self.active = self.tabs.len() - 1;
     }
 
@@ -1084,71 +1082,14 @@ impl App {
 
     // ------------------------------------------------- code intelligence
 
-    fn reset_lsp(&mut self) {
-        for client in self.lsp.values() {
-            client.retire();
-        }
-        self.lsp.clear();
-        self.lsp_failed.clear();
-    }
-
-    /// Running language server for files with extension `ext`, starting one if installed.
-    fn client_for(&mut self, ext: &str) -> Option<Arc<lsp::Client>> {
-        for spec in lsp::servers_for(ext) {
-            if let Some(c) = self.lsp.get(spec.name) {
-                if c.alive() {
-                    return Some(c.clone());
-                }
-                self.lsp.remove(spec.name);
-                self.lsp_failed.insert(spec.name); // crashed: don't restart in a loop
-                self.message = format!("{} stopped; using text search", spec.name);
-                continue;
-            }
-            if self.lsp_failed.contains(spec.name) || lsp::resolve(spec.command).is_none() {
-                continue;
-            }
-            let mut root = self.work_dir();
-            let mut ignored = self.ignored.clone();
-            if !ignored.is_empty()
-                && let Some(project) = &self.root
-            {
-                // A server may start at the Git root even when a subfolder is open.
-                match workspace::relative_path(&root, project) {
-                    Some(prefix) if !prefix.is_empty() => {
-                        for dir in &mut ignored {
-                            *dir = format!("{prefix}/{dir}");
-                        }
-                    }
-                    None => root = project.clone(),
-                    _ => {}
-                }
-            }
-            let ctx = self.ctx.clone();
-            match lsp::Client::start(&spec, &root, &ignored, Some(Arc::new(move || ctx.request_repaint()))) {
-                Ok(c) => {
-                    self.lsp.insert(spec.name, c.clone());
-                    self.ctx.request_repaint();
-                    return Some(c);
-                }
-                Err(e) => {
-                    self.lsp_failed.insert(spec.name);
-                    self.message = e;
-                }
-            }
-        }
-        None
-    }
-
     fn go_to_definition(&mut self, char_idx: usize, ctx: &egui::Context) {
         let Some(Tab::File(doc)) = self.tabs.get(self.active) else { return };
         let (path, text, ext, from) = (doc.path.clone(), doc.text.clone(), doc.ext(), doc.cursor);
+        let revision = (doc.id, doc.version);
         let Some((_, word)) = goto::word_at(&text, char_idx) else { return };
         // Ignored folders get no language server and are never a source of definitions.
-        let use_lsp = !self.path_is_ignored(&path);
-        let client = use_lsp.then(|| self.client_for(&ext)).flatten();
-        if use_lsp && client.is_none() {
-            self.offer_install(&ext);
-        }
+        let client = (!self.path_is_ignored(&path)).then(|| self.launch_server(&ext, true)).flatten();
+        self.lsp.install_check = client.as_ref().map(|client| (ext, client.clone()));
         // Without a project, the text-search fallback only looks at the current file.
         let project = self.root.clone();
         let ignored = self.ignored.clone();
@@ -1163,6 +1104,7 @@ impl App {
             ignored: if self.root.is_some() { ignored_for_goto } else { Vec::new() },
             char_idx,
             client,
+            revision,
         };
         let (tx, rx) = channel();
         ctx.request_repaint();
@@ -1185,11 +1127,7 @@ impl App {
             match res {
                 Ok(path) => {
                     self.message = format!("Installed {command} at {}", path.display());
-                    self.lsp_failed.clear();
-                    if let Some(Tab::File(d)) = self.tabs.get(self.active) {
-                        let ext = d.ext();
-                        self.client_for(&ext);
-                    }
+                    self.lsp.retry_missing();
                 }
                 Err(e) => self.message = format!("Could not install {command}: {e}"),
             }
@@ -1361,7 +1299,10 @@ impl App {
         {
             let line_start: usize = doc.text.split('\n').take(line).map(|l| l.chars().count() + 1).sum();
             let max = doc.text.chars().count();
-            doc.goto = Some(((line_start + cols.start).min(max), (line_start + cols.end).min(max)));
+            doc.goto = Some((
+                line_start.saturating_add(cols.start).min(max),
+                line_start.saturating_add(cols.end).min(max),
+            ));
         }
     }
 
@@ -1574,14 +1515,20 @@ impl App {
                 (Side::Explorer, ic::FILES, "Explorer".to_string()),
                 (Side::Search, ic::MAGNIFYING_GLASS, "Search in files (Ctrl/Cmd+Shift+F)".to_string()),
                 (Side::Changes, ic::GIT_BRANCH, changes_tip),
+                (Side::Problems, ic::WARNING, "Problems".to_string()),
             ] {
                 let on = self.side_open && self.side == side;
                 if side == Side::Search && !on {
                     self.search.focus = true;
                 }
                 let r = activity_button(ui, icon, on).on_hover_text(tip);
-                if side == Side::Changes && n > 0 {
-                    badge(ui, r.rect, n);
+                let count = match side {
+                    Side::Changes => n,
+                    Side::Problems => self.problems.badge_count(),
+                    _ => 0,
+                };
+                if count > 0 {
+                    badge(ui, r.rect, count);
                 }
                 if r.clicked() {
                     // Clicking the active view collapses the sidebar.
@@ -2084,6 +2031,24 @@ impl App {
         let active = self.active;
         let mut open_path = None;
         let mut goto_at = None;
+        // Diagnostics of the active file, for squiggles (collected before borrowing the tab).
+        let diags: Vec<(usize, usize, usize, usize, Color32)> = match self.tabs.get(active) {
+            Some(Tab::File(doc)) => {
+                let v = ui.visuals();
+                self.diagnostics_for(&doc.path)
+                    .iter()
+                    .map(|d| {
+                        let color = match d.severity {
+                            crate::diagnostics::Severity::Error => v.error_fg_color,
+                            crate::diagnostics::Severity::Warning => v.warn_fg_color,
+                            _ => v.hyperlink_color.gamma_multiply(0.7),
+                        };
+                        (d.line, d.col_start, d.end_line, d.col_end, color)
+                    })
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
         match &mut self.tabs[active] {
             Tab::File(doc) => {
                 let fresh = match self.vcs {
@@ -2096,7 +2061,7 @@ impl App {
                 } else {
                     None
                 };
-                if let Some(idx) = editor(ui, doc, self.settings, inline) {
+                if let Some(idx) = editor(ui, doc, self.settings, inline, &diags) {
                     goto_at = Some(idx);
                 }
             }
@@ -2192,7 +2157,7 @@ impl App {
             activity.push((format!("Searching… {} {suffix}", self.search.total), None));
         }
 
-        let mut clients: Vec<_> = self.lsp.values().map(Arc::as_ref).collect();
+        let mut clients: Vec<_> = self.lsp.clients().map(Arc::as_ref).collect();
         clients.sort_unstable_by_key(|client| (server.map(|s| s.name) != Some(client.name), client.name));
         for client in clients {
             for progress in client.active_progress() {
@@ -2221,7 +2186,7 @@ impl App {
         activity
     }
 
-    fn status_bar(&self, ui: &mut egui::Ui) {
+    fn status_bar(&mut self, ui: &mut egui::Ui) {
         let file = match self.tabs.get(self.active) {
             Some(Tab::File(doc)) => Some((doc, doc.ext())),
             _ => None,
@@ -2230,19 +2195,22 @@ impl App {
             if self.path_is_ignored(&doc.path) {
                 return None;
             }
-            lsp::servers_for(ext)
-                .iter()
-                .filter_map(|spec| self.lsp.get(spec.name))
-                .find(|client| client.is_available())
+            let specs = lsp::servers_for(ext);
+            self.lsp
+                .clients()
+                .find(|client| specs.iter().any(|spec| spec.name == client.name))
                 .map(Arc::as_ref)
         });
         let activity = self.background_activity(server);
+        let mut open_problems = false;
         ui.horizontal(|ui| {
             if self.repo.is_some() {
                 let branch = format!("{} {} {}", ic::GIT_BRANCH, self.status.branch, self.status.ahead_behind);
                 ui.add(egui::Label::new(branch).truncate());
                 ui.separator();
             }
+            open_problems = self.problems.status_button(ui).clicked();
+            ui.separator();
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if let Some((doc, ext)) = &file {
                     let (backend, hint) = match server {
@@ -2291,6 +2259,9 @@ impl App {
                 }
             });
         });
+        if open_problems {
+            self.open_problems();
+        }
     }
 
     fn dialogs(&mut self, ctx: &egui::Context) {
@@ -2510,11 +2481,13 @@ impl eframe::App for App {
                     Side::Explorer => self.explorer(ui),
                     Side::Changes => self.changes(ui),
                     Side::Search => self.search_panel(ui),
+                    Side::Problems => self.problems_panel(ui),
                 });
         }
         egui::CentralPanel::default().show(ui, |ui| self.central(ui));
         self.open_requested_folder(frame);
         self.dialogs(&ctx);
+        self.sync_active_document();
         #[cfg(feature = "tour")]
         if let Some(mut t) = self.tour.take() {
             t.tick(self, &ctx);
@@ -2622,7 +2595,13 @@ mod folder_picker {
 
 /// Draws the editor. Returns a char index when the user Ctrl/Cmd+clicked a symbol.
 /// Draws the editor. Returns a char index when the user Ctrl/Cmd+clicked a symbol.
-fn editor(ui: &mut egui::Ui, doc: &mut Doc, settings: Settings, inline: Option<String>) -> Option<usize> {
+fn editor(
+    ui: &mut egui::Ui,
+    doc: &mut Doc,
+    settings: Settings,
+    inline: Option<String>,
+    diags: &[(usize, usize, usize, usize, Color32)],
+) -> Option<usize> {
     let id = ui.make_persistent_id(("editor", doc.id));
     // A pending selection from elsewhere (search hit, go to definition): char range.
     if let Some((a, b)) = doc.goto.take() {
@@ -2639,8 +2618,25 @@ fn editor(ui: &mut egui::Ui, doc: &mut Doc, settings: Settings, inline: Option<S
         indent: &doc.indent,
         comment: doc.comment,
     };
+    // Diagnostics: (line, char col) pairs to byte ranges.
+    let squiggles: Vec<(std::ops::Range<usize>, Color32)> = {
+        let ix = doc.ed.index(&doc.text, doc.version);
+        let text = &doc.text;
+        let at = |line: usize, col: usize| {
+            if line >= ix.lines() {
+                return text.len();
+            }
+            let r = ix.line_range(text, line);
+            r.start + text[r.clone()].char_indices().nth(col).map_or(r.len(), |(i, _)| i)
+        };
+        diags
+            .iter()
+            .map(|&(l0, c0, l1, c1, color)| (at(l0, c0)..at(l1, c1), color))
+            .collect()
+    };
     let extras = editor::Extras {
         inline: inline.as_deref(),
+        squiggles: &squiggles,
         ..Default::default()
     };
     let before = doc.version;
