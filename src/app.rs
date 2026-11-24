@@ -368,6 +368,8 @@ pub struct App {
     /// The file last revealed in the Explorer, and one to scroll into view.
     explorer_revealed: Option<PathBuf>,
     explorer_scroll_to: Option<PathBuf>,
+    /// A folder shown from the path bar, highlighted until the next click in the tree.
+    explorer_marked: Option<PathBuf>,
     outline: outline::Outline,
 
     status: Status,
@@ -470,6 +472,7 @@ impl App {
             expanded: session::FolderSet::default(),
             explorer_revealed: None,
             explorer_scroll_to: None,
+            explorer_marked: None,
             outline: Default::default(),
             status: Status::default(),
             status_rx: None,
@@ -550,6 +553,7 @@ impl App {
         self.ignored_off.clear();
         self.explorer_revealed = None;
         self.explorer_scroll_to = None;
+        self.explorer_marked = None;
         self.code_navigation = code_navigation::CodeNavigation::default();
         self.root = None;
         self.search.opts.include.clear();
@@ -2188,8 +2192,13 @@ impl App {
                     } else {
                         (ic::CARET_RIGHT, ic::FOLDER)
                     };
-                    let row = ui.selectable_label(false, format!("{caret} {folder} {name}"));
+                    let row = ui.selectable_label(self.explorer_marked.as_ref() == Some(&path), format!("{caret} {folder} {name}"));
+                    if self.explorer_scroll_to.as_ref() == Some(&path) {
+                        row.scroll_to_me(Some(egui::Align::Center));
+                        self.explorer_scroll_to = None;
+                    }
                     if row.clicked() {
+                        self.explorer_marked = None;
                         if expanded {
                             self.expanded.remove(&path);
                         } else {
@@ -2542,6 +2551,70 @@ impl App {
         }
     }
 
+    /// Below the tabs: the shown file's path relative to the folder, as breadcrumbs;
+    /// clicking a folder shows it in the Explorer.
+    fn path_bar(&mut self, ui: &mut egui::Ui) {
+        let path = match self.tabs.get(self.active) {
+            Some(Tab::File(d)) => d.path.clone(),
+            Some(Tab::Diff(d)) => d.path.clone(),
+            Some(Tab::Large(v)) => v.path.clone(),
+            Some(Tab::Graph) | None => return,
+        };
+        let mut reveal = None;
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            let sep = |ui: &mut egui::Ui| {
+                ui.weak(ic::CARET_RIGHT);
+            };
+            match self.root.as_deref().filter(|root| path.starts_with(root)) {
+                Some(root) => {
+                    let crumb = |ui: &mut egui::Ui, text: String, dir: &Path| {
+                        ui.add(egui::Button::new(RichText::new(text).small()).frame(false))
+                            .on_hover_text(format!("Show {} in the Explorer", dir.display()))
+                            .clicked()
+                    };
+                    if crumb(ui, dir_name(root), root) {
+                        reveal = Some(root.to_path_buf());
+                    }
+                    let mut dir = root.to_path_buf();
+                    let rel = path.strip_prefix(root).unwrap_or(&path);
+                    let parts: Vec<_> = rel.iter().collect();
+                    for (i, part) in parts.iter().enumerate() {
+                        sep(ui);
+                        dir.push(part);
+                        let name = part.to_string_lossy().into_owned();
+                        if i + 1 == parts.len() {
+                            ui.label(RichText::new(name).small().strong());
+                        } else if crumb(ui, name, &dir) {
+                            reveal = Some(dir.clone());
+                        }
+                    }
+                }
+                None => {
+                    ui.label(RichText::new(path.display().to_string()).small());
+                }
+            }
+        });
+        ui.separator();
+        if let Some(dir) = reveal {
+            self.reveal_folder(dir);
+        }
+    }
+
+    /// Show `dir` in the Explorer: open its parents and itself, scroll to it, highlight it.
+    fn reveal_folder(&mut self, dir: PathBuf) {
+        let Some(root) = self.root.clone() else { return };
+        self.side = Side::Explorer;
+        self.side_open = true;
+        for d in dir.ancestors().take_while(|d| d.starts_with(&root) && *d != root) {
+            self.expanded.insert(d.to_path_buf());
+        }
+        if dir != root {
+            self.explorer_scroll_to = Some(dir.clone());
+            self.explorer_marked = Some(dir);
+        }
+    }
+
     /// The editor area with no tabs: the start page, or a hint when a folder is open.
     fn empty_editor(&mut self, ui: &mut egui::Ui) {
         if self.root.is_none() {
@@ -2567,6 +2640,7 @@ impl App {
             return;
         }
         self.active = self.active.min(self.tabs.len() - 1);
+        self.path_bar(ui);
         let active = self.active;
         let mut open_path = None;
         let mut goto_at = None;
