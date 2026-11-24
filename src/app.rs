@@ -163,6 +163,8 @@ impl Doc {
 #[allow(clippy::large_enum_variant)]
 enum Tab {
     File(Doc),
+    /// A very large file, read-only (see src/large.rs).
+    Large(Box<crate::large::Viewer>),
     Diff(Box<DiffTab>),
     Graph,
 }
@@ -982,6 +984,19 @@ impl App {
         }
         if self.search_replace.is_writing(path) {
             self.message = "Wait for replacements to finish before opening this file".into();
+            return;
+        }
+        if let Some(i) = self.tabs.iter().position(|t| matches!(t, Tab::Large(v) if v.path == path)) {
+            self.active = i;
+            return;
+        }
+        // Very large files open read-only, without loading them into memory.
+        if let Ok(meta) = std::fs::metadata(path)
+            && meta.len() >= crate::large::THRESHOLD
+        {
+            let viewer = crate::large::Viewer::open(path, meta.len(), &self.ctx);
+            self.tabs.push(Tab::Large(Box::new(viewer)));
+            self.active = self.tabs.len() - 1;
             return;
         }
         let DiskText { text, crlf } = match read_doc_text(path) {
@@ -2020,6 +2035,7 @@ impl App {
                     let title = match tab {
                         Tab::File(d) => format!("{}{}", d.name(), if d.dirty() { " ●" } else { "" }),
                         Tab::Diff(d) => format!("{} {}", ic::GIT_DIFF, d.title),
+                        Tab::Large(v) => format!("{} (read-only)", file_name(&v.path.to_string_lossy())),
                         Tab::Graph => format!("{} {}", ic::TREE_STRUCTURE, self.vcs.unwrap_or(Vcs::Git).history_title()),
                     };
                     let r = ui.selectable_label(i == self.active, title);
@@ -2034,6 +2050,7 @@ impl App {
                     let file_path = match tab {
                         Tab::File(d) => Some(d.path.clone()),
                         Tab::Diff(d) => Some(d.path.clone()),
+                        Tab::Large(v) => Some(v.path.clone()),
                         Tab::Graph => None,
                     };
                     let r = match &file_path {
@@ -2195,6 +2212,7 @@ impl App {
                     side_by_side_view(ui, d);
                 }
             }
+            Tab::Large(v) => large_view(ui, v),
             Tab::Graph => {
                 let Some(graph) = &self.graph else {
                     ui.label(if self.graph_rx.is_some() {
@@ -2790,6 +2808,98 @@ fn editor(
         changed: out.changed,
         focused: out.focused,
     }
+}
+
+/// The read-only viewer for very large files: line numbers, find, go to line.
+fn large_view(ui: &mut egui::Ui, v: &mut crate::large::Viewer) {
+    let ctx = ui.ctx().clone();
+    if let Some(rx) = &v.find_rx
+        && let Ok(found) = rx.try_recv()
+    {
+        v.matches = found;
+        v.find_rx = None;
+        v.current = 0;
+        if let Some(&l) = v.matches.first() {
+            v.scroll_to = Some(l);
+        }
+    }
+    let lines = v.index.lines();
+    ui.horizontal(|ui| {
+        let size = v.size as f64 / (1024.0 * 1024.0);
+        if v.index.done() {
+            ui.weak(format!("Read-only · {size:.0} MB · {lines} lines"));
+        } else {
+            let pct = v.index.scanned() as f64 * 100.0 / v.size.max(1) as f64;
+            ui.spinner();
+            ui.weak(format!("Read-only · {size:.0} MB · indexing {pct:.0}% ({lines} lines so far)"));
+            ctx.request_repaint_after(Duration::from_millis(200));
+        }
+        ui.separator();
+        let r = ui.add(egui::TextEdit::singleline(&mut v.query).hint_text("Find").desired_width(180.0));
+        if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+            v.start_find(&ctx);
+        }
+        if v.find_rx.is_some() {
+            let pct = v.find_progress.load(std::sync::atomic::Ordering::Relaxed) as f64 * 100.0 / v.size.max(1) as f64;
+            ui.weak(format!("searching {pct:.0}%"));
+            ctx.request_repaint_after(Duration::from_millis(200));
+        } else if !v.matches.is_empty() {
+            ui.weak(format!("{} of {}", v.current + 1, v.matches.len()));
+            if icon_button(ui, ic::ARROW_UP).clicked() {
+                v.current = (v.current + v.matches.len() - 1) % v.matches.len();
+                v.scroll_to = Some(v.matches[v.current]);
+            }
+            if icon_button(ui, ic::ARROW_DOWN).clicked() {
+                v.current = (v.current + 1) % v.matches.len();
+                v.scroll_to = Some(v.matches[v.current]);
+            }
+        } else if !v.query.is_empty() && v.error.is_none() {
+            ui.weak("no results");
+        }
+        if let Some(e) = &v.error {
+            ui.colored_label(ui.visuals().error_fg_color, e);
+        }
+        ui.separator();
+        let r = ui.add(
+            egui::TextEdit::singleline(&mut v.goto_line)
+                .hint_text("Go to line")
+                .desired_width(90.0),
+        );
+        if r.lost_focus()
+            && ui.input(|i| i.key_pressed(Key::Enter))
+            && let Ok(n) = v.goto_line.trim().parse::<usize>()
+        {
+            v.scroll_to = Some(n.saturating_sub(1).min(lines.saturating_sub(1)));
+        }
+    });
+    ui.separator();
+    let font = egui::TextStyle::Monospace.resolve(ui.style());
+    let row_h = ui.fonts_mut(|f| f.row_height(&font));
+    let digits = lines.to_string().len().max(4);
+    let current = v.matches.get(v.current).copied();
+    let mut area = egui::ScrollArea::both().id_salt(("large", &v.path)).auto_shrink([false, false]);
+    if let Some(l) = v.scroll_to.take() {
+        // A few lines of context above the target.
+        area = area.vertical_scroll_offset(l.saturating_sub(3) as f32 * row_h);
+    }
+    area.show_rows(ui, row_h, lines, |ui, range| {
+        v.request(range.clone(), &ctx);
+        for l in range {
+            let text = v.line(l).unwrap_or("");
+            let mut job = egui::text::LayoutJob::default();
+            job.append(
+                &format!("{:>digits$}  ", l + 1),
+                0.0,
+                egui::TextFormat::simple(font.clone(), ui.visuals().weak_text_color()),
+            );
+            job.append(text, 0.0, egui::TextFormat::simple(font.clone(), ui.visuals().text_color()));
+            let r = ui.add(egui::Label::new(job).wrap_mode(egui::TextWrapMode::Extend));
+            if current == Some(l) {
+                ui.painter()
+                    .rect_filled(r.rect, 2.0, ui.visuals().warn_fg_color.gamma_multiply(0.15));
+            }
+        }
+    });
 }
 
 /// What the editor reports back to the app each frame.

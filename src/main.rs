@@ -16,6 +16,7 @@ mod graph;
 mod highlight;
 mod icons;
 mod installer;
+mod large;
 mod lsp;
 mod outline;
 mod replace;
