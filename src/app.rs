@@ -4,6 +4,7 @@ mod code_navigation;
 mod diff_edit;
 mod document_save;
 mod find;
+mod graph_menu;
 mod gutter;
 mod navigation;
 mod outline;
@@ -275,6 +276,7 @@ type DetectedRepo = Option<(PathBuf, Vcs)>;
 enum VcsOperation {
     Change(&'static str),
     History(&'static str),
+    Graph(vcs::HistoryAction),
     Commit(String, bool),
     Discard(PathBuf),
 }
@@ -283,6 +285,7 @@ impl VcsOperation {
     fn label(&self) -> &'static str {
         match self {
             Self::Change(label) | Self::History(label) => label,
+            Self::Graph(action) => action.label(),
             Self::Commit(..) => "Commit",
             Self::Discard(_) => "Discard",
         }
@@ -336,6 +339,7 @@ pub struct App {
     graph_detail: Vec<String>,
     graph_rx: Option<Receiver<Result<Graph, String>>>,
     graph_detail_rx: Option<Receiver<Vec<String>>>,
+    graph_dialog: Option<graph_menu::GraphDialog>,
     diff_rx: Option<Receiver<DiffTab>>,
 
     bg_task: Option<VcsJob>,
@@ -428,6 +432,7 @@ impl App {
             graph_detail: Vec::new(),
             graph_rx: None,
             graph_detail_rx: None,
+            graph_dialog: None,
             diff_rx: None,
             bg_task: None,
             message: String::new(),
@@ -641,6 +646,7 @@ impl App {
         self.graph_detail.clear();
         self.graph_rx = None;
         self.graph_detail_rx = None;
+        self.graph_dialog = None;
         self.diff_rx = None;
         for tab in &mut self.tabs {
             if let Tab::File(doc) = tab {
@@ -846,6 +852,7 @@ impl App {
             if let Some(result) = result {
                 let operation = self.bg_task.take().unwrap().operation;
                 let label = operation.label();
+                let refresh_graph = matches!(operation, VcsOperation::Graph(_));
                 match result {
                     Ok(out) => {
                         self.message = out
@@ -868,10 +875,22 @@ impl App {
                                 self.pending_changes.paths.insert(path);
                             }
                             VcsOperation::History(_) => self.refresh_history(),
-                            VcsOperation::Change(_) => {}
+                            VcsOperation::Graph(_) | VcsOperation::Change(_) => {}
                         }
                     }
-                    Err(e) => self.message = format!("{label} failed: {e}"),
+                    Err(e) => {
+                        self.message = format!("{label} failed: {e}");
+                        if let VcsOperation::Graph(vcs::HistoryAction::Git(crate::git::HistoryAction::DeleteBranch {
+                            name,
+                            force: false,
+                        })) = &operation
+                        {
+                            self.offer_force_delete(name.clone());
+                        }
+                    }
+                }
+                if refresh_graph {
+                    self.refresh_history();
                 }
                 self.refresh_vcs();
             }
@@ -2290,6 +2309,13 @@ impl App {
                         return;
                     };
                     let mut clicked = None;
+                    let mut action = None;
+                    let menu = self.vcs.map(|vcs| graph_menu::GraphMenu {
+                        vcs,
+                        status: &self.status,
+                        branches: &self.branches,
+                        busy: self.bg_task.is_some(),
+                    });
                     egui::Panel::bottom("commit_detail")
                         .resizable(true)
                         .default_size(260.0)
@@ -2303,10 +2329,19 @@ impl App {
                             }
                         });
                     egui::CentralPanel::default().show(ui, |ui| {
-                        clicked = graph.ui(ui, self.graph_sel);
+                        clicked = graph.ui(ui, self.graph_sel, |ui, commit| {
+                            if let Some(menu) = &menu
+                                && let Some(chosen) = menu.show(ui, commit)
+                            {
+                                action = Some(chosen);
+                            }
+                        });
                     });
                     if let Some(r) = clicked {
                         self.load_graph_detail(r);
+                    }
+                    if let Some(action) = action {
+                        self.handle_graph_action(action);
                     }
                 }
             }
@@ -2474,6 +2509,7 @@ impl App {
     }
 
     fn dialogs(&mut self, ctx: &egui::Context) {
+        self.graph_dialog(ctx);
         self.c_flags_dialogs(ctx);
         // Quick open
         if let Some(q) = &mut self.quick_open {

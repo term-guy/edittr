@@ -52,6 +52,10 @@ fn run(root: &Path, args: &[&str]) -> Result<String, String> {
     run_bytes(root, args).map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
 }
 
+pub fn update_revision(root: &Path, revision: u64) -> Result<String, String> {
+    run(root, &["update", "-r", &revision.to_string(), "--", "."])
+}
+
 fn run_xml<T: DeserializeOwned>(root: &Path, args: &[&str]) -> Result<T, String> {
     let mut child = svn(root, args)
         .stdout(Stdio::piped())
@@ -546,11 +550,13 @@ impl History {
         while let Some(entry) = entries.next() {
             commits.push(Commit {
                 hash: format!("r{}", entry.number),
+                short_hash: format!("r{}", entry.number),
                 parents: entries.peek().map(|p| format!("r{}", p.number)).into_iter().collect(),
                 author: entry.author.clone(),
                 date: date_time(&entry.date),
                 refs: Vec::new(),
                 subject: entry.subject().into(),
+                message: entry.message.clone(),
             });
         }
         commits

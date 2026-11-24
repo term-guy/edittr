@@ -153,7 +153,7 @@ pub fn commit(repo: &Path, msg: &str, amend: bool) -> Result<String, String> {
 }
 
 pub fn branches(repo: &Path) -> Vec<String> {
-    run(repo, &["branch", "--format=%(refname:short)"])
+    run(repo, &["branch", "--format=%(refname:lstrip=2)"])
         .map(|s| s.lines().map(str::to_string).collect())
         .unwrap_or_default()
 }
@@ -186,11 +186,47 @@ pub fn list_files(dir: &Path) -> Option<Vec<String>> {
 #[derive(Clone, Debug)]
 pub struct Commit {
     pub hash: String,
+    pub short_hash: String,
     pub parents: Vec<String>,
     pub author: String,
     pub date: String,
-    pub refs: Vec<String>,
+    pub refs: Vec<CommitRef>,
     pub subject: String,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CommitRef {
+    Local { name: String, head: bool },
+    Remote(String),
+    Tag(String),
+    Head,
+    Other(String),
+}
+
+fn parse_ref(decoration: &str) -> Option<CommitRef> {
+    if decoration == "HEAD" {
+        return Some(CommitRef::Head);
+    }
+    let (name, head) = match decoration.strip_prefix("HEAD -> ") {
+        Some(name) => (name, true),
+        None => (decoration, false),
+    };
+    if let Some(name) = name.strip_prefix("refs/heads/") {
+        Some(CommitRef::Local { name: name.into(), head })
+    } else if let Some(name) = name.strip_prefix("refs/remotes/") {
+        // The remote's symbolic default-branch pointer is an alias for a branch already listed.
+        let (_, branch) = name.split_once('/')?;
+        Some(if branch == "HEAD" {
+            CommitRef::Other(name.into())
+        } else {
+            CommitRef::Remote(name.into())
+        })
+    } else if name == "refs/stash" {
+        Some(CommitRef::Other(name.into()))
+    } else {
+        name.strip_prefix("tag: refs/tags/").map(|name| CommitRef::Tag(name.into()))
+    }
 }
 
 pub fn log(repo: &Path, limit: usize) -> Result<Vec<Commit>, String> {
@@ -201,27 +237,139 @@ pub fn log(repo: &Path, limit: usize) -> Result<Vec<Commit>, String> {
             "log",
             "--all",
             "--topo-order",
+            "--decorate=full",
+            "--decorate-refs=HEAD",
+            "--decorate-refs=refs/heads/",
+            "--decorate-refs=refs/remotes/",
+            "--decorate-refs=refs/tags/",
+            "--decorate-refs=refs/stash",
+            "-z",
             &n,
-            "--format=%H%x1f%P%x1f%an%x1f%ad%x1f%D%x1f%s%x1e",
+            "--format=%H%x00%h%x00%P%x00%an%x00%ad%x00%D%x00%s%x00%B",
             "--date=format:%Y-%m-%d %H:%M",
         ],
     )?;
-    Ok(out
-        .split('\x1e')
-        .filter_map(|rec| {
-            let rec = rec.trim_start_matches('\n');
-            let f: Vec<&str> = rec.split('\x1f').collect();
-            if f.len() < 6 {
-                return None;
-            }
-            Some(Commit {
-                hash: f[0].to_string(),
-                parents: f[1].split_whitespace().map(str::to_string).collect(),
-                author: f[2].to_string(),
-                date: f[3].to_string(),
-                refs: f[4].split(", ").filter(|r| !r.is_empty()).map(str::to_string).collect(),
-                subject: f[5].to_string(),
-            })
+    let fields: Vec<_> = out.split_terminator('\0').collect();
+    Ok(fields
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|&[hash, short_hash, parents, author, date, refs, subject, message]| Commit {
+            hash: hash.into(),
+            short_hash: short_hash.into(),
+            parents: parents.split_whitespace().map(str::to_string).collect(),
+            author: author.into(),
+            date: date.into(),
+            refs: refs.split(", ").filter_map(parse_ref).collect(),
+            subject: subject.into(),
+            message: message.trim_end_matches('\n').into(),
         })
         .collect())
 }
+
+#[derive(Clone, Copy, Debug)]
+pub enum ResetMode {
+    Soft,
+    Mixed,
+    Hard,
+}
+
+impl ResetMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Soft => "Soft",
+            Self::Mixed => "Mixed",
+            Self::Hard => "Hard",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum HistoryAction {
+    Checkout(String),
+    Track { local: String, remote: String },
+    Detach(String),
+    CreateBranch { name: String, hash: String, checkout: bool },
+    Reset { branch: String, hash: String, mode: ResetMode },
+    CherryPick(String),
+    Revert(String),
+    Merge { branch: String, source: String },
+    CreateTag { name: String, hash: String },
+    DeleteBranch { name: String, force: bool },
+}
+
+impl HistoryAction {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Checkout(_) | Self::Track { .. } | Self::Detach(_) => "Checkout",
+            Self::CreateBranch { .. } => "Create branch",
+            Self::Reset { .. } => "Reset",
+            Self::CherryPick(_) => "Cherry-pick",
+            Self::Revert(_) => "Revert",
+            Self::Merge { .. } => "Merge",
+            Self::CreateTag { .. } => "Create tag",
+            Self::DeleteBranch { .. } => "Delete branch",
+        }
+    }
+
+    fn args(&self) -> Vec<&str> {
+        match self {
+            Self::Checkout(name) => vec!["switch", "--no-guess", "--", name],
+            Self::Track { local, remote } => vec!["switch", "--track", "-c", local, "--", remote],
+            Self::Detach(hash) => vec!["switch", "--detach", "--", hash],
+            Self::CreateBranch {
+                name,
+                hash,
+                checkout: true,
+            } => vec!["switch", "--no-track", "-c", name, "--", hash],
+            Self::CreateBranch {
+                name,
+                hash,
+                checkout: false,
+            } => vec!["branch", "--no-track", "--", name, hash],
+            Self::Reset { hash, mode, .. } => {
+                let flag = match mode {
+                    ResetMode::Soft => "--soft",
+                    ResetMode::Mixed => "--mixed",
+                    ResetMode::Hard => "--hard",
+                };
+                vec!["reset", flag, hash, "--"]
+            }
+            Self::CherryPick(hash) => vec!["cherry-pick", "--", hash],
+            Self::Revert(hash) => vec!["revert", "--no-edit", "--", hash],
+            Self::Merge { source, .. } => vec!["merge", "--no-edit", "--", source],
+            Self::CreateTag { name, hash } => vec!["tag", "--no-sign", "--", name, hash],
+            Self::DeleteBranch { name, force } => vec!["branch", if *force { "-D" } else { "-d" }, "--", name],
+        }
+    }
+
+    pub fn run(&self, repo: &Path) -> Result<String, String> {
+        if let Self::Reset { branch, .. } | Self::Merge { branch, .. } = self
+            && run(repo, &["symbolic-ref", "--quiet", "HEAD"]).ok().as_deref().map(str::trim_end)
+                != Some(format!("refs/heads/{branch}").as_str())
+        {
+            return Err(format!("The current branch changed. Check out {branch} and try again."));
+        }
+
+        // Git prints conflict paths on stdout and recovery hints on stderr.
+        let output = run_raw(repo, &self.args()).map_err(|e| format!("failed to run git: {e}"))?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if output.status.success() {
+            return Ok(stdout.into_owned());
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let message = [stdout.trim(), stderr.trim()]
+            .into_iter()
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        Err(if message.is_empty() {
+            format!("git exited with {}", output.status)
+        } else {
+            message
+        })
+    }
+}
+
+#[cfg(test)]
+mod history_tests;

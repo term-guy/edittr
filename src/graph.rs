@@ -1,6 +1,6 @@
 //! Git graph: assigns each commit a lane and draws edges between rows.
 
-use crate::git::Commit;
+use crate::git::{Commit, CommitRef};
 use eframe::egui::{self, Color32, Pos2, Rect, Sense, Stroke, Vec2};
 
 pub struct Row {
@@ -125,7 +125,7 @@ impl Graph {
     }
 
     /// Show the whole graph as a virtualised list. Returns the clicked row.
-    pub fn ui(&self, ui: &mut egui::Ui, selected: Option<usize>) -> Option<usize> {
+    pub fn ui(&self, ui: &mut egui::Ui, selected: Option<usize>, mut menu: impl FnMut(&mut egui::Ui, &Commit)) -> Option<usize> {
         let row_h = 22.0;
         let lane_w = 14.0;
         let graph_w = lane_w * self.lanes.min(24) as f32 + 6.0;
@@ -136,7 +136,8 @@ impl Graph {
                 for r in range {
                     let c = &self.commits[r];
                     let width = ui.available_width().max(600.0);
-                    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, row_h), Sense::click());
+                    let (_, rect) = ui.allocate_space(Vec2::new(width, row_h));
+                    let resp = ui.interact(rect, ui.make_persistent_id(&c.hash), Sense::click());
                     let painter = ui.painter_at(rect);
                     let vis = ui.visuals();
                     if selected == Some(r) {
@@ -165,7 +166,7 @@ impl Graph {
                     painter.text(
                         Pos2::new(right - 8.0, cy),
                         egui::Align2::RIGHT_CENTER,
-                        &c.hash[..7.min(c.hash.len())],
+                        &c.short_hash,
                         mono.clone(),
                         weak,
                     );
@@ -184,6 +185,7 @@ impl Graph {
                     if resp.clicked() {
                         clicked = Some(r);
                     }
+                    resp.context_menu(|ui| menu(ui, c));
                 }
             });
         clicked
@@ -200,16 +202,12 @@ fn free_slot(lanes: &mut Vec<Option<usize>>) -> usize {
     }
 }
 
-fn ref_style(r: &str) -> (String, Color32) {
-    if let Some(b) = r.strip_prefix("HEAD -> ") {
-        (format!("● {b}"), Color32::from_rgb(0x2f, 0x81, 0x3a))
-    } else if let Some(t) = r.strip_prefix("tag: ") {
-        (t.to_string(), Color32::from_rgb(0x9a, 0x6d, 0x14))
-    } else if r == "HEAD" {
-        ("HEAD".into(), Color32::from_rgb(0x2f, 0x81, 0x3a))
-    } else if r.contains('/') {
-        (r.to_string(), Color32::from_rgb(0x6b, 0x4f, 0x9e))
-    } else {
-        (r.to_string(), Color32::from_rgb(0x2b, 0x6c, 0xb0))
+fn ref_style(r: &CommitRef) -> (String, Color32) {
+    match r {
+        CommitRef::Local { name, head: true } => (format!("● {name}"), Color32::from_rgb(0x2f, 0x81, 0x3a)),
+        CommitRef::Local { name, head: false } => (name.clone(), Color32::from_rgb(0x2b, 0x6c, 0xb0)),
+        CommitRef::Remote(name) | CommitRef::Other(name) => (name.clone(), Color32::from_rgb(0x6b, 0x4f, 0x9e)),
+        CommitRef::Tag(name) => (name.clone(), Color32::from_rgb(0x9a, 0x6d, 0x14)),
+        CommitRef::Head => ("HEAD".into(), Color32::from_rgb(0x2f, 0x81, 0x3a)),
     }
 }

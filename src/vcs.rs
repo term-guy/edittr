@@ -12,6 +12,29 @@ pub enum Vcs {
     Svn,
 }
 
+#[derive(Clone, Debug)]
+pub enum HistoryAction {
+    Git(git::HistoryAction),
+    UpdateRevision(u64),
+}
+
+impl HistoryAction {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Git(action) => action.label(),
+            Self::UpdateRevision(_) => "Update working copy",
+        }
+    }
+
+    pub fn run(&self, vcs: Vcs, root: &Path) -> Result<String, String> {
+        match (vcs, self) {
+            (Vcs::Git, Self::Git(action)) => action.run(root),
+            (Vcs::Svn, Self::UpdateRevision(revision)) => svn::update_revision(root, *revision),
+            _ => Err("This action is unavailable for the current repository".into()),
+        }
+    }
+}
+
 pub fn detect(dir: &Path) -> Option<(PathBuf, Vcs)> {
     let git = git::repo_root(dir).map(|p| p.canonicalize().unwrap_or(p));
     let svn = svn::repo_root(dir).map(|p| p.canonicalize().unwrap_or(p));
