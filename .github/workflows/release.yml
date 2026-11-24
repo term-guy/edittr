@@ -117,7 +117,12 @@ jobs:
             codesign --force --deep --sign - "pkg/$flavor/edittr.app"
             ln -s /Applications "pkg/$flavor/Applications"
             # LZMA (ULMO, macOS 10.15+): the full dmg is ~220 MB instead of ~330 MB with zlib.
-            hdiutil create -volname "edittr ${VERSION}" -srcfolder "pkg/$flavor" -ov -format ULMO "dist/$NAME.dmg"
+            # hdiutil fails now and then on CI runners ("Resource busy"): retry.
+            for attempt in 1 2 3 4 5; do
+              hdiutil create -volname "edittr ${VERSION}" -srcfolder "pkg/$flavor" -ov -format ULMO "dist/$NAME.dmg" && break
+              [ "$attempt" = 5 ] && exit 1
+              echo "hdiutil failed (attempt $attempt), retrying in 15 s"; sleep 15
+            done
             rm "pkg/$flavor/Applications"
             (cd "pkg/$flavor" && ditto -c -k --keepParent edittr.app "../../dist/$NAME.zip")
           done
