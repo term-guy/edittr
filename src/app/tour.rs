@@ -47,6 +47,8 @@ const STEPS: &[&str] = &[
     "column-select",
     "c-flags",
     "c-settings",
+    "disk-changed",
+    "disk-compare",
 ];
 
 impl Tour {
@@ -220,7 +222,7 @@ impl Tour {
         let min_frames = match name {
             "column-select" | "diff-side-by-side" => 40,
             // Give the language server time to answer.
-            "lsp-hover" | "lsp-completion" | "c-flags" => 150,
+            "lsp-hover" | "lsp-completion" | "c-flags" | "disk-changed" => 150,
             _ => 10,
         };
         if self.frames < min_frames || elapsed < std::time::Duration::from_millis(800) || (!ready && elapsed.as_secs() < 20) {
@@ -378,6 +380,19 @@ impl Tour {
                 }
             }
             "c-settings" => app.open_c_settings(),
+            "disk-changed" => {
+                // Change the open file outside edittr: a notice appears, nothing is reloaded.
+                app.c_flags = Default::default();
+                if let Some(i) = app.tabs.iter().position(|t| matches!(t, Tab::File(_))) {
+                    app.active = i;
+                    if let Some(Tab::File(d)) = app.tabs.get(i) {
+                        let mut text = std::fs::read_to_string(&d.path).unwrap_or_default();
+                        text.push_str("// changed by another program\n");
+                        let _ = std::fs::write(&d.path, text);
+                    }
+                }
+            }
+            "disk-compare" => app.disk_changed(app.active, super::DiskAction::Compare),
             "split-editor" => {
                 app.side_open = false;
                 let graph = app

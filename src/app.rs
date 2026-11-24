@@ -47,6 +47,8 @@ struct Doc {
     text: String,
     saved: String,
     crlf: bool,
+    /// The file changed on disk (outside edittr) to this; the user decides what to do.
+    disk: Option<DiskText>,
     lang: String,
     /// Pending selection (char range) to reveal on the next frame, e.g. from a search hit.
     goto: Option<(usize, usize)>,
@@ -143,7 +145,7 @@ impl Doc {
         self.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
     }
 
-    /// Replace a clean buffer with the latest text from disk.
+    /// Replace the buffer with the latest text from disk.
     fn reload(&mut self, text: String, _ctx: &egui::Context) {
         let len = text.chars().count();
         self.cursor = self.cursor.min(len);
@@ -598,7 +600,8 @@ impl App {
             .tabs
             .iter()
             .filter_map(|tab| match tab {
-                Tab::File(doc) if (changes.rescan || changes.affects(&doc.path)) && !doc.dirty() && !self.writing_document(&doc.path) => {
+                // Unsaved documents too: an outside change is reported, never applied silently.
+                Tab::File(doc) if (changes.rescan || changes.affects(&doc.path)) && !self.writing_document(&doc.path) => {
                     Some((doc.path.clone(), doc.id, doc.version))
                 }
                 _ => None,
@@ -801,7 +804,7 @@ impl App {
         }
     }
 
-    fn poll_vcs(&mut self, ctx: &egui::Context) {
+    fn poll_vcs(&mut self, _ctx: &egui::Context) {
         if let Some(detected) = receive(&mut self.repo_rx) {
             match detected {
                 Ok(repository) => {
@@ -834,16 +837,14 @@ impl App {
                     self.refresh_history();
                 }
             }
-            for (id, version, DiskText { text, crlf }) in refresh.files {
+            for (id, _version, disk) in refresh.files {
                 if let Some(doc) = self.tabs.iter_mut().find_map(|tab| match tab {
                     Tab::File(doc) if doc.id == id => Some(doc),
                     _ => None,
-                }) && doc.version == version
-                    && !doc.dirty()
-                    && doc.text != text
-                {
-                    doc.crlf = crlf;
-                    doc.reload(text, ctx);
+                }) {
+                    // `saved` is what edittr last read or wrote: anything else came from elsewhere.
+                    // Nothing is reloaded until the user chooses (see `disk_changed_bar`).
+                    doc.disk = (disk.text != doc.saved).then_some(disk);
                 }
             }
         }
@@ -1074,6 +1075,7 @@ impl App {
             id: self.next_doc_id,
             path: path.to_path_buf(),
             saved: text.clone(),
+            disk: None,
             crlf,
             text,
             lang,
@@ -1095,6 +1097,30 @@ impl App {
         }));
         self.next_doc_id += 1;
         self.prime_editorconfig(path.to_owned());
+    }
+
+    fn disk_changed(&mut self, i: usize, action: DiskAction) {
+        let Some(Tab::File(doc)) = self.tabs.get_mut(i) else { return };
+        let Some(disk) = doc.disk.clone() else { return };
+        match action {
+            DiskAction::Reload => {
+                doc.crlf = disk.crlf;
+                doc.reload(disk.text, &self.ctx.clone());
+                doc.disk = None;
+            }
+            DiskAction::KeepMine => {
+                // The editor text now differs from the file: it shows as unsaved, and saving wins.
+                doc.saved = disk.text;
+                doc.disk = None;
+                doc.version += 1;
+            }
+            DiskAction::Compare => {
+                let diff = disk_vs_editor(&doc.path, &disk.text, &doc.text);
+                let title = format!("{} (on disk ↔ editor)", doc.name());
+                let tab = DiffTab::new(title, doc.path.clone(), &diff);
+                self.show_tab(Tab::Diff(Box::new(tab)));
+            }
+        }
     }
 
     fn show_tab(&mut self, tab: Tab) {
@@ -2281,6 +2307,7 @@ impl App {
         let mut open_path = None;
         let mut goto_at = None;
         let mut editor_out = None;
+        let mut disk_action = None;
         // Diagnostics of the active file, for squiggles (collected before borrowing the tab).
         let diags = self.squiggles_for(active, ui.visuals());
         // The completion popup takes its keys before the editor sees them.
@@ -2309,6 +2336,7 @@ impl App {
                         || self.search_replace.confirming()
                         || self.c_flags.is_open();
                     self.find.bar(ui, doc, dialog_open);
+                    disk_action = disk_changed_bar(ui, doc);
                     let fresh = match self.vcs {
                         Some(Vcs::Svn) => doc.blame_version.is_some() && !doc.dirty(),
                         _ => doc.blame_version == Some(doc.version),
@@ -2417,6 +2445,9 @@ impl App {
         }
         if let Some(p) = open_path {
             self.open_file(&p);
+        }
+        if let Some(action) = disk_action {
+            self.disk_changed(active, action);
         }
         if let Some(out) = &editor_out {
             self.last_caret = out.caret;
@@ -3651,9 +3682,75 @@ fn save_recent(list: &[PathBuf]) {
     let _ = std::fs::write(f, text);
 }
 
+#[derive(Clone)]
 struct DiskText {
     text: String,
     crlf: bool,
+}
+
+#[derive(Clone, Copy)]
+enum DiskAction {
+    Reload,
+    Compare,
+    KeepMine,
+}
+
+/// "Changed on disk" notice above the editor; returns the user's choice.
+fn disk_changed_bar(ui: &mut egui::Ui, doc: &Doc) -> Option<DiskAction> {
+    doc.disk.as_ref()?;
+    let mut action = None;
+    egui::Frame::new()
+        .fill(ui.visuals().warn_fg_color.gamma_multiply(0.15))
+        .inner_margin(egui::Margin::symmetric(8, 4))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.colored_label(ui.visuals().warn_fg_color, ic::WARNING);
+                let what = if doc.dirty() {
+                    format!("{} changed on disk, and you have unsaved changes.", doc.name())
+                } else {
+                    format!("{} changed on disk.", doc.name())
+                };
+                ui.label(what);
+                let reload = if doc.dirty() { "Reload (discard my changes)" } else { "Reload" };
+                if ui
+                    .button(reload)
+                    .on_hover_text("Replace the editor text with the file on disk")
+                    .clicked()
+                {
+                    action = Some(DiskAction::Reload);
+                }
+                if ui
+                    .button("Compare")
+                    .on_hover_text("Show the differences: on disk ↔ in the editor")
+                    .clicked()
+                {
+                    action = Some(DiskAction::Compare);
+                }
+                if ui
+                    .button("Keep mine")
+                    .on_hover_text("Keep the editor text; saving will overwrite the file on disk")
+                    .clicked()
+                {
+                    action = Some(DiskAction::KeepMine);
+                }
+            });
+        });
+    action
+}
+
+/// Unified diff from the disk version to the editor text, as `DiffTab` shows it.
+fn disk_vs_editor(path: &Path, disk: &str, editor: &str) -> String {
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let diff = similar::TextDiff::from_lines(disk, editor);
+    let mut out = format!("diff --git a/{name} b/{name}\n");
+    out.push_str(
+        &diff
+            .unified_diff()
+            .context_radius(3)
+            .header(&format!("a/{name} (on disk)"), &format!("b/{name} (in the editor)"))
+            .to_string(),
+    );
+    out
 }
 
 fn read_doc_text(path: &Path) -> std::io::Result<Option<DiskText>> {
@@ -3873,6 +3970,14 @@ mod tests {
         let m = fuzzy_filter(&many, "mod5file9", 200);
         assert_eq!(m.len(), 200);
         eprintln!("fuzzy_filter over 100k paths: {:?}", t.elapsed());
+    }
+
+    #[test]
+    fn disk_vs_editor_diff_shows_both_sides() {
+        let diff = super::disk_vs_editor(std::path::Path::new("/p/main.c"), "a\nb\nc\n", "a\nB\nc\nd\n");
+        let tab = super::DiffTab::new("t".into(), "/p/main.c".into(), &diff);
+        assert_eq!((tab.added, tab.removed), (2, 1));
+        assert!(diff.contains("(on disk)") && diff.contains("(in the editor)"));
     }
 
     #[test]
