@@ -37,6 +37,7 @@ const STEPS: &[&str] = &[
     "diff-side-by-side",
     "diff-inline",
     "git-graph",
+    "git-graph-menu",
     "tab-menu",
     "go-to-definition-install-offer",
     "go-to-definition",
@@ -133,6 +134,16 @@ impl Tour {
                 20 if showing => self.click(at, egui::PointerButton::Primary, true),
                 21 if showing => self.click(at, egui::PointerButton::Primary, false),
                 23 if showing => self.inject.push(egui::Event::Text(" // edited in the diff".into())),
+                _ => {}
+            }
+        }
+        if name == "git-graph-menu" {
+            // Right-click the second history row: move, press, release on separate frames.
+            let row = egui::pos2(540.0, 84.0);
+            match self.frames {
+                3 => self.inject.push(egui::Event::PointerMoved(row)),
+                4 => self.click(row, egui::PointerButton::Secondary, true),
+                5 => self.click(row, egui::PointerButton::Secondary, false),
                 _ => {}
             }
         }
