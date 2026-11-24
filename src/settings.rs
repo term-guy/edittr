@@ -19,6 +19,8 @@ pub(crate) struct Settings {
     pub(crate) inline_blame: bool,
     /// Code overview on the right of the editor.
     pub(crate) minimap: bool,
+    /// Color nested brackets by depth.
+    pub(crate) bracket_colors: bool,
     pub(crate) restore_previous_session: bool,
 }
 
@@ -31,6 +33,7 @@ impl Default for Settings {
             show_whitespace: false,
             inline_blame: true,
             minimap: true,
+            bracket_colors: true,
             restore_previous_session: true,
         }
     }
@@ -89,6 +92,7 @@ impl Settings {
                     "show_whitespace" => settings.show_whitespace = value,
                     "inline_blame" => settings.inline_blame = value,
                     "minimap" => settings.minimap = value,
+                    "bracket_colors" => settings.bracket_colors = value,
                     "restore_previous_session" => settings.restore_previous_session = value,
                     _ => {}
                 }
@@ -116,6 +120,7 @@ impl Settings {
         text.push_str(&format!("show_whitespace={}\n", self.show_whitespace));
         text.push_str(&format!("inline_blame={}\n", self.inline_blame));
         text.push_str(&format!("minimap={}\n", self.minimap));
+        text.push_str(&format!("bracket_colors={}\n", self.bracket_colors));
         text.push_str(&format!("restore_previous_session={}\n", self.restore_previous_session));
         text.push_str(&format!("format_on_save={}\n", self.format_on_save));
         text
@@ -205,7 +210,7 @@ mod tests {
         let text = settings.format(previous);
         assert_eq!(
             text,
-            "future_key=one=two\nfuture_key = three\n# A comment\nchanges_tree=false\nhighlight_line=false\nshow_whitespace=false\ninline_blame=true\nminimap=true\nrestore_previous_session=true\nformat_on_save=false\n"
+            "future_key=one=two\nfuture_key = three\n# A comment\nchanges_tree=false\nhighlight_line=false\nshow_whitespace=false\ninline_blame=true\nminimap=true\nbracket_colors=true\nrestore_previous_session=true\nformat_on_save=false\n"
         );
         assert!(!Settings::parse(&text).changes_tree);
     }

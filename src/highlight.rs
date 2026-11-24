@@ -49,6 +49,8 @@ pub struct Span {
 pub struct Line {
     hash: u64,
     pub spans: Vec<Span>,
+    /// Brackets outside strings and comments: (byte in line, is an opener).
+    pub brackets: Vec<(u32, bool)>,
     /// Parser + highlighter state after this line.
     end: (ParseState, HighlightState),
 }
@@ -169,10 +171,11 @@ impl Cache {
                 }
             }
             let line = new[i];
-            let spans = highlight_line(line, &mut state, &highlighter);
+            let (spans, brackets) = highlight_line(line, &mut state, &highlighter);
             lines.push(Line {
                 hash: hashes[i],
                 spans,
+                brackets,
                 end: state.clone(),
             });
             i += 1;
@@ -181,10 +184,11 @@ impl Cache {
     }
 }
 
-fn highlight_line(line: &str, state: &mut (ParseState, HighlightState), highlighter: &Highlighter) -> Vec<Span> {
+fn highlight_line(line: &str, state: &mut (ParseState, HighlightState), highlighter: &Highlighter) -> (Vec<Span>, Vec<(u32, bool)>) {
     let Ok(ops) = state.0.parse_line(line, &assets().syntaxes) else {
-        return Vec::new();
+        return Default::default();
     };
+    let brackets = code_brackets(line, &ops, state.1.path.clone());
     let mut spans = Vec::new();
     let mut pos = 0;
     for (style, piece) in HighlightIterator::new(&mut state.1, &ops, line, highlighter) {
@@ -197,7 +201,32 @@ fn highlight_line(line: &str, state: &mut (ParseState, HighlightState), highligh
         });
         pos += piece.len();
     }
-    spans
+    (spans, brackets)
+}
+
+/// Brackets in `line` that are code (not inside a string or comment scope).
+fn code_brackets(line: &str, ops: &[(usize, syntect::parsing::ScopeStackOp)], mut stack: ScopeStack) -> Vec<(u32, bool)> {
+    use syntect::parsing::Scope;
+    static LITERAL: OnceLock<[Scope; 2]> = OnceLock::new();
+    let literal = LITERAL.get_or_init(|| [Scope::new("string").unwrap(), Scope::new("comment").unwrap()]);
+    if !line.bytes().any(|b| matches!(b, b'(' | b')' | b'[' | b']' | b'{' | b'}')) {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for (range, op) in syntect::easy::ScopeRangeIterator::new(ops, line) {
+        let in_literal = stack.as_slice().iter().any(|s| literal.iter().any(|l| l.is_prefix_of(*s)));
+        if !in_literal {
+            for (i, b) in line.as_bytes()[range.clone()].iter().enumerate() {
+                match b {
+                    b'(' | b'[' | b'{' => out.push(((range.start + i) as u32, true)),
+                    b')' | b']' | b'}' => out.push(((range.start + i) as u32, false)),
+                    _ => {}
+                }
+            }
+        }
+        let _ = stack.apply(op);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -225,6 +254,14 @@ mod tests {
             .iter()
             .map(|l| l.spans.iter().map(|s| (s.range.clone(), s.color)).collect())
             .collect()
+    }
+
+    #[test]
+    fn brackets_outside_strings_and_comments() {
+        let mut c = Cache::default();
+        c.update("let s = \"(\"; // [\nf(a[0]);\n", syntax("rs").unwrap(), true);
+        assert!(c.lines[0].brackets.is_empty());
+        assert_eq!(c.lines[1].brackets, vec![(1, true), (3, true), (5, false), (6, false)]);
     }
 
     #[test]

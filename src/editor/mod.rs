@@ -57,6 +57,8 @@ pub struct State {
     /// Vertical scroll offset to apply next frame (minimap clicks).
     scroll_to: Option<f32>,
     minimap_drag: bool,
+    /// Bracket nesting depth at the start of each line, for a version of the text.
+    depth: (Option<u64>, Arc<Vec<u32>>),
 }
 
 impl State {
@@ -162,6 +164,8 @@ pub struct Options<'a> {
     /// Line comment token for Cmd+/ (None: no toggle).
     pub comment: Option<&'a str>,
     pub minimap: bool,
+    /// Color brackets by nesting depth.
+    pub bracket_colors: bool,
 }
 
 /// Decorations supplied by the app.
@@ -205,11 +209,63 @@ impl Layout<'_> {
     }
 }
 
-fn line_job(text: &str, ix: &LineIndex, l: usize, spans: Option<&[highlight::Line]>, font: &egui::FontId, color: Color32) -> LayoutJob {
+/// Bracket colors for one line: depth at its start, the code brackets in it, palette.
+struct Brackets<'a> {
+    depth: u32,
+    marks: &'a [(u32, bool)],
+    colors: [Color32; 3],
+}
+
+fn line_job(
+    text: &str,
+    ix: &LineIndex,
+    l: usize,
+    spans: Option<&[highlight::Line]>,
+    font: &egui::FontId,
+    color: Color32,
+    brackets: Option<Brackets>,
+) -> LayoutJob {
     let range = ix.line_range(text, l);
     let line = &text[range.clone()];
     let mut job = LayoutJob::default();
     job.wrap.max_width = f32::INFINITY;
+    // Bracket color overrides: (byte in line, color).
+    let mut overrides: Vec<(usize, Color32)> = Vec::new();
+    if let Some(b) = brackets {
+        let mut d = b.depth;
+        for &(at, open) in b.marks {
+            if open {
+                overrides.push((at as usize, b.colors[d as usize % 3]));
+                d += 1;
+            } else {
+                d = d.saturating_sub(1);
+                overrides.push((at as usize, b.colors[d as usize % 3]));
+            }
+        }
+    }
+    let mut next = 0;
+    let mut push = |job: &mut LayoutJob, from: usize, to: usize, fmt: egui::TextFormat| {
+        let mut a = from;
+        while a < to {
+            while next < overrides.len() && overrides[next].0 < a {
+                next += 1;
+            }
+            match overrides.get(next) {
+                Some(&(at, c)) if at < to => {
+                    if at > a {
+                        job.append(&line[a..at], 0.0, fmt.clone());
+                    }
+                    job.append(&line[at..at + 1], 0.0, egui::TextFormat { color: c, ..fmt.clone() });
+                    a = at + 1;
+                    next += 1;
+                }
+                _ => {
+                    job.append(&line[a..to], 0.0, fmt.clone());
+                    a = to;
+                }
+            }
+        }
+    };
     let spans = spans.and_then(|s| s.get(l)).map(|l| l.spans.as_slice()).unwrap_or_default();
     let mut pos = 0;
     for s in spans {
@@ -218,23 +274,22 @@ fn line_job(text: &str, ix: &LineIndex, l: usize, spans: Option<&[highlight::Lin
             continue;
         }
         if a > pos {
-            job.append(&line[pos..a], 0.0, egui::TextFormat::simple(font.clone(), color));
+            push(&mut job, pos, a, egui::TextFormat::simple(font.clone(), color));
         }
-        job.append(
-            &line[a..b],
-            0.0,
-            egui::TextFormat {
-                font_id: font.clone(),
-                color: s.color,
-                italics: s.italics,
-                underline: if s.underline { Stroke::new(1.0, s.color) } else { Stroke::NONE },
-                ..Default::default()
-            },
-        );
+        let fmt = egui::TextFormat {
+            font_id: font.clone(),
+            color: s.color,
+            italics: s.italics,
+            underline: if s.underline { Stroke::new(1.0, s.color) } else { Stroke::NONE },
+            ..Default::default()
+        };
+        push(&mut job, a, b, fmt);
         pos = b;
     }
-    if pos < line.len() || line.is_empty() {
-        job.append(&line[pos..], 0.0, egui::TextFormat::simple(font.clone(), color));
+    if pos < line.len() {
+        push(&mut job, pos, line.len(), egui::TextFormat::simple(font.clone(), color));
+    } else if line.is_empty() {
+        job.append("", 0.0, egui::TextFormat::simple(font.clone(), color));
     }
     job
 }
@@ -247,11 +302,21 @@ struct Lines<'a> {
     spans: Option<&'a [highlight::Line]>,
     font: egui::FontId,
     color: Color32,
+    /// Depth at each line start + palette, when bracket colors are on.
+    depth: Option<(&'a [u32], [Color32; 3])>,
 }
 
 impl Lines<'_> {
     fn galley(&self, l: usize) -> Arc<egui::Galley> {
-        let job = line_job(self.text, self.ix, l, self.spans, &self.font, self.color);
+        let brackets = match (self.depth, self.spans.and_then(|s| s.get(l))) {
+            (Some((depth, colors)), Some(hl)) if !hl.brackets.is_empty() => Some(Brackets {
+                depth: depth.get(l).copied().unwrap_or(0),
+                marks: &hl.brackets,
+                colors,
+            }),
+            _ => None,
+        };
+        let job = line_job(self.text, self.ix, l, self.spans, &self.font, self.color, brackets);
         self.ui.fonts_mut(|f| f.layout_job(job))
     }
 
@@ -338,6 +403,36 @@ pub fn show(
     } else {
         None
     };
+    if opts.bracket_colors
+        && let Some(sp) = spans
+        && st.depth.0 != Some(*version)
+    {
+        let mut depth = Vec::with_capacity(sp.len() + 1);
+        let mut d = 0u32;
+        for line in sp {
+            depth.push(d);
+            for &(_, open) in &line.brackets {
+                d = if open { d + 1 } else { d.saturating_sub(1) };
+            }
+        }
+        depth.push(d);
+        st.depth = (Some(*version), Arc::new(depth));
+    }
+    let bracket_palette = if ui.visuals().dark_mode {
+        [
+            Color32::from_rgb(0xff, 0xd7, 0x00),
+            Color32::from_rgb(0xda, 0x70, 0xd6),
+            Color32::from_rgb(0x17, 0x9f, 0xff),
+        ]
+    } else {
+        [
+            Color32::from_rgb(0x04, 0x31, 0xfa),
+            Color32::from_rgb(0x31, 0x93, 0x31),
+            Color32::from_rgb(0x7b, 0x38, 0x14),
+        ]
+    };
+    let use_depth = opts.bracket_colors && spans.is_some() && st.depth.0 == Some(*version);
+    let depth_arc = st.depth.1.clone();
     let digits = ix.lines().to_string().len().max(3);
     // Fold arrows, line numbers, change markers.
     let fold_w = 1.6 * char_w;
@@ -375,6 +470,7 @@ pub fn show(
             spans,
             font: font.clone(),
             color: text_color,
+            depth: use_depth.then(|| (depth_arc.as_slice(), bracket_palette)),
         };
         let visible_rows = (vp.min.y / row_h).floor().max(0.0) as usize..((vp.max.y / row_h).ceil() as usize + 1).min(view.count());
         let vis_lines: Vec<usize> = visible_rows.clone().map(|r| view.line(r)).collect();
@@ -1044,6 +1140,7 @@ fn key_press(ui: &egui::Ui, st: &mut State, text: &mut String, version: &mut u64
         spans: None,
         font: k.font.clone(),
         color: Color32::WHITE,
+        depth: None,
     };
     // Move every caret with `f`; Shift extends.
     let moved = |st: &mut State, f: &dyn Fn(Sel) -> usize, keep_x: bool| {
@@ -1465,6 +1562,7 @@ mod tests {
                     indent: "    ",
                     comment: Some("//"),
                     minimap: false,
+                    bracket_colors: true,
                 };
                 out = show(ui, id, st, text, version, hl, &opts, &Extras::default());
             });

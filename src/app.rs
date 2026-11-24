@@ -2633,6 +2633,7 @@ fn editor(
         indent: &doc.indent,
         comment: doc.comment,
         minimap: settings.minimap,
+        bracket_colors: settings.bracket_colors,
     };
     // Diagnostics: (line, char col) pairs to byte ranges.
     let squiggles: Vec<(std::ops::Range<usize>, Color32)> = {
