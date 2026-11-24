@@ -65,7 +65,9 @@ fn main() -> eframe::Result {
         .find(|a| !a.to_string_lossy().starts_with("-psn"))
         .map(PathBuf::from);
     let settings = settings::Settings::load();
-    let startup = session::Startup::new(arg, settings.restore_previous_session);
+    // Without a folder argument, edittr starts on the start page (recent folders)
+    // unless "Reopen last folder at startup" is on.
+    let startup = session::Startup::new(arg, settings.restore_previous_session && settings.reopen_last_folder);
 
     let mut viewport = eframe::egui::ViewportBuilder::default()
         .with_title("edittr")

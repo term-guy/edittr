@@ -24,6 +24,8 @@ pub(crate) struct Settings {
     pub(crate) show_outline: bool,
     pub(crate) outline_expanded: bool,
     pub(crate) restore_previous_session: bool,
+    /// Start in the last folder instead of the start page (when no folder is given).
+    pub(crate) reopen_last_folder: bool,
 }
 
 impl Default for Settings {
@@ -39,6 +41,7 @@ impl Default for Settings {
             show_outline: true,
             outline_expanded: true,
             restore_previous_session: true,
+            reopen_last_folder: false,
         }
     }
 }
@@ -100,6 +103,7 @@ impl Settings {
                     "show_outline" => settings.show_outline = value,
                     "outline_expanded" => settings.outline_expanded = value,
                     "restore_previous_session" => settings.restore_previous_session = value,
+                    "reopen_last_folder" => settings.reopen_last_folder = value,
                     _ => {}
                 }
             }
@@ -120,6 +124,7 @@ impl Settings {
                         | "minimap"
                         | "bracket_colors"
                         | "restore_previous_session"
+                        | "reopen_last_folder"
                         | "format_on_save"
                         | "show_outline"
                         | "outline_expanded",
@@ -137,6 +142,7 @@ impl Settings {
         text.push_str(&format!("minimap={}\n", self.minimap));
         text.push_str(&format!("bracket_colors={}\n", self.bracket_colors));
         text.push_str(&format!("restore_previous_session={}\n", self.restore_previous_session));
+        text.push_str(&format!("reopen_last_folder={}\n", self.reopen_last_folder));
         text.push_str(&format!("format_on_save={}\n", self.format_on_save));
         text.push_str(&format!("show_outline={}\n", self.show_outline));
         text.push_str(&format!("outline_expanded={}\n", self.outline_expanded));
@@ -247,7 +253,7 @@ mod tests {
         let text = settings.format(previous);
         assert_eq!(
             text,
-            "future_key=one=two\nfuture_key = three\n# A comment\nchanges_tree=false\nhighlight_line=false\nshow_whitespace=false\ninline_blame=true\nminimap=true\nbracket_colors=true\nrestore_previous_session=true\nformat_on_save=false\nshow_outline=true\noutline_expanded=true\n"
+            "future_key=one=two\nfuture_key = three\n# A comment\nchanges_tree=false\nhighlight_line=false\nshow_whitespace=false\ninline_blame=true\nminimap=true\nbracket_colors=true\nrestore_previous_session=true\nreopen_last_folder=false\nformat_on_save=false\nshow_outline=true\noutline_expanded=true\n"
         );
         assert!(!Settings::parse(&text).changes_tree);
     }
@@ -279,6 +285,16 @@ mod tests {
     fn missing_or_invalid_value_enables_line_highlight() {
         assert!(Settings::parse("changes_tree=true").highlight_line);
         assert!(Settings::parse("highlight_line=maybe").highlight_line);
+    }
+
+    #[test]
+    fn reopen_last_folder_defaults_off_and_round_trips() {
+        assert!(!Settings::parse("").reopen_last_folder);
+        let settings = Settings {
+            reopen_last_folder: true,
+            ..Settings::default()
+        };
+        assert!(Settings::parse(&settings.format("")).reopen_last_folder);
     }
 
     #[test]

@@ -802,7 +802,10 @@ fn minimap(
     // The visible part.
     let vy = rect.min.y + (offset_rows - top) * ROW;
     let vr = Rect::from_min_size(Pos2::new(rect.min.x, vy), Vec2::new(rect.width(), vis_rows * ROW));
-    painter.rect_filled(vr, 0.0, ui.visuals().text_color().gamma_multiply(0.08));
+    // The visible part of the file: a clear band with an outline, readable on both themes.
+    let band = ui.visuals().text_color();
+    painter.rect_filled(vr, 0.0, band.gamma_multiply(0.16));
+    painter.rect_stroke(vr, 0.0, egui::Stroke::new(1.0, band.gamma_multiply(0.35)), egui::StrokeKind::Inside);
 
     let resp = ui.interact(rect, id.with("minimap"), Sense::click_and_drag());
     if resp.drag_started() || resp.clicked() {

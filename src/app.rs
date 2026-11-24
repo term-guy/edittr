@@ -1783,6 +1783,76 @@ impl App {
         }
     }
 
+    /// The editor area when no folder is open: open a folder or pick a recent one.
+    fn start_page(&mut self, ui: &mut egui::Ui) {
+        let width = ui.available_width().min(520.0);
+        let mut open = None;
+        let mut forget = None;
+        ui.vertical_centered(|ui| {
+            ui.add_space((ui.available_height() / 6.0).min(120.0));
+            ui.heading("edittr");
+            ui.weak("A fast, lightweight code editor");
+            ui.add_space(16.0);
+            if ui
+                .add(egui::Button::new(format!("{} Open Folder…", ic::FOLDER_OPEN)).min_size(egui::vec2(220.0, 30.0)))
+                .clicked()
+            {
+                self.request_open_folder();
+            }
+            ui.add_space(24.0);
+            if self.recent.is_empty() {
+                ui.weak("Folders you open will be listed here.");
+                return;
+            }
+            ui.allocate_ui(egui::vec2(width, ui.available_height()), |ui| {
+                ui.set_width(width);
+                ui.label(RichText::new("RECENT FOLDERS").small().strong());
+                ui.add_space(4.0);
+                egui::ScrollArea::vertical().auto_shrink([false, true]).show(ui, |ui| {
+                    for (i, dir) in self.recent.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if icon_button(ui, ic::X).on_hover_text("Remove from list").clicked() {
+                                    forget = Some(i);
+                                }
+                                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                    let parent = dir.parent().map(short_path).unwrap_or_default();
+                                    let label = egui::Button::selectable(false, format!("{} {}", ic::FOLDER, dir_name(dir)))
+                                        .shortcut_text(RichText::new(parent).small().weak())
+                                        .truncate();
+                                    if ui
+                                        .add_sized([ui.available_width(), 26.0], label)
+                                        .on_hover_text(dir.display().to_string())
+                                        .clicked()
+                                    {
+                                        open = Some(dir.clone());
+                                    }
+                                });
+                            });
+                        });
+                    }
+                });
+            });
+        });
+        self.open_recent(open, forget);
+    }
+
+    fn open_recent(&mut self, open: Option<PathBuf>, forget: Option<usize>) {
+        if let Some(i) = forget {
+            self.recent.remove(i);
+            save_recent(&self.recent);
+        }
+        if let Some(dir) = open {
+            if dir.is_dir() {
+                self.set_root(dir);
+            } else {
+                self.message = format!("{} no longer exists", dir.display());
+                self.recent.retain(|r| r != &dir);
+                save_recent(&self.recent);
+            }
+        }
+    }
+
     /// Explorer content when no folder is open.
     fn welcome(&mut self, ui: &mut egui::Ui) {
         ui.label(RichText::new("NO FOLDER OPENED").small().strong());
@@ -1820,19 +1890,7 @@ impl App {
                 });
             });
         }
-        if let Some(i) = forget {
-            self.recent.remove(i);
-            save_recent(&self.recent);
-        }
-        if let Some(dir) = open {
-            if dir.is_dir() {
-                self.set_root(dir);
-            } else {
-                self.message = format!("{} no longer exists", dir.display());
-                self.recent.retain(|r| r != &dir);
-                save_recent(&self.recent);
-            }
-        }
+        self.open_recent(open, forget);
     }
 
     fn tree_dir(&mut self, ui: &mut egui::Ui, dir: &Path, depth: usize, deco: &HashMap<PathBuf, char>, open: &mut Option<PathBuf>) {
@@ -2209,14 +2267,7 @@ impl App {
     fn central(&mut self, ui: &mut egui::Ui) {
         if self.tabs.is_empty() {
             if self.root.is_none() {
-                ui.vertical_centered(|ui| {
-                    ui.add_space(ui.available_height() / 3.0);
-                    ui.heading("edittr");
-                    ui.add_space(8.0);
-                    if ui.button(format!("{} Open Folder…", ic::FOLDER_OPEN)).clicked() {
-                        self.request_open_folder();
-                    }
-                });
+                self.start_page(ui);
             } else {
                 ui.centered_and_justified(|ui| {
                     ui.weak("Open a file from the Explorer, or press Ctrl/Cmd+P");
@@ -3355,6 +3406,26 @@ fn collapse_key(staged: bool, path: &str) -> String {
     format!("{}{path}", if staged { "S:" } else { "U:" })
 }
 
+/// A folder path for display: the home folder as `~`, long paths cut from the left
+/// ("…/projects/app") so the folder name next to it stays readable.
+fn short_path(path: &Path) -> String {
+    const MAX: usize = 40;
+    let home = dirs::home_dir();
+    let text = match home.as_deref().and_then(|h| path.strip_prefix(h).ok()) {
+        Some(rest) if rest.as_os_str().is_empty() => "~".to_owned(),
+        Some(rest) => format!("~{}{}", std::path::MAIN_SEPARATOR, rest.display()),
+        None => path.display().to_string(),
+    };
+    let chars = text.chars().count();
+    if chars <= MAX {
+        return text;
+    }
+    let tail: String = text.chars().skip(chars - MAX).collect();
+    // Start at a separator so no folder name is cut in half.
+    let tail = tail.find(['/', '\\']).map_or(tail.as_str(), |i| &tail[i..]);
+    format!("…{tail}")
+}
+
 /// Whether `path` is inside the repo-relative folder `folder`.
 fn in_folder(path: &str, folder: &str) -> bool {
     path.strip_prefix(folder).is_some_and(|rest| rest.starts_with('/'))
@@ -3802,6 +3873,16 @@ mod tests {
         let m = fuzzy_filter(&many, "mod5file9", 200);
         assert_eq!(m.len(), 200);
         eprintln!("fuzzy_filter over 100k paths: {:?}", t.elapsed());
+    }
+
+    #[test]
+    fn short_paths_keep_the_end() {
+        use super::short_path;
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(short_path(&home.join("code")), format!("~{}code", std::path::MAIN_SEPARATOR));
+        let long = std::path::Path::new("/very/long/path/to/some/deeply/nested/projects/folder/here");
+        let s = short_path(long);
+        assert!(s.starts_with("…/") && s.ends_with("/folder/here") && s.chars().count() <= 41, "{s}");
     }
 
     #[test]

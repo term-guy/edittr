@@ -245,7 +245,10 @@ impl Tour {
         match name {
             "welcome" => {
                 app.clear_project();
-                app.recent = vec![demo.clone()];
+                app.recent = std::iter::once(demo.clone())
+                    .chain(demo.parent().map(PathBuf::from))
+                    .chain(demo.parent().and_then(|p| p.parent()).map(PathBuf::from))
+                    .collect();
                 app.side = Side::Explorer;
             }
             "editor" => {
