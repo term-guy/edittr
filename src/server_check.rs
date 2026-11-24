@@ -135,12 +135,13 @@ pub fn round_trip(sample: &Sample, bundled_only: bool, timeout: Duration) -> Res
         std::fs::write(p, body).map_err(|e| e.to_string())?;
     }
     let result = (|| {
-        // macOS's temp dir is behind a symlink that servers resolve. Not on Windows:
-        // canonicalize gives `\\?\C:\...` paths, which servers' file URIs never match.
-        let dir = if cfg!(windows) {
-            dir.clone()
-        } else {
-            std::fs::canonicalize(&dir).map_err(|e| e.to_string())?
+        // Resolve symlinks (macOS's temp dir) and, on Windows, 8.3 short names such as
+        // RUNNER~1, which gopls expands and then no longer matches the workspace folder.
+        // canonicalize returns `\\?\C:\...` there; servers' URIs use plain `C:\...`.
+        let dir = std::fs::canonicalize(&dir).map_err(|e| e.to_string())?;
+        let dir = match dir.to_str().and_then(|d| d.strip_prefix(r"\\?\")) {
+            Some(plain) if !plain.starts_with("UNC") => std::path::PathBuf::from(plain),
+            _ => dir,
         };
         let launch = Arc::new(lsp::Launch::default());
         launch.finish(Some(lsp::Client::start(&spec, command, &dir, &[], None)?));

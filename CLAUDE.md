@@ -29,7 +29,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Commit identity for this repo is `termguy <hello@termg.com>` (local git config); keep it.
 - Commit directly on `main`; push only when asked. The remote uses the SSH host alias `github-term-guy`.
 - Release = push a `vX.Y.Z` tag. `.github/workflows/release.yml` builds the Windows installer + portable exe, macOS universal dmg/zip and Linux deb/tar.gz, and publishes them; the version comes from the tag (`.github/scripts/version.sh`).
-- `gh` is not logged in; check Actions runs via the public API (`curl https://api.github.com/repos/term-guy/edittr/actions/runs`).
+- `gh` is logged in as term-guy: `gh run list`, `gh run view <id> --log-failed`. Pushing the `release-check` branch builds every package and runs `verify` (bundled language servers on fresh Windows/macOS/Linux runners) without publishing.
 
 ## Language servers
 
