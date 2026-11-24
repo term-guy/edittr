@@ -366,6 +366,10 @@ pub struct App {
     sessions: session::Sessions,
     /// Collapsed folders in the Changes tree, keyed "S:<path>" (staged) or "U:<path>".
     changes_collapsed: HashSet<String>,
+    /// Bumped whenever `status` is replaced; keys the cached Changes rows.
+    status_gen: u64,
+    /// Visible Changes rows for (status_gen, tree view, collapsed folders), built once.
+    changes_rows: Option<((u64, bool, usize), Vec<ChangeRow>)>,
     #[cfg(feature = "tour")]
     tour: Option<tour::Tour>,
 }
@@ -446,6 +450,8 @@ impl App {
             settings_writer,
             sessions: session::Sessions::new(session_writer, startup.window.clone()),
             changes_collapsed: HashSet::new(),
+            status_gen: 0,
+            changes_rows: None,
             #[cfg(feature = "tour")]
             tour: tour::Tour::from_env(),
         };
@@ -624,6 +630,7 @@ impl App {
             None => (None, None),
         };
         self.status = Status::default();
+        self.status_gen += 1;
         self.branches.clear();
         self.graph = None;
         self.graph_sel = None;
@@ -796,7 +803,10 @@ impl App {
                 }
                 if let Some(status) = refresh.status {
                     match status {
-                        Ok(status) => self.status = status,
+                        Ok(status) => {
+                            self.status = status;
+                            self.status_gen += 1;
+                        }
                         Err(e) => self.message = e,
                     }
                 }
@@ -1975,43 +1985,72 @@ impl App {
         });
         ui.separator();
 
-        let staged = self.status.staged.clone();
-        let unstaged = self.status.unstaged.clone();
+        // Only the visible rows are laid out, and the row list is rebuilt only when the
+        // status, the view or a folder changes: tens of thousands of changes stay smooth.
+        let key = (self.status_gen, self.settings.changes_tree, self.changes_collapsed.len());
+        if self.changes_rows.as_ref().is_none_or(|(k, _)| *k != key) {
+            let rows = change_rows(&self.status, has_index, self.settings.changes_tree, &self.changes_collapsed);
+            self.changes_rows = Some((key, rows));
+        }
+        let rows = &self.changes_rows.as_ref().unwrap().1;
+        let row_height = ui
+            .spacing()
+            .interact_size
+            .y
+            .max(ui.text_style_height(&egui::TextStyle::Button) + 4.0);
         let mut actions = Vec::new();
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            if has_index {
-                ui.horizontal(|ui| {
-                    ui.strong(format!("Staged ({})", staged.len()));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if !busy && !staged.is_empty() && icon_button(ui, ic::MINUS).on_hover_text("Unstage all").clicked() {
-                            self.stage_change(None, false);
-                        }
-                    });
-                });
-                if let Some(a) = change_section(ui, &staged, true, !busy, self.settings.changes_tree, &self.changes_collapsed) {
-                    actions.push(a);
+        let (mut stage_all, mut unstage_all) = (false, false);
+        let status = &self.status;
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show_rows(ui, row_height, rows.len(), |ui, range| {
+                for row in &rows[range] {
+                    let width = ui.available_width();
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(width, row_height),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            ui.set_height(row_height);
+                            match row {
+                                ChangeRow::Header { staged } => {
+                                    let items = if *staged { &status.staged } else { &status.unstaged };
+                                    let title = if *staged { "Staged" } else { "Changes" };
+                                    ui.strong(format!("{title} ({})", items.len()));
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        if *staged {
+                                            if !busy
+                                                && !items.is_empty()
+                                                && icon_button(ui, ic::MINUS).on_hover_text("Unstage all").clicked()
+                                            {
+                                                unstage_all = true;
+                                            }
+                                        } else if has_index
+                                            && !busy
+                                            && !items.is_empty()
+                                            && icon_button(ui, ic::PLUS).on_hover_text("Stage all").clicked()
+                                        {
+                                            stage_all = true;
+                                        }
+                                    });
+                                }
+                                ChangeRow::Gap => {}
+                                row => {
+                                    let show_stage = if row.staged() { !busy } else { has_index && !busy };
+                                    if let Some(a) = draw_change_row(ui, row, status, show_stage) {
+                                        actions.push(a);
+                                    }
+                                }
+                            }
+                        },
+                    );
                 }
-                ui.add_space(8.0);
-            }
-            ui.horizontal(|ui| {
-                ui.strong(format!("Changes ({})", unstaged.len()));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if has_index && !busy && !unstaged.is_empty() && icon_button(ui, ic::PLUS).on_hover_text("Stage all").clicked() {
-                        self.stage_change(None, true);
-                    }
-                });
             });
-            if let Some(a) = change_section(
-                ui,
-                &unstaged,
-                false,
-                has_index && !busy,
-                self.settings.changes_tree,
-                &self.changes_collapsed,
-            ) {
-                actions.push(a);
-            }
-        });
+        if unstage_all {
+            self.stage_change(None, false);
+        }
+        if stage_all {
+            self.stage_change(None, true);
+        }
         for action in actions {
             match action {
                 ChangeAction::OpenDiff(c, staged) => self.open_diff(&c, staged),
@@ -2024,6 +2063,7 @@ impl App {
                     if !self.changes_collapsed.remove(&key) {
                         self.changes_collapsed.insert(key);
                     }
+                    self.changes_rows = None;
                 }
             }
         }
@@ -3162,96 +3202,170 @@ enum ChangeAction {
     ToggleFolder(String),
 }
 
-/// One section (staged or unstaged) of the Changes view, as a flat list or a folder tree.
-fn change_section(
-    ui: &mut egui::Ui,
-    items: &[FileChange],
-    staged: bool,
-    show_stage: bool,
-    as_tree: bool,
-    collapsed: &HashSet<String>,
-) -> Option<ChangeAction> {
-    let mut action = None;
-    let mut file_row = |ui: &mut egui::Ui, c: &FileChange, depth: usize, show_dir: bool| {
-        const UNSTAGED_BUTTONS: &[(&str, &str)] = &[
-            (ic::PLUS, "Stage"),
-            (ic::ARROW_U_UP_LEFT, "Discard changes"),
-            (ic::ARROW_SQUARE_OUT, "Open file"),
-        ];
-        let buttons = if staged {
-            if show_stage { &[(ic::MINUS, "Unstage")][..] } else { &[] }
-        } else {
-            &UNSTAGED_BUTTONS[usize::from(!show_stage)..]
-        };
-        match change_row(ui, c, buttons, depth, show_dir) {
-            RowAction::Open => action = Some(ChangeAction::OpenDiff(c.clone(), staged)),
-            RowAction::Button(0) if staged => action = Some(ChangeAction::Unstage(c.path.clone())),
-            RowAction::Button(0) if show_stage => action = Some(ChangeAction::Stage(c.path.clone())),
-            RowAction::Button(i) if i == usize::from(show_stage) => action = Some(ChangeAction::Discard(c.clone())),
-            RowAction::Button(_) => action = Some(ChangeAction::OpenFile(c.path.clone())),
-            _ => {}
+/// One row of the Changes view (list or folder tree), with indices into `Status`.
+enum ChangeRow {
+    Header {
+        staged: bool,
+    },
+    Gap,
+    Folder {
+        staged: bool,
+        depth: usize,
+        path: String,
+        label: String,
+        files: usize,
+        collapsed: bool,
+    },
+    File {
+        staged: bool,
+        depth: usize,
+        index: usize,
+        show_dir: bool,
+    },
+}
+
+impl ChangeRow {
+    fn staged(&self) -> bool {
+        match self {
+            Self::Header { staged } | Self::Folder { staged, .. } | Self::File { staged, .. } => *staged,
+            Self::Gap => false,
         }
-    };
-    if !as_tree {
-        for c in items {
-            file_row(ui, c, 0, true);
-        }
-        return action;
     }
-    let key_prefix = if staged { "S:" } else { "U:" };
-    let section_collapsed: HashSet<String> = collapsed
-        .iter()
-        .filter_map(|k| k.strip_prefix(key_prefix).map(str::to_string))
-        .collect();
-    let paths: Vec<&str> = items.iter().map(|c| c.path.as_str()).collect();
-    let mut folder_action = None;
-    for row in crate::tree::layout(&paths, &section_collapsed) {
-        match row {
-            crate::tree::Row::File { depth, index } => file_row(ui, &items[index], depth, false),
-            crate::tree::Row::Folder {
-                depth,
-                path,
-                label,
-                files,
-                collapsed,
-            } => {
-                ui.horizontal(|ui| {
-                    ui.add_space(depth as f32 * 12.0);
-                    let (caret, folder) = if collapsed {
-                        (ic::CARET_RIGHT, ic::FOLDER)
-                    } else {
-                        (ic::CARET_DOWN, ic::FOLDER_OPEN)
-                    };
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let (icon, tip) = if staged {
-                            (ic::MINUS, "Unstage folder")
-                        } else {
-                            (ic::PLUS, "Stage folder")
-                        };
-                        if show_stage && icon_button(ui, icon).on_hover_text(tip).clicked() {
-                            folder_action = Some(if staged {
-                                ChangeAction::Unstage(path.clone())
-                            } else {
-                                ChangeAction::Stage(path.clone())
-                            });
-                        }
-                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                            let text = format!("{caret} {folder} {label}");
-                            if ui
-                                .add(egui::Button::selectable(false, text).truncate())
-                                .on_hover_text(&path)
-                                .clicked()
-                            {
-                                folder_action = Some(ChangeAction::ToggleFolder(format!("{key_prefix}{path}")));
-                            }
-                            ui.weak(files.to_string());
-                        });
-                    });
-                });
+}
+
+fn collapse_key(staged: bool, path: &str) -> String {
+    format!("{}{path}", if staged { "S:" } else { "U:" })
+}
+
+/// The visible rows of both sections, as a flat list or a folder tree.
+fn change_rows(status: &Status, has_index: bool, as_tree: bool, collapsed: &HashSet<String>) -> Vec<ChangeRow> {
+    let mut rows = Vec::new();
+    let sections: &[(bool, &[FileChange])] = if has_index {
+        &[(true, &status.staged), (false, &status.unstaged)]
+    } else {
+        &[(false, &status.unstaged)]
+    };
+    for (i, (staged, items)) in sections.iter().enumerate() {
+        if i > 0 {
+            rows.push(ChangeRow::Gap);
+        }
+        rows.push(ChangeRow::Header { staged: *staged });
+        if !as_tree {
+            rows.extend((0..items.len()).map(|index| ChangeRow::File {
+                staged: *staged,
+                depth: 0,
+                index,
+                show_dir: true,
+            }));
+            continue;
+        }
+        let prefix = if *staged { "S:" } else { "U:" };
+        let section_collapsed: HashSet<String> = collapsed
+            .iter()
+            .filter_map(|k| k.strip_prefix(prefix).map(str::to_string))
+            .collect();
+        let paths: Vec<&str> = items.iter().map(|c| c.path.as_str()).collect();
+        for row in crate::tree::layout(&paths, &section_collapsed) {
+            rows.push(match row {
+                crate::tree::Row::File { depth, index } => ChangeRow::File {
+                    staged: *staged,
+                    depth,
+                    index,
+                    show_dir: false,
+                },
+                crate::tree::Row::Folder {
+                    depth,
+                    path,
+                    label,
+                    files,
+                    collapsed,
+                } => ChangeRow::Folder {
+                    staged: *staged,
+                    depth,
+                    path,
+                    label,
+                    files,
+                    collapsed,
+                },
+            });
+        }
+    }
+    rows
+}
+
+fn draw_change_row(ui: &mut egui::Ui, row: &ChangeRow, status: &Status, show_stage: bool) -> Option<ChangeAction> {
+    match row {
+        ChangeRow::File {
+            staged,
+            depth,
+            index,
+            show_dir,
+        } => {
+            let items = if *staged { &status.staged } else { &status.unstaged };
+            let c = items.get(*index)?;
+            const UNSTAGED_BUTTONS: &[(&str, &str)] = &[
+                (ic::PLUS, "Stage"),
+                (ic::ARROW_U_UP_LEFT, "Discard changes"),
+                (ic::ARROW_SQUARE_OUT, "Open file"),
+            ];
+            let buttons = if *staged {
+                if show_stage { &[(ic::MINUS, "Unstage")][..] } else { &[] }
+            } else {
+                &UNSTAGED_BUTTONS[usize::from(!show_stage)..]
+            };
+            match change_row(ui, c, buttons, *depth, *show_dir) {
+                RowAction::Open => Some(ChangeAction::OpenDiff(c.clone(), *staged)),
+                RowAction::Button(0) if *staged => Some(ChangeAction::Unstage(c.path.clone())),
+                RowAction::Button(0) if show_stage => Some(ChangeAction::Stage(c.path.clone())),
+                RowAction::Button(i) if i == usize::from(show_stage) => Some(ChangeAction::Discard(c.clone())),
+                RowAction::Button(_) => Some(ChangeAction::OpenFile(c.path.clone())),
+                _ => None,
             }
         }
+        ChangeRow::Folder {
+            staged,
+            depth,
+            path,
+            label,
+            files,
+            collapsed,
+        } => {
+            let mut action = None;
+            ui.add_space(*depth as f32 * 12.0);
+            let (caret, folder) = if *collapsed {
+                (ic::CARET_RIGHT, ic::FOLDER)
+            } else {
+                (ic::CARET_DOWN, ic::FOLDER_OPEN)
+            };
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let (icon, tip) = if *staged {
+                    (ic::MINUS, "Unstage folder")
+                } else {
+                    (ic::PLUS, "Stage folder")
+                };
+                if show_stage && icon_button(ui, icon).on_hover_text(tip).clicked() {
+                    action = Some(if *staged {
+                        ChangeAction::Unstage(path.clone())
+                    } else {
+                        ChangeAction::Stage(path.clone())
+                    });
+                }
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    let text = format!("{caret} {folder} {label}");
+                    if ui
+                        .add(egui::Button::selectable(false, text).truncate())
+                        .on_hover_text(path)
+                        .clicked()
+                    {
+                        action = Some(ChangeAction::ToggleFolder(collapse_key(*staged, path)));
+                    }
+                    ui.weak(files.to_string());
+                });
+            });
+            action
+        }
+        ChangeRow::Header { .. } | ChangeRow::Gap => None,
     }
-    folder_action.or(action)
 }
 
 fn change_row(ui: &mut egui::Ui, c: &FileChange, buttons: &[(&str, &str)], depth: usize, show_dir: bool) -> RowAction {

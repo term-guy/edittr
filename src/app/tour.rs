@@ -43,6 +43,8 @@ const STEPS: &[&str] = &[
     "split-editor",
     "light-theme",
     "column-select",
+    "c-flags",
+    "c-settings",
 ];
 
 impl Tour {
@@ -180,7 +182,7 @@ impl Tour {
         let min_frames = match name {
             "column-select" => 40,
             // Give the language server time to answer.
-            "lsp-hover" | "lsp-completion" => 150,
+            "lsp-hover" | "lsp-completion" | "c-flags" => 150,
             _ => 10,
         };
         if self.frames < min_frames || elapsed < std::time::Duration::from_millis(800) || (!ready && elapsed.as_secs() < 20) {
@@ -308,6 +310,15 @@ impl Tour {
                     }
                 }
             }
+            "c-flags" => {
+                // Back to the opened C file, where the status bar shows where clangd's flags come from.
+                ctx.set_theme(egui::Theme::Dark);
+                app.split = None;
+                if let Some(i) = app.tabs.iter().position(|t| matches!(t, Tab::File(d) if d.ext() == "c")) {
+                    app.active = i;
+                }
+            }
+            "c-settings" => app.open_c_settings(),
             "split-editor" => {
                 app.side_open = false;
                 let graph = app
