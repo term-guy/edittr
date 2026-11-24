@@ -214,8 +214,7 @@ impl App {
         if self.search_replace.confirming() {
             return;
         }
-        // The palette binding precedes Go to file because egui accepts extra Shift modifiers.
-        for command in COMMANDS.iter().filter(|c| c.id != Command::Commit) {
+        for command in commands::dispatch_order().iter().filter(|c| c.id != Command::Commit) {
             if command.id == Command::SwitchSourceHeader && !ctx.input(|input| input.key_pressed(Key::O) && self.can_switch_source_header())
             {
                 continue;

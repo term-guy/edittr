@@ -154,6 +154,17 @@ impl Tour {
         if name == "git-graph" && app.graph_sel.is_none() {
             app.load_graph_detail(1);
         }
+        if name == "search-in-files" && self.frames == 5 {
+            for pressed in [true, false] {
+                self.inject.push(egui::Event::Key {
+                    key: Key::F,
+                    physical_key: None,
+                    pressed,
+                    repeat: false,
+                    modifiers: Modifiers::COMMAND | Modifiers::SHIFT,
+                });
+            }
+        }
         if name == "lsp-hover" && self.frames == 20 {
             if let Some(r) = app.last_caret {
                 self.inject.push(egui::Event::PointerMoved(r.center() + egui::vec2(4.0, 0.0)));
@@ -225,14 +236,20 @@ impl Tour {
                 }
             }
             "search-in-files" => {
-                self.key(Key::Escape);
+                // Select a word in the editor; a real Ctrl/Cmd+Shift+F follows (see tick):
+                // it must search all files for the selection, not open Find in file.
+                // (No Escape here: the editor would clear the selection with it.)
                 app.quick_open = None;
-                app.show_search();
-                app.search.opts.query = "lane".into();
                 app.search.opts.include = "*.rs".into();
                 app.search.show_filters = true;
                 app.ignored = vec!["target".into()];
-                app.start_search(ctx);
+                if let Some(Tab::File(d)) = app.tabs.get_mut(app.active)
+                    && let Some(b) = d.text.find("lane_color").or_else(|| d.text.find("add"))
+                {
+                    let start = d.text[..b].chars().count();
+                    let word = if d.text[b..].starts_with("lane_color") { 10 } else { 3 };
+                    d.goto = Some((start, start + word));
+                }
             }
             "folding" => {
                 // Fold `pub struct Row {` and `const PALETTE` (0-based lines 5 and 18).

@@ -197,6 +197,19 @@ pub(crate) const COMMANDS: &[Entry] = &[
     ),
 ];
 
+/// Commands in the order their shortcuts are tried: most modifiers first. egui also
+/// matches a shortcut when Shift or Alt is held in addition, so Ctrl+F would otherwise
+/// take Ctrl+Shift+F (Search in files) and Ctrl+Alt+F (Replace).
+pub(crate) fn dispatch_order() -> &'static [&'static Entry] {
+    static ORDER: std::sync::OnceLock<Vec<&'static Entry>> = std::sync::OnceLock::new();
+    ORDER.get_or_init(|| {
+        let count = |m: Modifiers| [m.alt, m.shift, m.command || m.ctrl || m.mac_cmd].iter().filter(|b| **b).count();
+        let mut order: Vec<&Entry> = COMMANDS.iter().collect();
+        order.sort_by_key(|e| std::cmp::Reverse(e.shortcuts.iter().map(|s| count(s.modifiers)).max().unwrap_or(0)));
+        order
+    })
+}
+
 pub(crate) fn entry(id: Command) -> &'static Entry {
     COMMANDS.iter().find(|entry| entry.id == id).expect("command is registered")
 }
@@ -204,6 +217,25 @@ pub(crate) fn entry(id: Command) -> &'static Entry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn more_specific_shortcuts_win() {
+        let first = |modifiers: Modifiers, key: Key| {
+            dispatch_order()
+                .iter()
+                .find(|e| e.shortcuts.iter().any(|s| s.logical_key == key && modifiers.matches_logically(s.modifiers)))
+                .map(|e| e.id)
+        };
+        assert!(first(CMD_SHIFT, Key::F) == Some(FindInFiles));
+        assert!(first(CMD.plus(Modifiers::ALT), Key::F) == Some(Replace));
+        assert!(first(CMD, Key::F) == Some(Find));
+        assert!(first(CMD_SHIFT, Key::P) == Some(Palette));
+        assert!(first(CMD, Key::P) == Some(QuickOpen));
+        assert!(first(CMD_SHIFT, Key::O) == Some(DocumentSymbols));
+        assert!(first(Modifiers::SHIFT, Key::F12) == Some(FindReferences));
+        assert!(first(Modifiers::NONE, Key::F12) == Some(GoToDefinition));
+        assert!(first(Modifiers::SHIFT.plus(Modifiers::ALT), Key::F) == Some(FormatDocument));
+    }
 
     #[test]
     fn switch_source_header_consumes_text_generated_by_the_shortcut() {
