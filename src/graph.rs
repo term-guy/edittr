@@ -135,6 +135,9 @@ impl Graph {
         let lane_w = 14.0;
         let graph_w = lane_w * self.lanes.min(24) as f32 + 6.0;
         let mut clicked = None;
+        // Rows touch (no item spacing), so the lanes drawn in each row join into
+        // continuous lines. show_rows reads the spacing from this ui as well.
+        ui.spacing_mut().item_spacing.y = 0.0;
         egui::ScrollArea::both()
             .auto_shrink([false, false])
             .show_rows(ui, row_h, self.commits.len(), |ui, range| {
