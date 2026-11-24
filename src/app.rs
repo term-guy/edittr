@@ -3553,45 +3553,77 @@ fn walk_files(root: &Path, limit: usize, ignored: &[String]) -> Vec<String> {
     out
 }
 
-/// Subsequence fuzzy match, scored to favour matches in the file name and contiguous runs.
-/// Indices of the best `limit` matches of `query` (subsequence, case-insensitive)
-/// among `lower` (lowercased paths), best first; favours file-name and contiguous hits.
+/// Fuzzy subsequence score of `q` in `text` (greedy, from the left): contiguous runs
+/// and matches in the file name (from `name_start`) score higher. `None` if no match.
+/// Works on bytes: `q` is UTF-8 too, so a byte subsequence is a char subsequence.
+fn subsequence_score(text: &[u8], q: &[u8], name_start: usize) -> Option<i32> {
+    let (mut qi, mut score, mut prev) = (0, 0, usize::MAX - 1);
+    for (i, &b) in text.iter().enumerate() {
+        if b == q[qi] {
+            score += if i == prev + 1 { 5 } else { 1 };
+            if i >= name_start {
+                score += 3;
+            }
+            prev = i;
+            qi += 1;
+            if qi == q.len() {
+                return Some(score);
+            }
+        }
+    }
+    None
+}
+
+/// Indices of the best `limit` matches of `query` (case-insensitive) among `lower`
+/// (lowercased paths), best first. Closer matches always win: the exact file name,
+/// then a path ending in the query, a file name starting with it, a file name or path
+/// containing it, and last any subsequence (preferring ones within the file name).
+/// Within a tier, shorter names and paths come first.
 fn fuzzy_filter(lower: &[String], query: &str, limit: usize) -> Vec<usize> {
-    let q: Vec<char> = query.to_lowercase().chars().filter(|c| !c.is_whitespace()).collect();
+    let q_str: String = query.to_lowercase().chars().filter(|c| !c.is_whitespace()).collect();
+    let q = q_str.as_bytes();
     if q.is_empty() {
         return (0..lower.len().min(limit)).collect();
     }
-    let mut scored: Vec<(i32, usize)> = lower
+    let has_slash = q_str.contains('/');
+    let mut scored: Vec<(u8, i64, usize)> = lower
         .iter()
         .enumerate()
         .filter_map(|(idx, f)| {
-            let name_start = f.rfind('/').map(|i| i + 1).unwrap_or(0);
-            let mut qi = 0;
-            let mut score = 0;
-            let mut prev = usize::MAX - 1;
-            for (i, ch) in f.char_indices() {
-                if ch == q[qi] {
-                    score += if i == prev + 1 { 5 } else { 1 };
-                    if i >= name_start {
-                        score += 3;
-                    }
-                    prev = i;
-                    qi += 1;
-                    if qi == q.len() {
-                        return Some((score * 100 - f.len() as i32, idx));
-                    }
-                }
-            }
-            None
+            // Cheapest test first: most paths don't match at all.
+            let path_score = subsequence_score(f.as_bytes(), q, usize::MAX)?;
+            let name_start = f.rfind('/').map_or(0, |i| i + 1);
+            let name = &f[name_start..];
+            let (len, name_len) = (f.len() as i64, name.len() as i64);
+            let ends_at_boundary = f.ends_with(q_str.as_str())
+                && (f.len() == q_str.len() || q_str.starts_with('/') || f.as_bytes()[f.len() - q_str.len() - 1] == b'/');
+            let (tier, sub) = if name == q_str {
+                (7, -len)
+            } else if has_slash && ends_at_boundary {
+                (6, -len)
+            } else if name.starts_with(q_str.as_str()) {
+                (5, -(name_len * 4096 + len))
+            } else if let Some(pos) = name.find(q_str.as_str()) {
+                (4, -((pos as i64) * 65_536 + name_len * 256 + len))
+            } else if let Some(pos) = f.find(q_str.as_str()) {
+                (3, -((len - pos as i64) * 4096 + len))
+            } else if let Some(score) = subsequence_score(name.as_bytes(), q, 0) {
+                (2, i64::from(score) * 4096 - name_len * 16 - len)
+            } else {
+                // Rescore with the file-name bonus only for the paths that matched.
+                let score = subsequence_score(f.as_bytes(), q, name_start).unwrap_or(path_score);
+                (1, i64::from(score) * 4096 - len)
+            };
+            Some((tier, sub, idx))
         })
         .collect();
-    let key = |&(score, idx): &(i32, usize)| (std::cmp::Reverse(score), idx);
+    let key = |&(tier, sub, idx): &(u8, i64, usize)| (std::cmp::Reverse(tier), std::cmp::Reverse(sub), idx);
     if scored.len() > limit {
         scored.select_nth_unstable_by_key(limit, key);
         scored.truncate(limit);
     }
     scored.sort_unstable_by_key(key);
-    scored.into_iter().map(|(_, idx)| idx).collect()
+    scored.into_iter().map(|(.., idx)| idx).collect()
 }
 
 #[cfg(test)]
@@ -3611,6 +3643,37 @@ mod tests {
         assert!(fuzzy_filter(&files, "zzz", 10).is_empty());
         assert_eq!(fuzzy_filter(&files, "", 2), vec![0, 1]);
         assert_eq!(fuzzy_filter(&files, "  ", 2), vec![0, 1]);
+
+        // The closest match wins over longer names that also match.
+        let files: Vec<String> = [
+            "src/mainsjs.c",
+            "test/main.c.test",
+            "lib/domain.c",
+            "very/deep/path/to/main.c",
+            "src/main.c",
+            "src/maintenance.c",
+            "docs/main_c_notes.md",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let order: Vec<&str> = fuzzy_filter(&files, "main.c", 10).into_iter().map(|i| files[i].as_str()).collect();
+        // main_c_notes.md has no "." before a "c", so it isn't a match at all.
+        assert_eq!(
+            order,
+            [
+                "src/main.c",
+                "very/deep/path/to/main.c",
+                "test/main.c.test",
+                "lib/domain.c",
+                "src/mainsjs.c",
+                "src/maintenance.c"
+            ]
+        );
+        // A folder in the query matches the path's end; partial names still work.
+        assert_eq!(files[fuzzy_filter(&files, "to/main.c", 10)[0]], "very/deep/path/to/main.c");
+        assert_eq!(files[fuzzy_filter(&files, "Main", 10)[0]], "src/main.c");
+        assert_eq!(files[fuzzy_filter(&files, "mjs", 10)[0]], "src/mainsjs.c");
 
         let many: Vec<String> = (0..100_000).map(|i| format!("crates/module{}/src/file_{i}.rs", i % 97)).collect();
         let t = std::time::Instant::now();
