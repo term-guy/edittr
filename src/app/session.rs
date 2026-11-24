@@ -13,6 +13,8 @@ pub(super) struct Sessions {
     loading: Option<Receiver<LoadedWorkspace>>,
     workspace: Debounce<Workspace>,
     saved_filters: SearchFilters,
+    /// The next restore is "close folder": show the empty start page.
+    start_page: bool,
     pending_filters: Option<(SearchFilters, Instant)>,
     window: Window,
     saved_window: Debounce<Window>,
@@ -94,6 +96,7 @@ impl Sessions {
             loading: None,
             workspace: Debounce::new(Some(Workspace::default())),
             saved_filters: SearchFilters::default(),
+            start_page: false,
             pending_filters: None,
             saved_window: Debounce::new(Some(window.clone())),
             window,
@@ -135,6 +138,25 @@ impl App {
         }
     }
 
+    /// Close the folder (and its tabs, which its session keeps) and show the start page.
+    pub(super) fn close_folder(&mut self, force: bool) {
+        if self.root.is_none() {
+            return;
+        }
+        if !force && self.tabs.iter().any(|tab| matches!(tab, Tab::File(doc) if doc.dirty())) {
+            self.confirm = Some(Confirm::CloseFolder);
+            return;
+        }
+        if crate::session::enabled() {
+            self.sessions.start_page = true;
+            self.restore_workspace(None, None);
+        } else {
+            self.tabs.clear();
+            self.active = 0;
+            self.clear_project();
+        }
+    }
+
     pub(super) fn restore_workspace(&mut self, root: Option<PathBuf>, file: Option<PathBuf>) {
         // Queue the outgoing snapshot before reading the incoming one. The barrier
         // also covers a quick return to a workspace whose last save is still queued.
@@ -160,7 +182,12 @@ impl App {
     }
 
     pub(super) fn poll_session_restore(&mut self) -> bool {
-        if let Some(loaded) = receive(&mut self.sessions.loading) {
+        if let Some(mut loaded) = receive(&mut self.sessions.loading) {
+            if std::mem::take(&mut self.sessions.start_page) {
+                // Closing a folder lands on an empty start page, not the no-folder session's files.
+                loaded.tabs.clear();
+                loaded.active = None;
+            }
             self.tabs.clear();
             self.active = 0;
             if let Some(root) = loaded.root {

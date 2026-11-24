@@ -214,6 +214,19 @@ impl App {
         if self.search_replace.confirming() {
             return;
         }
+        // Mouse back / forward buttons.
+        let (back, forward) = ctx.input(|i| {
+            (
+                i.pointer.button_pressed(egui::PointerButton::Extra1),
+                i.pointer.button_pressed(egui::PointerButton::Extra2),
+            )
+        });
+        if back {
+            self.run_command(Command::GoBack);
+        }
+        if forward {
+            self.run_command(Command::GoForward);
+        }
         for command in commands::dispatch_order().iter().filter(|c| c.id != Command::Commit) {
             if command.id == Command::SwitchSourceHeader && !ctx.input(|input| input.key_pressed(Key::O) && self.can_switch_source_header())
             {
@@ -230,6 +243,7 @@ impl App {
             Command::Palette | Command::DocumentSymbols | Command::WorkspaceSymbols => self.start_picker(cmd),
             Command::SwitchSourceHeader => self.switch_source_header(),
             Command::OpenFolder => self.request_open_folder(),
+            Command::CloseFolder => self.close_folder(false),
             Command::QuickOpen => self.start_quick_open(),
             Command::Find => self.show_find(false),
             Command::Replace => self.show_find(true),
@@ -250,6 +264,7 @@ impl App {
                 }
             }
             Command::GoBack => self.go_back(),
+            Command::GoForward => self.go_forward(),
             Command::FindReferences => self.find_references(),
             Command::Explorer => {
                 self.side = Side::Explorer;
@@ -442,8 +457,9 @@ impl App {
                 && doc.id == id
                 && doc.version == version
             {
-                self.nav_back.push((doc.path.clone(), doc.cursor));
+                let from = (doc.path.clone(), doc.cursor);
                 doc.goto = Some(symbols::selection(&doc.text, symbol.line, symbol.cols));
+                self.push_nav(from);
             } else {
                 self.message = "File changed while finding symbols".into();
             }
@@ -456,7 +472,7 @@ impl App {
             if let Some(from) = from
                 && matches!(self.tabs.get(self.active), Some(Tab::File(doc)) if doc.path == symbol.path)
             {
-                self.nav_back.push(from);
+                self.push_nav(from);
             }
         }
     }

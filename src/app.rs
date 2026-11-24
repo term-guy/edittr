@@ -272,6 +272,8 @@ struct QuickOpen {
 enum Confirm {
     CloseTabs(Vec<usize>),
     SwitchWorkspace(PathBuf),
+    /// Close the folder and go back to the start page.
+    CloseFolder,
     Discard(FileChange),
     /// Discard every change under a folder (path, the changes).
     DiscardFolder(String, Vec<FileChange>),
@@ -373,6 +375,8 @@ pub struct App {
     goto_rx: Option<Receiver<goto::Outcome>>,
     /// Where we jumped from, for "go back".
     nav_back: Vec<(PathBuf, usize)>,
+    /// Positions left with Go back, for Go forward (cleared by a new jump).
+    nav_forward: Vec<(PathBuf, usize)>,
     install: Option<InstallJob>,
     install_prompt: Option<&'static str>,
     install_declined: HashSet<&'static str>,
@@ -462,6 +466,7 @@ impl App {
             c_flags: c_flags::CFlags::default(),
             goto_rx: None,
             nav_back: Vec::new(),
+            nav_forward: Vec::new(),
             install: None,
             install_prompt: None,
             install_declined: HashSet::new(),
@@ -495,6 +500,7 @@ impl App {
         self.reset_lsp();
         self.goto_rx = None;
         self.nav_back.clear();
+        self.nav_forward.clear();
         self.last_poll = Instant::now();
         self.pending_changes.rediscover = true;
         self.refresh_vcs();
@@ -764,11 +770,11 @@ impl App {
         }
         let Ok(rel) = doc.path.strip_prefix(&repo) else { return };
         let rel = rel.to_string_lossy().replace('\\', "/");
-        let (text, version, ctx) = (doc.text.clone(), doc.version, ctx.clone());
+        let (text, version, ctx, crlf) = (doc.text.clone(), doc.version, ctx.clone(), doc.crlf);
         let (tx, rx) = channel();
         std::thread::spawn(move || {
             let res = match vcs {
-                Vcs::Git => blame::git(&repo, &rel, &text),
+                Vcs::Git => blame::git_with_endings(&repo, &rel, &text, crlf),
                 Vcs::Svn => vcs::blame(vcs, &repo, &rel).map(|lines| blame::from_svn(&lines)),
             };
             let _ = tx.send((version, res));
@@ -1279,7 +1285,7 @@ impl App {
             ctx.request_repaint();
         });
         self.goto_rx = Some(rx);
-        self.nav_back.push((path, from));
+        self.push_nav((path, from));
         self.message = format!("Finding definition of `{word}`…");
     }
 
@@ -1313,8 +1319,36 @@ impl App {
         }
     }
 
+    /// Record where a jump starts, for Go back; a new jump ends the forward history.
+    pub(super) fn push_nav(&mut self, from: (PathBuf, usize)) {
+        self.nav_back.push(from);
+        self.nav_forward.clear();
+    }
+
+    fn here(&self) -> Option<(PathBuf, usize)> {
+        match self.tabs.get(self.active) {
+            Some(Tab::File(d)) => Some((d.path.clone(), d.cursor)),
+            _ => None,
+        }
+    }
+
     fn go_back(&mut self) {
-        let Some((path, idx)) = self.nav_back.pop() else { return };
+        let Some(to) = self.nav_back.pop() else { return };
+        if let Some(here) = self.here() {
+            self.nav_forward.push(here);
+        }
+        self.go_to(to);
+    }
+
+    fn go_forward(&mut self) {
+        let Some(to) = self.nav_forward.pop() else { return };
+        if let Some(here) = self.here() {
+            self.nav_back.push(here);
+        }
+        self.go_to(to);
+    }
+
+    fn go_to(&mut self, (path, idx): (PathBuf, usize)) {
         self.open_file(&path);
         if let Some(Tab::File(d)) = self.tabs.get_mut(self.active)
             && d.path == path
@@ -1818,6 +1852,12 @@ impl App {
         ui.horizontal(|ui| {
             ui.label(RichText::new(dir_name(&root).to_uppercase()).small().strong());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if icon_button(ui, ic::X)
+                    .on_hover_text("Close folder (back to the start page)")
+                    .clicked()
+                {
+                    self.close_folder(false);
+                }
                 if icon_button(ui, ic::ARROWS_CLOCKWISE).on_hover_text("Refresh").clicked() {
                     self.invalidate_tree(|_| true);
                     self.refresh_vcs();
@@ -2806,6 +2846,7 @@ impl App {
                     }
                 }
                 Confirm::SwitchWorkspace(_) => "Discard unsaved changes and open the folder?".into(),
+                Confirm::CloseFolder => "Discard unsaved changes and close the folder?".into(),
                 Confirm::Discard(f) => format!("Discard all changes to {}?\nThis cannot be undone.", f.path),
                 Confirm::DiscardFolder(path, changes) => {
                     let new = changes.iter().filter(|c| c.code == '?').count();
@@ -2833,7 +2874,11 @@ impl App {
             let button = match c {
                 Confirm::StageFolder(_, _, true) => "Stage",
                 Confirm::StageFolder(_, _, false) => "Unstage",
-                Confirm::CloseTabs(_) | Confirm::SwitchWorkspace(_) | Confirm::Discard(_) | Confirm::DiscardFolder(..) => "Discard",
+                Confirm::CloseTabs(_)
+                | Confirm::SwitchWorkspace(_)
+                | Confirm::CloseFolder
+                | Confirm::Discard(_)
+                | Confirm::DiscardFolder(..) => "Discard",
             };
             let mut answer = None;
             egui::Modal::new(egui::Id::unique("confirm")).show(ctx, |ui| {
@@ -2853,6 +2898,7 @@ impl App {
                     match c {
                         Confirm::CloseTabs(idx) => self.close_tabs(idx, true),
                         Confirm::SwitchWorkspace(root) => self.restore_workspace(Some(root), None),
+                        Confirm::CloseFolder => self.close_folder(true),
                         Confirm::Discard(f) => {
                             if let Some(repo) = &self.repo {
                                 let path = repo.join(&f.path);

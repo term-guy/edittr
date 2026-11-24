@@ -5,6 +5,7 @@ use eframe::egui::{self, Key, KeyboardShortcut, ModifierNames, Modifiers};
 pub(crate) enum Command {
     Palette,
     OpenFolder,
+    CloseFolder,
     QuickOpen,
     Find,
     Replace,
@@ -15,6 +16,7 @@ pub(crate) enum Command {
     GoToDefinition,
     FindReferences,
     GoBack,
+    GoForward,
     Explorer,
     ToggleSidebar,
     SourceControl,
@@ -122,8 +124,12 @@ const CMD: Modifiers = Modifiers::COMMAND;
 const CMD_SHIFT: Modifiers = CMD.plus(Modifiers::SHIFT);
 #[cfg(target_os = "macos")]
 const GO_BACK: KeyboardShortcut = KeyboardShortcut::new(Modifiers::CTRL, Key::Minus);
+#[cfg(target_os = "macos")]
+const GO_FORWARD: KeyboardShortcut = KeyboardShortcut::new(Modifiers::CTRL.plus(Modifiers::SHIFT), Key::Minus);
 #[cfg(not(target_os = "macos"))]
 const GO_BACK: KeyboardShortcut = KeyboardShortcut::new(Modifiers::ALT, Key::ArrowLeft);
+#[cfg(not(target_os = "macos"))]
+const GO_FORWARD: KeyboardShortcut = KeyboardShortcut::new(Modifiers::ALT, Key::ArrowRight);
 
 use Command::*;
 
@@ -137,6 +143,7 @@ pub(crate) const COMMANDS: &[Entry] = &[
         ],
     ),
     Entry::new(OpenFolder, "Open folder", &[]),
+    Entry::new(CloseFolder, "Close folder (back to the start page)", &[]),
     Entry::new(QuickOpen, "Go to file", &[KeyboardShortcut::new(CMD, Key::P)]),
     Entry::new(Find, "Find in file", &[KeyboardShortcut::new(CMD, Key::F)]),
     Entry::new(
@@ -167,6 +174,7 @@ pub(crate) const COMMANDS: &[Entry] = &[
         &[KeyboardShortcut::new(Modifiers::ALT, Key::O)],
     ),
     Entry::new(GoBack, "Go back", &[GO_BACK]),
+    Entry::new(GoForward, "Go forward", &[GO_FORWARD]),
     Entry::new(Explorer, "Show Explorer", &[]),
     Entry::new(ToggleSidebar, "Toggle sidebar", &[]),
     Entry::new(SourceControl, "Show source control", &[]),
@@ -247,6 +255,16 @@ mod tests {
         assert!(first(Modifiers::SHIFT, Key::F12) == Some(FindReferences));
         assert!(first(Modifiers::NONE, Key::F12) == Some(GoToDefinition));
         assert!(first(Modifiers::SHIFT.plus(Modifiers::ALT), Key::F) == Some(FormatDocument));
+        #[cfg(target_os = "macos")]
+        {
+            assert!(first(Modifiers::CTRL.plus(Modifiers::SHIFT), Key::Minus) == Some(GoForward));
+            assert!(first(Modifiers::CTRL, Key::Minus) == Some(GoBack));
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert!(first(Modifiers::ALT, Key::ArrowRight) == Some(GoForward));
+            assert!(first(Modifiers::ALT, Key::ArrowLeft) == Some(GoBack));
+        }
     }
 
     #[test]
