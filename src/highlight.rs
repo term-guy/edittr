@@ -165,12 +165,29 @@ fn syntax(lang: &str) -> Option<&'static SyntaxReference> {
         })
 }
 
+/// Lines above this are freed on a background thread: each keeps the parser state at
+/// its start, and freeing ~20k of them took ~60 ms on the UI thread (on a theme switch
+/// or when closing the tab).
+const BACKGROUND_DROP_LINES: usize = 2000;
+
+fn drop_in_background(lines: Vec<Line>) {
+    if lines.len() > BACKGROUND_DROP_LINES {
+        std::thread::spawn(move || drop(lines));
+    }
+}
+
+impl Drop for Cache {
+    fn drop(&mut self) {
+        drop_in_background(std::mem::take(&mut self.lines));
+    }
+}
+
 impl Cache {
     /// Start or collect the background first pass; false while it runs.
     fn ensure(&mut self, ctx: &egui::Context, version: u64, text: &str, syntax: &'static SyntaxReference, dark: bool) -> bool {
         let key = (syntax.name.as_str(), dark);
         if self.key.as_ref() != Some(&key) {
-            self.lines.clear();
+            drop_in_background(std::mem::take(&mut self.lines));
             self.version = None;
             self.pending = None;
             self.key = Some(key);
@@ -193,7 +210,7 @@ impl Cache {
                 let mut c = Cache::default();
                 c.update(&text, syntax, dark);
                 mark_warmed(&syntax.name);
-                let _ = tx.send((c.lines, c.categories));
+                let _ = tx.send((std::mem::take(&mut c.lines), std::mem::take(&mut c.categories)));
                 ctx.request_repaint();
             });
             self.pending = Some(Pending { version, result: rx });
