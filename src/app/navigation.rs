@@ -245,6 +245,8 @@ impl App {
             Command::OpenFolder => self.request_open_folder(false),
             Command::OpenFolderInNewWindow => self.request_open_folder(true),
             Command::NewWindow => self.new_window(None),
+            Command::NewFile => self.request_new_entry(None, false),
+            Command::NewFolder => self.request_new_entry(None, true),
             Command::CloseFolder => self.close_folder(false),
             Command::QuickOpen => self.start_quick_open(),
             Command::GoToLine => self.open_goto_line(),

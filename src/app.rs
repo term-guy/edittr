@@ -15,6 +15,7 @@ mod hex_view;
 mod lsp_edit;
 mod markdown_preview;
 mod navigation;
+mod new_file;
 mod outline;
 mod problems;
 mod search_replace;
@@ -428,6 +429,9 @@ pub struct App {
     open_folder_requested: bool,
     /// The requested folder opens in a new window instead of this one.
     open_folder_in_new_window: bool,
+    new_entry: Option<new_file::NewEntry>,
+    /// New file with no folder open: ask where to save it (needs the frame, see `new_file_without_folder`).
+    new_file_save_dialog: bool,
     open_folder: Option<String>,
     search: SearchState,
     find: find::Find,
@@ -533,6 +537,8 @@ impl App {
             confirm: None,
             open_folder_requested: false,
             open_folder_in_new_window: false,
+            new_entry: None,
+            new_file_save_dialog: false,
             open_folder: None,
             search: SearchState::default(),
             lsp: problems::LanguageServers::default(),
@@ -2073,6 +2079,16 @@ impl App {
                     self.invalidate_tree(|_| true);
                     self.refresh_vcs();
                 }
+                if icon_button(ui, ic::FOLDER_PLUS).on_hover_text("New folder").clicked() {
+                    self.run_command(Command::NewFolder);
+                }
+                let new_file = commands::entry(Command::NewFile);
+                if icon_button(ui, ic::FILE_PLUS)
+                    .on_hover_text(format!("{} ({})", new_file.title, new_file.shortcut_text(ui.ctx())))
+                    .clicked()
+                {
+                    self.run_command(Command::NewFile);
+                }
             });
         });
         ui.separator();
@@ -2114,6 +2130,12 @@ impl App {
                 .clicked()
             {
                 self.request_open_folder(false);
+            }
+            if ui
+                .add(egui::Button::new(format!("{} New File…", ic::FILE_PLUS)).min_size(egui::vec2(220.0, 30.0)))
+                .clicked()
+            {
+                self.run_command(Command::NewFile);
             }
             if ui
                 .add(egui::Button::new(format!("{} New Window", ic::APP_WINDOW)).min_size(egui::vec2(220.0, 30.0)))
@@ -2258,6 +2280,15 @@ impl App {
                         }
                     }
                     row.context_menu(|ui| {
+                        if ui.button(format!("{} New File…", ic::FILE_PLUS)).clicked() {
+                            self.request_new_entry(Some(path.clone()), false);
+                            ui.close();
+                        }
+                        if ui.button(format!("{} New Folder…", ic::FOLDER_PLUS)).clicked() {
+                            self.request_new_entry(Some(path.clone()), true);
+                            ui.close();
+                        }
+                        ui.separator();
                         self.file_history_menu(ui, &path, false);
                         if let Some(rel) = self.root.as_deref().and_then(|root| workspace::relative_path(root, &path)) {
                             let enabled = workspace::valid_folder(&rel) && !workspace::is_ignored(&rel, &self.ignored);
@@ -3057,6 +3088,7 @@ impl App {
 
     fn dialogs(&mut self, ctx: &egui::Context) {
         self.goto_line_dialog(ctx);
+        self.new_entry_dialog(ctx);
         self.lsp_edit_ui(ctx);
         self.graph_dialog(ctx);
         self.c_flags_dialogs(ctx);
@@ -3352,6 +3384,7 @@ impl eframe::App for App {
         self.call_hierarchy_panel(ui);
         egui::CentralPanel::default().show(ui, |ui| self.central(ui));
         self.open_requested_folder(frame);
+        self.new_file_without_folder(frame);
         self.dialogs(&ctx);
         self.sync_active_document();
         self.refresh_outline();
