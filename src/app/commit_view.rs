@@ -172,7 +172,7 @@ impl CommitView {
         }
     }
 
-    pub(super) fn show(&mut self, ui: &mut egui::Ui, commit: &Commit, root: &Path, vcs: Vcs) {
+    pub(super) fn show(&mut self, ui: &mut egui::Ui, commit: &Commit, root: &Path, vcs: Vcs, palette: &crate::theme::Palette) {
         if self.hash != commit.hash {
             self.clear_selection();
             self.hash.clone_from(&commit.hash);
@@ -222,10 +222,10 @@ impl CommitView {
             .size_range(100.0..=(ui.available_width() * 0.55).max(100.0))
             .show(ui, |ui| files.tree(ui, &self.hash));
 
-        egui::CentralPanel::no_frame().show(ui, |ui| self.show_diff(ui, commit, root));
+        egui::CentralPanel::no_frame().show(ui, |ui| self.show_diff(ui, commit, root, palette));
     }
 
-    fn show_diff(&mut self, ui: &mut egui::Ui, commit: &Commit, root: &Path) {
+    fn show_diff(&mut self, ui: &mut egui::Ui, commit: &Commit, root: &Path, palette: &crate::theme::Palette) {
         let Some(Ok(files)) = &self.files else { return };
         let Some(index) = files.selected else { return };
         let change = &files.changes[index];
@@ -258,7 +258,7 @@ impl CommitView {
                         if self.inline {
                             diff_view(ui, &diff.lines, "commit_patch");
                         } else {
-                            side_by_side_view(ui, diff);
+                            side_by_side_view(ui, diff, palette);
                         }
                     });
                 }
@@ -477,7 +477,7 @@ pub(super) mod tests {
                     screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 260.0))),
                     ..Default::default()
                 },
-                |ui| detail.show(ui, &commit, Path::new("."), Vcs::Git),
+                |ui| detail.show(ui, &commit, Path::new("."), Vcs::Git, &crate::theme::Palette::defaults(true)),
             );
             frame.textures_delta.clear();
             let labels: Vec<_> = frame

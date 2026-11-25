@@ -40,7 +40,7 @@ pub fn warm_up(ctx: egui::Context) {
 }
 
 fn theme(dark: bool) -> &'static Theme {
-    // Same themes as egui_extras' CodeTheme defaults.
+    // The syntect themes egui_extras' CodeTheme used (the edittr Dark / Light presets keep their colors).
     &assets().themes.themes[if dark { "base16-mocha.dark" } else { "Solarized (light)" }]
 }
 
@@ -163,6 +163,28 @@ fn syntax(lang: &str) -> Option<&'static SyntaxReference> {
             }
             _ => None,
         })
+}
+
+/// Highlights one line on its own (no state from the lines before it), for diff rows.
+/// None until the grammars have loaded in the background, or when `lang` has none.
+pub fn line_spans(line: &str, lang: &str, dark: bool) -> Option<Vec<Span>> {
+    ASSETS.get()?;
+    let syntax = syntax(lang)?;
+    let highlighter = Highlighter::new(theme(dark));
+    let caps = matches!(
+        syntax.name.as_str(),
+        "C" | "C++" | "Objective-C" | "Objective-C++" | "Rust" | "Python" | "JavaScript" | "Go" | "Java" | "C#"
+    );
+    let mut state = (ParseState::new(syntax), HighlightState::new(&highlighter, ScopeStack::new()));
+    // The grammars expect each line to end with a newline.
+    let text = format!("{line}\n");
+    let constant_color = Palette::defaults(dark).color(Part::Constant);
+    let (mut spans, _) = highlight_line(&text, &mut state, &highlighter, caps, constant_color, &mut ScopeCache::new());
+    spans.retain_mut(|span| {
+        span.range.end = span.range.end.min(line.len());
+        span.range.start < span.range.end
+    });
+    Some(spans)
 }
 
 /// Lines above this are freed on a background thread, a batch at a time: each keeps the
@@ -863,6 +885,26 @@ mod tests {
             c.update(t, syntax(lang).unwrap(), true);
         }
         c.lines.iter().map(|l| l.spans.clone()).collect()
+    }
+
+    #[test]
+    fn single_lines_highlight_without_context() {
+        ASSETS.get_or_init(|| Assets {
+            syntaxes: SyntaxSet::load_defaults_newlines(),
+            themes: ThemeSet::load_defaults(),
+            scopes: Scopes::new(),
+        });
+        let line = "let s = \"text\"; // note";
+        let spans = line_spans(line, "rs", true).unwrap();
+        let part_at = |needle: &str| {
+            let at = line.find(needle).unwrap();
+            spans.iter().find(|s| s.range.contains(&at)).map(|s| s.part)
+        };
+        assert_eq!(part_at("let"), Some(Part::Keyword));
+        assert_eq!(part_at("text"), Some(Part::String));
+        assert_eq!(part_at("note"), Some(Part::Comment));
+        assert!(spans.iter().all(|s| s.range.end <= line.len()));
+        assert!(line_spans(line, "no-such-language", true).is_none());
     }
 
     #[test]

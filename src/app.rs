@@ -37,7 +37,6 @@ use crate::{blame, highlight};
 use crate::{editor, fonts};
 use crate::{goto, installer, lsp, symbols, workspace};
 use eframe::egui::{self, Color32, Key, Modifiers, RichText};
-use egui_extras::syntax_highlighting::{self, CodeTheme};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -224,6 +223,9 @@ struct DiffTab {
     /// Text selected in the side-by-side view (read-only): which side, and
     /// (row, char) anchor and head.
     sel: Option<SbsSelection>,
+    /// Syntax spans of side-by-side cells, per (row, left side), for `highlighted_dark`.
+    highlighted: HashMap<(usize, bool), Vec<highlight::Span>>,
+    highlighted_dark: bool,
 }
 
 #[derive(Clone)]
@@ -281,6 +283,8 @@ impl DiffTab {
             ignore_eol,
             only_line_endings,
             live: None,
+            highlighted: HashMap::new(),
+            highlighted_dark: false,
         }
     }
 }
@@ -2854,7 +2858,7 @@ impl App {
                     } else if d.inline {
                         diff_view(ui, &d.lines, "diff");
                     } else {
-                        side_by_side_view(ui, d);
+                        side_by_side_view(ui, d, self.settings.themes.active(ui.visuals().dark_mode));
                     }
                     self.refresh_diff();
                 }
@@ -2886,7 +2890,8 @@ impl App {
                             // The selection can outlive a shorter, reloaded history: never index blindly.
                             let commit = self.graph_sel.and_then(|row| graph.commits.get(row));
                             if let (Some(commit), Some(repo), Some(vcs)) = (commit, &self.repo, self.vcs) {
-                                self.graph_detail.show(ui, commit, repo, vcs);
+                                self.graph_detail
+                                    .show(ui, commit, repo, vcs, self.settings.themes.active(ui.visuals().dark_mode));
                             } else {
                                 ui.colored_label(secondary_text_color(ui.visuals()), "Select a commit to see its details.");
                             }
@@ -3870,7 +3875,7 @@ fn painter_sel(ui: &egui::Ui, clip: egui::Rect, origin: egui::Pos2, x0: f32, x1:
     ui.painter_at(clip).rect_filled(band, 0.0, color);
 }
 
-fn side_by_side_view(ui: &mut egui::Ui, d: &mut DiffTab) {
+fn side_by_side_view(ui: &mut egui::Ui, d: &mut DiffTab, palette: &crate::theme::Palette) {
     use crate::diff::Kind;
     use egui::text::CCursor;
     if let Some(note) = &d.sbs.note {
@@ -3890,7 +3895,11 @@ fn side_by_side_view(ui: &mut egui::Ui, d: &mut DiffTab) {
     );
     let empty_bg = ui.visuals().faint_bg_color;
     let weak = ui.visuals().weak_text_color();
-    let theme = CodeTheme::from_style(ui.style());
+    if d.highlighted_dark != dark {
+        d.highlighted.clear();
+        d.highlighted_dark = dark;
+    }
+    let plain = palette.color(crate::theme::Part::Foreground);
     let font = fonts::editor_font(ui.style());
     let row_h = ui.fonts_mut(|f| f.row_height(&font)) + 2.0;
     let gutter = ui.fonts_mut(|f| f.glyph_width(&font, '0')) * 6.0;
@@ -3951,11 +3960,31 @@ fn side_by_side_view(ui: &mut egui::Ui, d: &mut DiffTab) {
                     font.clone(),
                     weak,
                 );
-                let mut job = syntax_highlighting::highlight(ui.ctx(), ui.style(), &theme, &side.text, &d.lang);
+                // Highlighted once per cell, with the editor's grammars and colors (plain until they load).
+                let spans = match d.highlighted.entry((index, is_left)) {
+                    std::collections::hash_map::Entry::Occupied(e) => Some(&*e.into_mut()),
+                    std::collections::hash_map::Entry::Vacant(e) => highlight::line_spans(&side.text, &d.lang, dark).map(|s| &*e.insert(s)),
+                };
+                let mut job = egui::text::LayoutJob::default();
                 job.wrap.max_width = f32::INFINITY;
-                for section in &mut job.sections {
-                    section.format.font_id = font.clone();
+                let mut pos = 0;
+                let push = |job: &mut egui::text::LayoutJob, range: std::ops::Range<usize>, color: Color32, italics: bool| {
+                    if range.start < range.end {
+                        let format = egui::TextFormat {
+                            font_id: font.clone(),
+                            color,
+                            italics,
+                            ..Default::default()
+                        };
+                        job.append(&side.text[range], 0.0, format);
+                    }
+                };
+                for span in spans.into_iter().flatten() {
+                    push(&mut job, pos..span.range.start, plain, false);
+                    push(&mut job, span.range.clone(), span.color(palette), span.italics);
+                    pos = span.range.end;
                 }
+                push(&mut job, pos..side.text.len(), plain, false);
                 let galley = ui.fonts_mut(|f| f.layout_job(job));
                 widest = widest.max(galley.size().x);
                 let text_clip = egui::Rect::from_min_max(egui::pos2(half.left() + gutter, half.top()), half.max);
