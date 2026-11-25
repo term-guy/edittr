@@ -12,6 +12,7 @@ mod diff;
 mod editor;
 mod editorconfig;
 mod file_history;
+mod fonts;
 mod formatter;
 mod git;
 mod goto;

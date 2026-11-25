@@ -423,8 +423,16 @@ pub fn show(
     if st.sels.is_empty() {
         st.sels.push(Sel::caret(0));
     }
-    let font = egui::TextStyle::Monospace.resolve(ui.style());
-    let (row_h, char_w) = ui.fonts_mut(|f| (f.row_height(&font), f.glyph_width(&font, 'x')));
+    let font = crate::fonts::editor_font(ui.style());
+    let (row_h, char_w, line_char_w) = ui.fonts_mut(|f| {
+        let char_w = f.glyph_width(&font, 'x');
+        if matches!(font.family, egui::FontFamily::Name(_)) {
+            let digit_w = ('0'..='9').map(|c| f.glyph_width(&font, c)).fold(char_w, f32::max);
+            (f.row_height(&font), digit_w, digit_w.max(f.glyph_width(&font, 'W')))
+        } else {
+            (f.row_height(&font), char_w, char_w)
+        }
+    });
     let is_mac = ui.ctx().os() == egui::os::OperatingSystem::Mac;
     let focused = ui.memory(|m| m.has_focus(id));
     out.focused = focused;
@@ -500,7 +508,7 @@ pub fn show(
     let fold_w = 1.6 * char_w;
     let gutter_w = fold_w + (digits as f32 + 2.5) * char_w;
     let content = Vec2::new(
-        gutter_w + (ix.max_line_bytes as f32 + 8.0) * char_w + 200.0,
+        gutter_w + (ix.max_line_bytes as f32 + 8.0) * line_char_w + 200.0,
         // Let the last line scroll up to the middle of the view.
         (view.count() as f32) * row_h + ui.available_height() * 0.5,
     );
@@ -780,7 +788,7 @@ pub fn show(
         out.top_line = view.line(row) as f32 + rows.fract();
     }
     if mini_w > 0.0 {
-        minimap(ui, id, st, text, &ix, &view, spans, mini_rect, &scroll, row_h, palette);
+        minimap(ui, id, st, text, &ix, &view, spans, mini_rect, &scroll, row_h, font.size, palette);
     }
 
     // IME: report where the caret is, so the candidate window opens next to it.
@@ -832,12 +840,13 @@ fn minimap(
     rect: Rect,
     scroll: &egui::scroll_area::ScrollAreaOutput<Option<(usize, Pos2)>>,
     row_h: f32,
+    font_size: f32,
     palette: &Palette,
 ) {
-    const ROW: f32 = 2.0;
-    const CHAR: f32 = 1.0;
+    let char_width = font_size / f32::from(crate::settings::DEFAULT_FONT_SIZE);
+    let mini_row_height = 2.0 * char_width;
     let rows = view.count();
-    let capacity = ((rect.height() / ROW) as usize).max(1);
+    let capacity = ((rect.height() / mini_row_height) as usize).max(1);
     let vis_rows = scroll.inner_rect.height() / row_h;
     let offset_rows = scroll.state.clamped_offset().y / row_h;
     // Scroll the minimap proportionally when the file is longer than it can show.
@@ -853,7 +862,7 @@ fn minimap(
     let weak = palette.color(Part::Foreground).gamma_multiply(0.45);
     for (i, row) in (top_row..rows.min(top_row + capacity)).enumerate() {
         let l = view.line(row);
-        let y = rect.min.y + i as f32 * ROW;
+        let y = rect.min.y + i as f32 * mini_row_height;
         let lr = ix.line_range(text, l);
         let line = &text[lr];
         let draw = |range: Range<usize>, color: Color32| {
@@ -863,13 +872,13 @@ fn minimap(
             if body.is_empty() {
                 return;
             }
-            let x = rect.min.x + 4.0 + (range.start + lead) as f32 * CHAR;
+            let x = rect.min.x + 4.0 + (range.start + lead) as f32 * char_width;
             if x > rect.max.x {
                 return;
             }
-            let w = (body.len() as f32 * CHAR).min(rect.max.x - x);
+            let w = (body.len() as f32 * char_width).min(rect.max.x - x);
             painter.rect_filled(
-                Rect::from_min_size(Pos2::new(x, y), Vec2::new(w, ROW * 0.8)),
+                Rect::from_min_size(Pos2::new(x, y), Vec2::new(w, mini_row_height * 0.8)),
                 0.0,
                 color.gamma_multiply(0.7),
             );
@@ -884,8 +893,8 @@ fn minimap(
         }
     }
     // The visible part.
-    let vy = rect.min.y + (offset_rows - top) * ROW;
-    let vr = Rect::from_min_size(Pos2::new(rect.min.x, vy), Vec2::new(rect.width(), vis_rows * ROW));
+    let vy = rect.min.y + (offset_rows - top) * mini_row_height;
+    let vr = Rect::from_min_size(Pos2::new(rect.min.x, vy), Vec2::new(rect.width(), vis_rows * mini_row_height));
     // The visible part of the file: a clear band with an outline, readable on both themes.
     let band = palette.color(Part::Foreground);
     painter.rect_filled(vr, 0.0, band.gamma_multiply(0.16));
@@ -898,7 +907,7 @@ fn minimap(
     if ((st.minimap_drag && resp.dragged()) || resp.clicked())
         && let Some(p) = resp.interact_pointer_pos()
     {
-        let row = top + (p.y - rect.min.y) / ROW;
+        let row = top + (p.y - rect.min.y) / mini_row_height;
         st.scroll_to = Some((row - vis_rows / 2.0) * row_h);
         ui.ctx().request_repaint();
     }

@@ -188,7 +188,7 @@ impl App {
                 self.tabs.len() - 1
             }
         };
-        let settings = self.settings;
+        let settings = &self.settings;
         let dark = ui.visuals().dark_mode;
         let (Tab::Diff(d), Tab::File(doc)) = two_tabs(&mut self.tabs, active, file) else {
             return None;

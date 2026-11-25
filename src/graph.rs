@@ -146,7 +146,10 @@ impl Graph {
         selected: Option<usize>,
         mut menu: impl FnMut(&mut egui::Ui, &Commit, Option<&CommitRef>),
     ) -> Option<usize> {
-        let row_h = 22.0;
+        let font = egui::TextStyle::Body.resolve(ui.style());
+        let mut mono = egui::TextStyle::Monospace.resolve(ui.style());
+        mono.size *= 12.0 / 13.0;
+        let row_h = ui.fonts_mut(|f| f.row_height(&font).max(f.row_height(&mono) + 2.0)).max(22.0);
         let lane_w = 14.0;
         let graph_w = lane_w * self.lanes.min(24) as f32 + 6.0;
         let mut clicked = None;
@@ -158,7 +161,6 @@ impl Graph {
             .show_rows(ui, row_h, self.commits.len(), |ui, range| {
                 for r in range {
                     let c = &self.commits[r];
-                    let mono = egui::FontId::monospace(12.0);
                     // Branch labels take the color of their line in the graph.
                     let lane = lane_color(self.rows.get(r).map_or(0, |row| row.col));
                     let refs: Vec<_> = c
@@ -184,7 +186,6 @@ impl Graph {
                     let graph_rect = Rect::from_min_size(rect.min, Vec2::new(graph_w, row_h));
                     self.paint_row(&painter, graph_rect, r, lane_w);
 
-                    let font = egui::FontId::proportional(13.0);
                     let (text_col, secondary) = if is_selected {
                         let text = vis.selection.stroke.color;
                         // The selection foreground has less contrast to spare on the blue fill.
@@ -231,7 +232,7 @@ impl Graph {
                     );
                     let subj_clip = Rect::from_x_y_ranges(px..=right - 330.0, rect.y_range());
                     ui.painter_at(subj_clip)
-                        .text(Pos2::new(px, cy), egui::Align2::LEFT_CENTER, &c.subject, font, text_col);
+                        .text(Pos2::new(px, cy), egui::Align2::LEFT_CENTER, &c.subject, font.clone(), text_col);
 
                     if resp.clicked() {
                         clicked = Some(r);
