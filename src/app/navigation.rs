@@ -333,10 +333,14 @@ impl App {
             }
             Command::CloseTab => self.close_tab(self.active, false),
             Command::CloseAllTabs => self.close_tabs((0..self.tabs.len()).collect(), false),
-            Command::ToggleTheme => self.ctx.set_theme(match self.ctx.theme() {
-                egui::Theme::Dark => egui::Theme::Light,
-                egui::Theme::Light => egui::Theme::Dark,
-            }),
+            Command::ToggleTheme => {
+                let preference = match self.ctx.theme() {
+                    egui::Theme::Dark => egui::ThemePreference::Light,
+                    egui::Theme::Light => egui::ThemePreference::Dark,
+                };
+                self.set_theme_preference(preference);
+            }
+
             Command::TabSize(n) => self.set_tab_size(n),
             Command::ToggleSetting(setting) => {
                 let value = setting.value(&mut self.settings);

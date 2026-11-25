@@ -11,6 +11,7 @@ mod navigation_menu;
 pub(crate) mod sticky;
 
 use crate::highlight;
+use crate::theme::{Palette, Part};
 use buffer::{History, Kind, LineIndex, Sel};
 use eframe::egui::{self, Color32, Event, Key, Pos2, Rect, Sense, Stroke, Vec2, text::CCursor, text::LayoutJob};
 use std::collections::BTreeSet;
@@ -189,6 +190,7 @@ impl State {
 }
 
 pub struct Options<'a> {
+    pub palette: &'a Palette,
     pub lang: &'a str,
     pub highlight: bool,
     pub whitespace: bool,
@@ -224,9 +226,8 @@ pub struct Extras<'a> {
     pub line_bg: &'a [(usize, Color32)],
     /// Other uses of the symbol under the caret (byte ranges; `true`: written there).
     pub symbol_marks: &'a [(Range<usize>, bool)],
-    /// Colors from the language server's semantic tokens, per line: (byte range in
-    /// the line, color), sorted; they override the syntax colors.
-    pub semantic: &'a [Vec<(Range<usize>, Color32)>],
+    /// Sorted ranges and color roles from the language server, per line.
+    pub semantic: &'a [highlight::TokenLine],
 }
 
 #[derive(Default)]
@@ -272,11 +273,12 @@ fn line_job(
     ix: &LineIndex,
     l: usize,
     spans: Option<&[highlight::Line]>,
-    semantic: &[(Range<usize>, Color32)],
+    semantic: &[(Range<usize>, highlight::SemanticRole)],
     font: &egui::FontId,
-    color: Color32,
+    palette: &Palette,
     brackets: Option<Brackets>,
 ) -> LayoutJob {
+    let color = palette.color(Part::Foreground);
     let range = ix.line_range(text, l);
     let line = &text[range.clone()];
     let mut job = LayoutJob::default();
@@ -323,7 +325,7 @@ fn line_job(
     let spans = if semantic.is_empty() {
         spans
     } else {
-        merged = highlight::overlay(spans, semantic, line.len());
+        merged = highlight::overlay(spans, semantic, line.len(), palette);
         &merged[..]
     };
     let mut pos = 0;
@@ -335,7 +337,7 @@ fn line_job(
         if a > pos {
             push(&mut job, pos, a, egui::TextFormat::simple(font.clone(), color));
         }
-        let c = if s.color == Color32::PLACEHOLDER { color } else { s.color };
+        let c = s.color(palette);
         let fmt = egui::TextFormat {
             font_id: font.clone(),
             color: c,
@@ -361,9 +363,9 @@ struct Lines<'a> {
     ix: &'a LineIndex,
     spans: Option<&'a [highlight::Line]>,
     /// Semantic token colors per line (may be shorter than the file, or empty).
-    semantic: &'a [Vec<(Range<usize>, Color32)>],
+    semantic: &'a [highlight::TokenLine],
     font: egui::FontId,
-    color: Color32,
+    palette: &'a Palette,
     /// Depth at each line start + palette, when bracket colors are on.
     depth: Option<(&'a [u32], [Color32; 3])>,
 }
@@ -379,7 +381,9 @@ impl Lines<'_> {
             _ => None,
         };
         let semantic = self.semantic.get(l).map_or(&[][..], Vec::as_slice);
-        let job = line_job(self.text, self.ix, l, self.spans, semantic, &self.font, self.color, brackets);
+        let job = line_job(self.text, self.ix, l, self.spans, semantic, &self.font, self.palette, brackets);
+        // The layout cache hashes TextFormat, so palette changes invalidate affected galleys
+        // while syntax and semantic token ranges remain reusable.
         self.ui.fonts_mut(|f| f.layout_job(job))
     }
 
@@ -468,7 +472,7 @@ pub fn show(
         st.sticky.update(*version, text, &ix, &st.regions);
     }
     let spans = if opts.highlight {
-        hl.spans(ui.ctx(), *version, text, opts.lang, ui.visuals().dark_mode)
+        hl.spans(ui.ctx(), *version, text, opts.lang, opts.palette.preset().base == egui::Theme::Dark)
     } else {
         None
     };
@@ -487,19 +491,8 @@ pub fn show(
         depth.push(d);
         st.depth = (Some(*version), Arc::new(depth));
     }
-    let bracket_palette = if ui.visuals().dark_mode {
-        [
-            Color32::from_rgb(0xff, 0xd7, 0x00),
-            Color32::from_rgb(0xda, 0x70, 0xd6),
-            Color32::from_rgb(0x17, 0x9f, 0xff),
-        ]
-    } else {
-        [
-            Color32::from_rgb(0x04, 0x31, 0xfa),
-            Color32::from_rgb(0x31, 0x93, 0x31),
-            Color32::from_rgb(0x7b, 0x38, 0x14),
-        ]
-    };
+    let palette = opts.palette;
+    let bracket_palette = [Part::Bracket1, Part::Bracket2, Part::Bracket3].map(|part| palette.color(part));
     let use_depth = opts.bracket_colors && spans.is_some() && st.depth.0 == Some(*version);
     let depth_arc = st.depth.1.clone();
     let digits = ix.lines().to_string().len().max(3);
@@ -511,10 +504,11 @@ pub fn show(
         // Let the last line scroll up to the middle of the view.
         (view.count() as f32) * row_h + ui.available_height() * 0.5,
     );
-    let text_color = ui.visuals().text_color();
+    let text_color = palette.color(Part::Foreground);
 
     // The minimap takes a strip on the right.
     let full = ui.available_rect_before_wrap();
+    ui.painter().rect_filled(full, 0.0, palette.color(Part::Background));
     let mini_w = if opts.minimap && full.width() > 400.0 { 80.0 } else { 0.0 };
     let main_rect = Rect::from_min_max(full.min, Pos2::new(full.max.x - mini_w, full.max.y));
     let mini_rect = Rect::from_min_max(Pos2::new(full.max.x - mini_w, full.min.y), full.max);
@@ -544,7 +538,7 @@ pub fn show(
             spans,
             semantic: if ix.lines() == lines_before { extras.semantic } else { &[] },
             font: font.clone(),
-            color: text_color,
+            palette,
             depth: use_depth.then(|| (depth_arc.as_slice(), bracket_palette)),
         };
         let visible_rows = (vp.min.y / row_h).floor().max(0.0) as usize..((vp.max.y / row_h).ceil() as usize + 1).min(view.count());
@@ -595,7 +589,7 @@ pub fn show(
             let band = Rect::from_min_max(Pos2::new(clip.min.x - gutter_w, y), Pos2::new(clip.max.x, y + row_h));
             ui.painter()
                 .with_clip_rect(ui.clip_rect())
-                .rect_filled(band, 0.0, text_color.gamma_multiply(0.06));
+                .rect_filled(band, 0.0, palette.color(Part::CurrentLine));
         }
         let x_in = |l: usize, g: &egui::Galley, b: usize| {
             let range = ix.line_range(text, l);
@@ -642,7 +636,7 @@ pub fn show(
         );
         paint_ranges(&mut extras.global_marks.iter().cloned(), global, false);
         paint_ranges(&mut extras.marks.iter().cloned(), mark, false);
-        let sel_color = ui.visuals().selection.bg_fill.gamma_multiply(if focused { 0.7 } else { 0.4 });
+        let sel_color = palette.color(Part::Selection).gamma_multiply(if focused { 0.7 } else { 0.4 });
         paint_ranges(&mut st.sels.iter().map(|s| s.range()), sel_color, true);
 
         // Text.
@@ -710,7 +704,7 @@ pub fn show(
         if let Some(pre) = &st.preedit {
             let g = ui.fonts_mut(|f| f.layout_no_wrap(pre.clone(), font.clone(), text_color));
             let r = Rect::from_min_size(caret_rect.min, g.size());
-            painter.rect_filled(r, 0.0, ui.visuals().extreme_bg_color);
+            painter.rect_filled(r, 0.0, palette.color(Part::Background));
             painter.galley(r.min, g, text_color);
             painter.line_segment([r.left_bottom(), r.right_bottom()], Stroke::new(1.0, text_color));
         }
@@ -720,9 +714,9 @@ pub fn show(
         let gx = rect.min.x + vp.min.x;
         let gutter_clip = Rect::from_min_max(Pos2::new(gx, clip.min.y), Pos2::new(gx + gutter_w, clip.max.y));
         let gp = ui.painter().with_clip_rect(gutter_clip);
-        gp.rect_filled(gutter_clip, 0.0, ui.visuals().panel_fill);
-        let weak = ui.visuals().weak_text_color();
-        let strong = ui.visuals().strong_text_color();
+        gp.rect_filled(gutter_clip, 0.0, palette.color(Part::Background));
+        let weak = palette.color(Part::LineNumber);
+        let strong = palette.active_line_number(ui.visuals());
         let gutter_hover = resp.hover_pos().is_some_and(|p| p.x < gx + gutter_w);
         for &l in &vis_lines {
             let y = lay.line_y(l);
@@ -786,7 +780,7 @@ pub fn show(
         out.top_line = view.line(row) as f32 + rows.fract();
     }
     if mini_w > 0.0 {
-        minimap(ui, id, st, text, &ix, &view, spans, mini_rect, &scroll, row_h);
+        minimap(ui, id, st, text, &ix, &view, spans, mini_rect, &scroll, row_h, palette);
     }
 
     // IME: report where the caret is, so the candidate window opens next to it.
@@ -838,6 +832,7 @@ fn minimap(
     rect: Rect,
     scroll: &egui::scroll_area::ScrollAreaOutput<Option<(usize, Pos2)>>,
     row_h: f32,
+    palette: &Palette,
 ) {
     const ROW: f32 = 2.0;
     const CHAR: f32 = 1.0;
@@ -855,8 +850,7 @@ fn minimap(
     };
     let top_row = top as usize;
     let painter = ui.painter().with_clip_rect(rect);
-    painter.rect_filled(rect, 0.0, ui.visuals().panel_fill);
-    let weak = ui.visuals().text_color().gamma_multiply(0.45);
+    let weak = palette.color(Part::Foreground).gamma_multiply(0.45);
     for (i, row) in (top_row..rows.min(top_row + capacity)).enumerate() {
         let l = view.line(row);
         let y = rect.min.y + i as f32 * ROW;
@@ -883,7 +877,7 @@ fn minimap(
         match spans.and_then(|s| s.get(l)) {
             Some(hl) => {
                 for sp in &hl.spans {
-                    draw(sp.range.clone(), sp.color);
+                    draw(sp.range.clone(), sp.color(palette));
                 }
             }
             None => draw(0..line.len(), weak),
@@ -893,7 +887,7 @@ fn minimap(
     let vy = rect.min.y + (offset_rows - top) * ROW;
     let vr = Rect::from_min_size(Pos2::new(rect.min.x, vy), Vec2::new(rect.width(), vis_rows * ROW));
     // The visible part of the file: a clear band with an outline, readable on both themes.
-    let band = ui.visuals().text_color();
+    let band = palette.color(Part::Foreground);
     painter.rect_filled(vr, 0.0, band.gamma_multiply(0.16));
     painter.rect_stroke(vr, 0.0, egui::Stroke::new(1.0, band.gamma_multiply(0.35)), egui::StrokeKind::Inside);
 
@@ -1292,7 +1286,7 @@ fn key_press(ui: &egui::Ui, st: &mut State, text: &mut String, version: &mut u64
         spans: None,
         semantic: &[],
         font: k.font.clone(),
-        color: Color32::WHITE,
+        palette: k.opts.palette,
         depth: None,
     };
     // Move every caret with `f`; Shift extends.
@@ -1674,6 +1668,38 @@ mod tests {
     use super::*;
 
     /// Runs the real widget headlessly: one frame per batch of events.
+    #[test]
+    fn palette_changes_invalidate_only_affected_galleys() {
+        let ctx = egui::Context::default();
+        let text = "// sample\ncall(MAX);";
+        let ix = LineIndex::new(text);
+        let mut syntax = highlight::Cache::default();
+        highlight::mark_syntax_warmed_for_test("rs");
+        let spans = syntax.spans(&ctx, 1, text, "rs", true).unwrap();
+        let tokens = [(0..4, highlight::SemanticRole::new(Part::Macro))];
+        let mut palette = Palette::defaults(true);
+        let mut output = ctx.run_ui(Default::default(), |ui| {
+            let font = egui::TextStyle::Monospace.resolve(ui.style());
+            let galley = |palette: &Palette, line, semantic| {
+                let job = line_job(text, &ix, line, Some(spans), semantic, &font, palette, None);
+                ui.fonts_mut(|fonts| fonts.layout_job(job))
+            };
+            let before = galley(&palette, 0, &[]);
+            let semantic_before = galley(&palette, 1, &tokens);
+            assert!(Arc::ptr_eq(&before, &galley(&palette, 0, &[])));
+            palette.set(Part::Comment, Color32::RED);
+            let after = galley(&palette, 0, &[]);
+            assert!(!Arc::ptr_eq(&before, &after));
+            assert_eq!(after.job.sections[0].format.color, Color32::RED);
+            assert!(Arc::ptr_eq(&semantic_before, &galley(&palette, 1, &tokens)));
+            palette.set(Part::Macro, Color32::GREEN);
+            let semantic_after = galley(&palette, 1, &tokens);
+            assert!(!Arc::ptr_eq(&semantic_before, &semantic_after));
+            assert_eq!(semantic_after.job.sections[0].format.color, Color32::GREEN);
+        });
+        output.textures_delta.clear();
+    }
+
     struct Harness {
         ctx: egui::Context,
         st: State,
@@ -1721,6 +1747,7 @@ mod tests {
             );
             let mut full = self.ctx.run_ui(input, |ui| {
                 let opts = Options {
+                    palette: &Palette::defaults(ui.visuals().dark_mode),
                     lang: "rs",
                     highlight: false,
                     whitespace: false,

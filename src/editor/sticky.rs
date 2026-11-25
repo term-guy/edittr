@@ -242,15 +242,19 @@ impl Overlay {
         let text_painter = painter.with_clip_rect(Rect::from_min_max(Pos2::new(gutter_right, self.viewport.top()), self.viewport.max));
         let mut bottom = None;
         for (line, rect) in self.rows() {
-            painter.rect_filled(rect, 0.0, vis.panel_fill);
+            painter.rect_filled(rect, 0.0, lines.palette.color(crate::theme::Part::Background));
             painter.text(
                 Pos2::new(gutter_right - 1.5 * char_w, rect.top()),
                 Align2::RIGHT_TOP,
                 (line + 1).to_string(),
                 lines.font.clone(),
-                vis.weak_text_color(),
+                lines.palette.color(crate::theme::Part::LineNumber),
             );
-            text_painter.galley(Pos2::new(text_x, rect.top()), lines.galley(line), lines.color);
+            text_painter.galley(
+                Pos2::new(text_x, rect.top()),
+                lines.galley(line),
+                lines.palette.color(crate::theme::Part::Foreground),
+            );
             bottom = Some(rect.bottom());
         }
         if let Some(y) = bottom {

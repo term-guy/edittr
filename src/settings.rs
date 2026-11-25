@@ -9,9 +9,11 @@ use std::{
 use eframe::egui;
 
 use crate::outline::{CollapsedGroups, Group};
+use crate::theme::{Palette, Themes};
 
 #[derive(Clone, Copy)]
 pub(crate) struct Settings {
+    pub(crate) themes: Themes,
     pub(crate) changes_tree: bool,
     pub(crate) format_on_save: bool,
     pub(crate) highlight_line: bool,
@@ -42,6 +44,7 @@ pub(crate) struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            themes: Themes::default(),
             changes_tree: false,
             format_on_save: false,
             highlight_line: true,
@@ -108,6 +111,39 @@ impl Settings {
     fn parse(text: &str) -> Self {
         let mut settings = Self::default();
         for (key, value) in text.lines().filter_map(entry) {
+            match key {
+                "theme_preference" => {
+                    settings.themes.preference = match value {
+                        "dark" => egui::ThemePreference::Dark,
+                        "light" => egui::ThemePreference::Light,
+                        _ => egui::ThemePreference::System,
+                    };
+                    continue;
+                }
+                "theme_dark" | "theme_light" => {
+                    let base = if key == "theme_dark" {
+                        egui::Theme::Dark
+                    } else {
+                        egui::Theme::Light
+                    };
+                    if let Some(palette) = Palette::parse(value, base) {
+                        settings.themes.set_palette(palette);
+                    }
+                    continue;
+                }
+                "theme_custom_dark" | "theme_custom_light" => {
+                    let base = if key == "theme_custom_dark" {
+                        egui::Theme::Dark
+                    } else {
+                        egui::Theme::Light
+                    };
+                    settings
+                        .themes
+                        .set_custom(base, Palette::parse(value, base).filter(Palette::is_custom));
+                    continue;
+                }
+                _ => {}
+            }
             if key == "tab_size" {
                 if let Ok(n) = value.parse::<usize>()
                     && (1..=16).contains(&n)
@@ -172,7 +208,12 @@ impl Settings {
                         | "show_outline"
                         | "outline_expanded"
                         | "outline_grouped"
-                        | "outline_collapsed_groups",
+                        | "outline_collapsed_groups"
+                        | "theme_preference"
+                        | "theme_dark"
+                        | "theme_light"
+                        | "theme_custom_dark"
+                        | "theme_custom_light",
                     _
                 ))
             ) {
@@ -203,6 +244,26 @@ impl Settings {
             .collect::<Vec<_>>()
             .join(",");
         text.push_str(&format!("outline_collapsed_groups={collapsed}\n"));
+        text.push_str(match self.themes.preference {
+            egui::ThemePreference::Dark => "theme_preference=dark\n",
+            egui::ThemePreference::Light => "theme_preference=light\n",
+            egui::ThemePreference::System => "theme_preference=system\n",
+        });
+        text.push_str("theme_dark=");
+        self.themes.dark.write(&mut text);
+        text.push_str("\ntheme_light=");
+        self.themes.light.write(&mut text);
+        text.push('\n');
+        for (key, custom) in [
+            ("theme_custom_dark=", self.themes.custom_dark),
+            ("theme_custom_light=", self.themes.custom_light),
+        ] {
+            if let Some(palette) = custom {
+                text.push_str(key);
+                palette.write(&mut text);
+                text.push('\n');
+            }
+        }
         text
     }
 }
@@ -243,6 +304,30 @@ fn entry(line: &str) -> Option<(&str, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn theme_presets_and_custom_colors_round_trip() {
+        use crate::theme::{PRESETS, Part};
+        for (i, preset) in PRESETS.iter().enumerate() {
+            let mut settings = Settings::default();
+            let mut palette = Palette::new(i);
+            settings.themes.preference = preset.base.into();
+            settings.themes.set_palette(palette);
+            let saved = settings.format("");
+            assert_eq!(Settings::parse(&saved).themes, settings.themes);
+
+            palette.set(Part::Comment, egui::Color32::from_rgba_unmultiplied(135, 83, 117, 142));
+            palette.set(Part::CurrentLine, egui::Color32::TRANSPARENT);
+            settings.themes.set_custom(preset.base, Some(palette));
+            settings.themes.set_palette(palette);
+            let saved = settings.format(&saved);
+            assert_eq!(Settings::parse(&saved).themes, settings.themes);
+            settings.themes.set_palette(Palette::new(i));
+            assert_eq!(Settings::parse(&settings.format(&saved)).themes, settings.themes);
+        }
+        let settings = Settings::parse("theme_dark=oat-paper\ntheme_light=edittr-light,comment:invalid");
+        assert_eq!(settings.themes, Themes::default());
+    }
 
     #[test]
     fn outline_group_layout_round_trips() {
@@ -326,7 +411,7 @@ mod tests {
         let text = settings.format(previous);
         assert_eq!(
             text,
-            "future_key=one=two\nfuture_key = three\n# A comment\nchanges_tree=false\nhighlight_line=false\nshow_whitespace=false\ndiff_ignore_eol=true\ninline_blame=true\nminimap=true\nbracket_colors=true\nsemantic_highlighting=true\nsticky_scroll=true\nrestore_previous_session=true\nreopen_last_folder=false\ntab_size=4\nformat_on_save=false\nshow_outline=true\noutline_expanded=true\noutline_grouped=true\noutline_collapsed_groups=\n"
+            "future_key=one=two\nfuture_key = three\n# A comment\nchanges_tree=false\nhighlight_line=false\nshow_whitespace=false\ndiff_ignore_eol=true\ninline_blame=true\nminimap=true\nbracket_colors=true\nsemantic_highlighting=true\nsticky_scroll=true\nrestore_previous_session=true\nreopen_last_folder=false\ntab_size=4\nformat_on_save=false\nshow_outline=true\noutline_expanded=true\noutline_grouped=true\noutline_collapsed_groups=\ntheme_preference=system\ntheme_dark=edittr-dark\ntheme_light=edittr-light\n"
         );
         assert!(!Settings::parse(&text).changes_tree);
     }

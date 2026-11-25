@@ -471,7 +471,8 @@ impl App {
         session_writer: Option<Writer>,
     ) -> Self {
         ic::install(&cc.egui_ctx, settings.tab_size);
-        highlight::warm_up();
+        highlight::warm_up(cc.egui_ctx.clone());
+        cc.egui_ctx.set_theme(settings.themes.preference);
         cc.egui_ctx.global_style_mut(|s| {
             s.spacing.item_spacing.y = 3.0;
         });
@@ -3490,7 +3491,9 @@ fn editor(
         doc.ed.select(a..b);
         ui.memory_mut(|m| m.request_focus(id));
     }
+    let palette = settings.themes.active(ui.visuals().dark_mode);
     let opts = editor::Options {
+        palette,
         lang: &doc.lang,
         highlight: doc.text.len() <= HIGHLIGHT_LIMIT,
         whitespace: settings.show_whitespace,
@@ -3536,8 +3539,8 @@ fn editor(
         .map(|&(l, c)| (l, gutter::color(c, dark), c == gutter::Change::Deleted))
         .collect();
     let semantic = if opts.highlight && settings.semantic_highlighting {
-        doc.lsp.align(&doc.text, doc.version, dark);
-        doc.lsp.colors()
+        doc.lsp.align(&doc.text, doc.version);
+        doc.lsp.token_lines()
     } else {
         &[]
     };

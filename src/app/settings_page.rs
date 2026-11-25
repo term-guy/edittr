@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::commands::Setting;
+use crate::theme::{PRESETS, Palette, Part};
 
 enum Control {
     Toggle(Setting),
@@ -153,6 +154,15 @@ fn matches(filter: &str, section: &str, item: &Item) -> bool {
         })
 }
 
+fn theme_matches(filter: &str) -> bool {
+    filter.split_whitespace().all(|word| {
+        let word = word.to_ascii_lowercase();
+        "theme editor palette color preset".contains(&word)
+            || Part::ALL.iter().any(|(_, _, label)| label.to_ascii_lowercase().contains(&word))
+            || PRESETS.iter().any(|preset| preset.name.to_ascii_lowercase().contains(&word))
+    })
+}
+
 /// An on/off switch, drawn like the ones in system settings.
 fn switch(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
     let size = ui.spacing().interact_size.y * egui::vec2(1.8, 1.0);
@@ -215,16 +225,22 @@ impl App {
                         let mut shown = 0;
                         for (section, items) in SECTIONS {
                             let items: Vec<_> = items.iter().filter(|item| matches(&filter, section, item)).collect();
-                            if items.is_empty() {
-                                continue;
+                            if !items.is_empty() {
+                                ui.add_space(18.0);
+                                ui.label(RichText::new(*section).strong().size(15.0));
+                                ui.add_space(2.0);
+                                for item in items {
+                                    shown += 1;
+                                    ui.separator();
+                                    self.settings_row(ui, item, &mut run, &mut tab_size);
+                                }
                             }
-                            ui.add_space(18.0);
-                            ui.label(RichText::new(*section).strong().size(15.0));
-                            ui.add_space(2.0);
-                            for item in items {
+                            if *section == "Appearance" && theme_matches(&filter) {
                                 shown += 1;
-                                ui.separator();
-                                self.settings_row(ui, item, &mut run, &mut tab_size);
+                                ui.add_space(12.0);
+                                egui::CollapsingHeader::new(RichText::new("Theme editor").strong().size(15.0))
+                                    .open((!filter.trim().is_empty()).then_some(true))
+                                    .show(ui, |ui| self.theme_editor(ui));
                             }
                         }
                         if shown == 0 {
@@ -233,7 +249,7 @@ impl App {
                         }
                         ui.add_space(24.0);
                         ui.weak(format!(
-                            "Settings are saved automatically. Every option is also in the command palette ({}).",
+                            "Settings are saved automatically. Open the command palette with {}.",
                             commands::entry(Command::Palette).shortcut_text(ui.ctx())
                         ));
                         ui.add_space(12.0);
@@ -245,6 +261,93 @@ impl App {
         }
         if let Some(command) = run {
             self.run_command(command);
+        }
+    }
+
+    pub(super) fn set_theme_preference(&mut self, preference: egui::ThemePreference) {
+        self.settings.themes.preference = preference;
+        self.ctx.set_theme(preference);
+        self.ctx.request_repaint();
+        self.save_settings(&self.ctx.clone());
+    }
+
+    fn theme_editor(&mut self, ui: &mut egui::Ui) {
+        let mut palette = *self.settings.themes.active(ui.ctx().theme() == egui::Theme::Dark);
+        let before = palette;
+        let mut preference = self.settings.themes.preference;
+        let mut edited = false;
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Preset");
+            let preset = palette.preset();
+            let label = if palette.is_custom() {
+                format!("{} (custom)", preset.name).into()
+            } else {
+                std::borrow::Cow::Borrowed(preset.name)
+            };
+            egui::ComboBox::from_id_salt("editor-theme-preset")
+                .selected_text(label.as_ref())
+                .show_ui(ui, |ui| {
+                    for (i, candidate) in PRESETS.iter().enumerate() {
+                        let selected = !palette.is_custom() && candidate.id == preset.id;
+                        if ui.selectable_label(selected, candidate.name).clicked() {
+                            palette = Palette::new(i);
+                            preference = candidate.base.into();
+                        }
+                    }
+                    for custom in [self.settings.themes.custom_dark, self.settings.themes.custom_light]
+                        .into_iter()
+                        .flatten()
+                    {
+                        let name = format!("{} (custom)", custom.preset().name);
+                        if ui.selectable_label(palette == custom, name).clicked() {
+                            palette = custom;
+                            preference = custom.preset().base.into();
+                        }
+                    }
+                });
+            if ui.add_enabled(palette.is_custom(), egui::Button::new("Reset to preset")).clicked() {
+                palette.reset();
+                edited = true;
+            }
+        });
+
+        ui.add_space(6.0);
+        theme_preview(ui, &palette);
+        ui.add_space(6.0);
+        let columns = if ui.available_width() >= 530.0 { 2 } else { 1 };
+        egui::Grid::new("theme-colors")
+            .num_columns(columns * 2)
+            .spacing([12.0, 6.0])
+            .show(ui, |ui| {
+                for (i, (part, _, label)) in Part::ALL.into_iter().enumerate() {
+                    let mut color = palette.color(part);
+                    let alpha = if part == Part::Background {
+                        egui::color_picker::Alpha::Opaque
+                    } else {
+                        egui::color_picker::Alpha::OnlyBlend
+                    };
+                    let response = ui
+                        .push_id(part, |ui| egui::color_picker::color_edit_button_srgba(ui, &mut color, alpha))
+                        .inner;
+                    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, ui.is_enabled(), label));
+                    ui.label(label);
+                    if response.changed() && color != palette.color(part) {
+                        palette.set(part, color);
+                        edited = true;
+                    }
+                    if (i + 1) % columns == 0 {
+                        ui.end_row();
+                    }
+                }
+            });
+        if edited {
+            self.settings
+                .themes
+                .set_custom(palette.preset().base, palette.is_custom().then_some(palette));
+        }
+        if edited || palette != before || preference != self.settings.themes.preference {
+            self.settings.themes.set_palette(palette);
+            self.set_theme_preference(preference);
         }
     }
 
@@ -279,7 +382,7 @@ impl App {
                     }
                 }
                 Theme => {
-                    let mut preference = ui.ctx().options(|o| o.theme_preference);
+                    let mut preference = self.settings.themes.preference;
                     let before = preference;
                     for (value, label) in [
                         (egui::ThemePreference::Light, "Light"),
@@ -289,7 +392,7 @@ impl App {
                         ui.selectable_value(&mut preference, value, label);
                     }
                     if preference != before {
-                        ui.ctx().set_theme(preference);
+                        self.set_theme_preference(preference);
                     }
                 }
                 Action(command, label) => {
@@ -299,6 +402,78 @@ impl App {
                 }
             });
         });
+    }
+}
+
+fn theme_preview(ui: &mut egui::Ui, palette: &Palette) {
+    use Part::*;
+    const LINES: &[&[(Part, &str)]] = &[
+        &[(Comment, "// Print a scaled sample")],
+        &[(Macro, "#define SCALE"), (Number, " 2")],
+        &[(Disabled, "// Inactive preprocessor branch")],
+        &[
+            (Keyword, "static "),
+            (Type, "Sample "),
+            (Function, "scale"),
+            (Bracket1, "("),
+            (Type, "Sample "),
+            (Variable, "value"),
+            (Bracket1, ") {"),
+        ],
+        &[
+            (Foreground, "    log"),
+            (Bracket2, "("),
+            (String, "\"ready\""),
+            (Operator, ", "),
+            (Bracket3, "("),
+            (Number, "3"),
+            (Bracket3, ")"),
+            (Bracket2, ")"),
+            (Operator, ";"),
+        ],
+        &[
+            (Keyword, "    return "),
+            (Bracket2, "("),
+            (Variable, "value"),
+            (Operator, " * "),
+            (Macro, "SCALE"),
+            (Bracket2, ")"),
+            (Operator, " + "),
+            (Constant, "LIMIT"),
+            (Operator, ";"),
+        ],
+        &[(Bracket1, "}")],
+    ];
+    let font = egui::TextStyle::Monospace.resolve(ui.style());
+    let row = ui.fonts_mut(|fonts| fonts.row_height(&font));
+    let height = row * LINES.len() as f32 + 12.0;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), height), egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 4.0, palette.color(Background));
+    for (i, line) in LINES.iter().enumerate() {
+        let y = rect.top() + 6.0 + i as f32 * row;
+        if i == 5 {
+            let band = egui::Rect::from_min_size(egui::pos2(rect.left(), y), egui::vec2(rect.width(), row));
+            painter.rect_filled(band, 0.0, palette.color(CurrentLine));
+        }
+        painter.text(
+            egui::pos2(rect.left() + 10.0, y),
+            egui::Align2::LEFT_TOP,
+            i + 1,
+            font.clone(),
+            palette.color(LineNumber),
+        );
+        let mut job = egui::text::LayoutJob::default();
+        job.wrap.max_width = f32::INFINITY;
+        for &(part, code) in *line {
+            let mut format = egui::TextFormat::simple(font.clone(), palette.color(part));
+            if i == 5 && part == Variable {
+                format.background = palette.color(Selection).gamma_multiply(0.7);
+            }
+            job.append(code, 0.0, format);
+        }
+        let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
+        painter.galley(egui::pos2(rect.left() + 36.0, y), galley, palette.color(Foreground));
     }
 }
 

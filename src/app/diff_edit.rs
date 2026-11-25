@@ -250,6 +250,7 @@ impl App {
         ui.columns(2, |cols| {
             cols[0].weak(format!("{} (base)", file_name(&path.to_string_lossy())));
             let opts = ed::Options {
+                palette: settings.themes.active(cols[0].visuals().dark_mode),
                 lang: &lang,
                 highlight: live.base.len() <= super::HIGHLIGHT_LIMIT,
                 whitespace: settings.show_whitespace,

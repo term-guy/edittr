@@ -5,7 +5,7 @@
 use super::{App, EditorOut, Tab, background};
 use crate::highlight;
 use crate::lsp::features::{HighlightKind, SemanticToken};
-use eframe::egui::Color32;
+
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, TryRecvError};
@@ -19,18 +19,13 @@ const MARKS_AFTER_MOVE: Duration = Duration::from_millis(120);
 /// Without a language server, whole-word matches stand in; not for huge files.
 const FALLBACK_LIMIT: usize = 4 << 20;
 
-/// Colors of one line: (byte range in the line, light color, dark color).
-type LineColors = Vec<(Range<usize>, Color32, Color32)>;
-
-/// Semantic colors computed for `text`, per line.
+/// Token roles computed for `text`, per line.
 struct Tokens {
     text: Arc<str>,
-    lines: Vec<LineColors>,
+    lines: Vec<highlight::TokenLine>,
 }
 
 type TokensResult = Result<Option<Tokens>, String>;
-/// Semantic colors of one line, for the current theme.
-pub(super) type Colors = Vec<(Range<usize>, Color32)>;
 type LspRange = ((usize, usize), (usize, usize));
 
 type MarksResult = (u64, Range<usize>, Option<Vec<(Range<usize>, bool)>>);
@@ -44,8 +39,8 @@ pub(super) struct DocLsp {
     /// The server has no semantic tokens (until it restarts).
     unsupported: bool,
     retry_at: Option<Instant>,
-    /// Token colors realigned to `aligned.0` (version, dark).
-    aligned: Option<((u64, bool), Vec<Colors>)>,
+    /// Token roles realigned to document version `aligned.0`.
+    aligned: Option<(u64, Vec<highlight::TokenLine>)>,
     /// Uses of the symbol at the caret: (version, word) they are for.
     pub(super) marks: Vec<(Range<usize>, bool)>,
     marks_key: Option<(u64, Range<usize>)>,
@@ -58,13 +53,12 @@ impl DocLsp {
     /// Semantic colors per line of `text` (version `version`): lines that are the same as
     /// when the tokens were computed keep theirs, changed ones have none until the next
     /// response. Cached per version.
-    pub(super) fn align(&mut self, text: &str, version: u64, dark: bool) {
+    pub(super) fn align(&mut self, text: &str, version: u64) {
         let Some(t) = &self.tokens else {
             self.aligned = None;
             return;
         };
-        if self.aligned.as_ref().map(|a| a.0) != Some((version, dark)) {
-            let pick = |l: &LineColors| l.iter().map(|(r, light, d)| (r.clone(), if dark { *d } else { *light })).collect();
+        if self.aligned.as_ref().map(|a| a.0) != Some(version) {
             let old: Vec<&str> = t.text.split('\n').collect();
             let new: Vec<&str> = text.split('\n').collect();
             let prefix = old.iter().zip(&new).take_while(|(a, b)| a == b).count();
@@ -76,21 +70,21 @@ impl DocLsp {
                 .take(max_suffix)
                 .take_while(|(a, b)| a == b)
                 .count();
-            let mut lines: Vec<Vec<(Range<usize>, Color32)>> = Vec::with_capacity(new.len());
-            lines.extend(t.lines.iter().take(prefix).map(pick));
+            let mut lines: Vec<highlight::TokenLine> = Vec::with_capacity(new.len());
+            lines.extend(t.lines.iter().take(prefix).cloned());
             lines.resize_with(new.len() - suffix, Vec::new);
             let from = old.len() - suffix;
-            lines.extend((from..old.len()).map(|i| t.lines.get(i).map(pick).unwrap_or_default()));
+            lines.extend((from..old.len()).map(|i| t.lines.get(i).cloned().unwrap_or_default()));
             // Drop trailing empty lines: lookups past the end mean "no colors".
             while lines.last().is_some_and(Vec::is_empty) {
                 lines.pop();
             }
-            self.aligned = Some(((version, dark), lines));
+            self.aligned = Some((version, lines));
         }
     }
 
     /// The colors from the last `align`.
-    pub(super) fn colors(&self) -> &[Vec<(Range<usize>, Color32)>] {
+    pub(super) fn token_lines(&self) -> &[highlight::TokenLine] {
         self.aligned.as_ref().map_or(&[], |a| &a.1)
     }
 
@@ -104,15 +98,12 @@ impl DocLsp {
 }
 
 /// Token colors per line, from tokens in UTF-16 columns.
-fn token_colors(text: &str, tokens: &[SemanticToken]) -> Vec<LineColors> {
+fn token_lines(text: &str, tokens: &[SemanticToken], clangd: bool) -> Vec<highlight::TokenLine> {
     let lines: Vec<&str> = text.split('\n').collect();
-    let mut out: Vec<LineColors> = vec![Vec::new(); lines.len()];
+    let mut out: Vec<highlight::TokenLine> = vec![Vec::new(); lines.len()];
     for t in tokens {
         let Some(line) = lines.get(t.line) else { continue };
-        let (Some(light), Some(dark)) = (
-            highlight::semantic_color(&t.kind, &t.modifiers, false),
-            highlight::semantic_color(&t.kind, &t.modifiers, true),
-        ) else {
+        let Some(role) = highlight::semantic_role(&t.kind, &t.modifiers, clangd) else {
             continue;
         };
         let byte = |c16: usize| {
@@ -127,14 +118,14 @@ fn token_colors(text: &str, tokens: &[SemanticToken]) -> Vec<LineColors> {
         };
         let (a, b) = (byte(t.start16), byte(t.start16 + t.len16));
         if a < b {
-            out[t.line].push((a..b, light, dark));
+            out[t.line].push((a..b, role));
         }
     }
     for l in &mut out {
-        l.sort_by_key(|(r, _, _)| r.start);
+        l.sort_by_key(|(r, _)| r.start);
         // Overlapping tokens: keep the first.
         let mut end = 0;
-        l.retain(|(r, _, _)| {
+        l.retain(|(r, _)| {
             let keep = r.start >= end;
             if keep {
                 end = r.end;
@@ -266,7 +257,7 @@ impl App {
                         let client = launch.wait().ok_or_else(|| "no server".to_string())?;
                         let tokens = client.semantic_tokens(&path, &text, revision, TIMEOUT)?;
                         Ok(tokens.map(|tokens| Tokens {
-                            lines: token_colors(&text, &tokens),
+                            lines: token_lines(&text, &tokens, client.name == "clangd"),
                             text: text.into(),
                         }))
                     })();
@@ -367,24 +358,24 @@ mod tests {
             token(0, 8, 1, "macro"),
             token(1, 8, 1, "macro"),
             token(2, 8, 1, "macro"),
-            token(2, 4, 1, "variable"),
+            token(2, 4, 1, "unknown"),
         ];
         let mut st = DocLsp {
             tokens: Some(Tokens {
-                lines: token_colors(text, &tokens),
+                lines: token_lines(text, &tokens, true),
                 text: text.into(),
             }),
             ..Default::default()
         };
-        let ranges = |c: &[Vec<(Range<usize>, Color32)>]| {
+        let ranges = |c: &[highlight::TokenLine]| {
             c.iter()
                 .map(|l| l.iter().map(|(r, _)| r.clone()).collect::<Vec<_>>())
                 .collect::<Vec<_>>()
         };
         assert_eq!(
             ranges({
-                st.align(text, 1, true);
-                st.colors()
+                st.align(text, 1);
+                st.token_lines()
             }),
             vec![vec![8..9], vec![8..9], vec![8..9]]
         );
@@ -392,8 +383,8 @@ mod tests {
         let edited = "// new\n#define N 3\nint x = N;\nint y = N;\n";
         assert_eq!(
             ranges({
-                st.align(edited, 2, true);
-                st.colors()
+                st.align(edited, 2);
+                st.token_lines()
             }),
             vec![vec![], vec![8..9], vec![8..9], vec![8..9]]
         );
@@ -401,8 +392,8 @@ mod tests {
         let edited = "#define N 3\nint xx = N;\nint y = N;\n";
         assert_eq!(
             ranges({
-                st.align(edited, 3, true);
-                st.colors()
+                st.align(edited, 3);
+                st.token_lines()
             }),
             vec![vec![8..9], vec![], vec![8..9]]
         );
@@ -411,11 +402,12 @@ mod tests {
     #[test]
     fn token_colors_use_bytes_and_skip_uncolored_kinds() {
         // `é` is 2 bytes but 1 UTF-16 unit.
-        let lines = token_colors(
+        let lines = token_lines(
             "é FOO\n",
-            &[token(0, 2, 3, "macro"), token(0, 0, 1, "variable"), token(5, 0, 1, "macro")],
+            &[token(0, 2, 3, "macro"), token(0, 0, 1, "unknown"), token(5, 0, 1, "macro")],
+            true,
         );
-        assert_eq!(lines[0].iter().map(|(r, _, _)| r.clone()).collect::<Vec<_>>(), vec![3..6]);
+        assert_eq!(lines[0].iter().map(|(r, _)| r.clone()).collect::<Vec<_>>(), vec![3..6]);
     }
 
     #[test]

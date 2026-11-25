@@ -33,6 +33,7 @@ mod settings;
 mod svn;
 mod symbol_cache;
 mod symbols;
+mod theme;
 mod tree;
 pub mod vcs;
 mod vcs_bytes;
