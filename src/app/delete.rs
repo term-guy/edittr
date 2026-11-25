@@ -55,7 +55,7 @@ enum Outcome {
     Failed(io::Error),
 }
 
-fn relative_target<'a>(root: &Path, path: &'a Path) -> Option<&'a Path> {
+pub(super) fn relative_target<'a>(root: &Path, path: &'a Path) -> Option<&'a Path> {
     let relative = path.strip_prefix(root).ok()?;
     (!relative.as_os_str().is_empty() && relative.components().all(|part| matches!(part, Component::Normal(_)))).then_some(relative)
 }
@@ -153,18 +153,25 @@ impl App {
         }
     }
 
-    pub(super) fn explorer_delete_shortcut(&mut self, ctx: &egui::Context) {
-        let Some(selection) = &self.explorer_selection else { return };
-        let Some(row) = selection.row else { return };
-        if self.deletion.is_some()
+    /// The selected Explorer row, when keys should act on it: the row has focus (or was the
+    /// last click) and no dialog, popup or text field is taking the keyboard.
+    pub(super) fn explorer_key_target(&self, ctx: &egui::Context) -> Option<(PathBuf, bool)> {
+        let selection = self.explorer_selection.as_ref()?;
+        let row = selection.row?;
+        let busy = self.deletion.is_some()
+            || self.renaming.is_some()
             || self.confirm.is_some()
             || self.quick_open.is_some()
             || self.open_folder.is_some()
             || egui::Popup::is_any_open(ctx)
-            || ctx.memory(|m| m.top_modal_layer().is_some() || !m.focused().map_or(selection.last_clicked, |focused| focused == row))
-        {
+            || ctx.memory(|m| m.top_modal_layer().is_some() || !m.focused().map_or(selection.last_clicked, |focused| focused == row));
+        (!busy).then(|| (selection.path.clone(), selection.folder))
+    }
+
+    pub(super) fn explorer_delete_shortcut(&mut self, ctx: &egui::Context) {
+        let Some((path, folder)) = self.explorer_key_target(ctx) else {
             return;
-        }
+        };
         let mac = ctx.os().is_mac();
         let pressed = ctx.input_mut(|input| {
             let mut pressed = false;
@@ -183,12 +190,16 @@ impl App {
             pressed
         });
         if pressed {
-            self.request_delete(selection.path.clone(), selection.folder);
+            self.request_delete(path, folder);
         }
     }
 
     pub(super) fn explorer_delete_menu(&mut self, ui: &mut egui::Ui, path: &Path, folder: bool) {
         ui.separator();
+        if ui.button(format!("{} Rename…", ic::PENCIL_SIMPLE)).clicked() {
+            self.request_rename(path.to_owned(), folder);
+            ui.close();
+        }
         if ui.button(format!("{} Delete", ic::TRASH)).clicked() {
             self.request_delete(path.to_owned(), folder);
             ui.close();

@@ -138,7 +138,7 @@ impl App {
     }
 
     /// Point tab `index` at `path`: the language, grammar and language server follow the new name.
-    fn retarget(&mut self, index: usize, path: PathBuf) {
+    pub(super) fn retarget(&mut self, index: usize, path: PathBuf) {
         let Some(Tab::File(doc)) = self.tabs.get_mut(index) else { return };
         doc.lang = language_of(&path);
         doc.comment = editor::comment_token(&doc.lang.to_lowercase());

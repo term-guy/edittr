@@ -19,6 +19,7 @@ mod navigation;
 mod new_file;
 mod outline;
 mod problems;
+mod rename_file;
 mod search_replace;
 mod semantic;
 mod session;
@@ -403,6 +404,7 @@ pub struct App {
     explorer_marked: Option<PathBuf>,
     explorer_selection: Option<delete::ExplorerSelection>,
     deletion: Option<delete::Deletion>,
+    renaming: Option<rename_file::Renaming>,
     outline: outline::Outline,
 
     status: Status,
@@ -524,6 +526,7 @@ impl App {
             explorer_marked: None,
             explorer_selection: None,
             deletion: None,
+            renaming: None,
             outline: Default::default(),
             status: Status::default(),
             status_rx: None,
@@ -624,6 +627,7 @@ impl App {
         self.explorer_marked = None;
         self.explorer_selection = None;
         self.deletion = None;
+        self.renaming = None;
         self.code_navigation = code_navigation::CodeNavigation::default();
         self.root = None;
         self.search.opts.include.clear();
@@ -3442,10 +3446,12 @@ impl eframe::App for App {
             return;
         }
         self.poll_background(&ctx);
+        self.explorer_rename_shortcut(&ctx);
         self.begin_explorer_input(&ctx);
         self.shortcuts(&ctx);
         self.picker_dialog(&ctx);
         self.delete_dialog(&ctx);
+        self.rename_dialog(&ctx);
 
         let title = match &self.root {
             Some(r) => format!("{} — edittr", dir_name(r)),
