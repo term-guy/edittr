@@ -27,7 +27,7 @@ impl App {
             Tab::Diff(diff) => Some(&diff.path),
             Tab::FileHistory(history) => Some(&history.path),
             Tab::Hex(view) => Some(&view.path),
-            Tab::Graph => None,
+            Tab::Graph | Tab::Settings => None,
         }
     }
 

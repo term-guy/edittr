@@ -40,6 +40,9 @@ pub(crate) enum Command {
     SplitEditor,
     FormatDocument,
     CSettings,
+    NewWindow,
+    OpenFolderInNewWindow,
+    OpenSettings,
     GenerateCompileDatabase,
     ToggleSetting(Setting),
     TabSize(usize),
@@ -168,6 +171,8 @@ pub(crate) const COMMANDS: &[Entry] = &[
         ],
     ),
     Entry::new(OpenFolder, "Open folder", &[]),
+    Entry::new(OpenFolderInNewWindow, "Open folder in new window…", &[]),
+    Entry::new(NewWindow, "New window", &[KeyboardShortcut::new(CMD_SHIFT, Key::N)]),
     Entry::new(CloseFolder, "Close folder (back to the start page)", &[]),
     Entry::new(QuickOpen, "Go to file", &[KeyboardShortcut::new(CMD, Key::P)]),
     // Ctrl+G on every platform (also on macOS, like VS Code).
@@ -228,6 +233,7 @@ pub(crate) const COMMANDS: &[Entry] = &[
     Entry::new(Save, "Save", &[KeyboardShortcut::new(CMD, Key::S)]),
     Entry::new(CloseTab, "Close tab", &[KeyboardShortcut::new(CMD, Key::W)]),
     Entry::new(CloseAllTabs, "Close all tabs", &[]),
+    Entry::new(OpenSettings, "Open settings", &[KeyboardShortcut::new(CMD, Key::Comma)]),
     Entry::new(ToggleTheme, "Toggle theme", &[]),
     Entry::new(
         SplitEditor,

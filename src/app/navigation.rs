@@ -242,7 +242,9 @@ impl App {
         match cmd {
             Command::Palette | Command::DocumentSymbols | Command::WorkspaceSymbols => self.start_picker(cmd),
             Command::SwitchSourceHeader => self.switch_source_header(),
-            Command::OpenFolder => self.request_open_folder(),
+            Command::OpenFolder => self.request_open_folder(false),
+            Command::OpenFolderInNewWindow => self.request_open_folder(true),
+            Command::NewWindow => self.new_window(None),
             Command::CloseFolder => self.close_folder(false),
             Command::QuickOpen => self.start_quick_open(),
             Command::GoToLine => self.open_goto_line(),
@@ -318,6 +320,7 @@ impl App {
             Command::Save => self.save_active(),
             Command::FormatDocument => self.format_document(self.active),
             Command::CSettings => self.open_c_settings(),
+            Command::OpenSettings => self.open_settings(),
             Command::GenerateCompileDatabase => self.plan_compile_database(),
             Command::SplitEditor => {
                 if self.preview.take().is_some() {

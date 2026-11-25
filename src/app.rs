@@ -20,6 +20,7 @@ mod problems;
 mod search_replace;
 mod semantic;
 mod session;
+mod settings_page;
 #[cfg(feature = "tour")]
 mod tour;
 
@@ -180,6 +181,11 @@ impl Doc {
 
 // File tabs are the common case; boxing them would only add an indirection.
 #[allow(clippy::large_enum_variant)]
+/// Argument a new window is started with: open the start page, never the last folder.
+pub(crate) const NEW_WINDOW_ARG: &str = "--new-window";
+
+// Files are by far the most common tab; boxing them would add an indirection to every editor access.
+#[allow(clippy::large_enum_variant)]
 enum Tab {
     File(Doc),
     /// A very large file, read-only (see src/large.rs).
@@ -188,6 +194,7 @@ enum Tab {
     FileHistory(Box<file_history::History>),
     Hex(Box<hex_view::Viewer>),
     Graph,
+    Settings,
 }
 
 type PendingDiff = Receiver<Result<(Tab, bool), String>>;
@@ -399,6 +406,7 @@ pub struct App {
     graph_sel: Option<usize>,
     graph_detail: commit_view::CommitView,
     graph_rx: Option<Receiver<Result<Graph, String>>>,
+    settings_page: settings_page::Page,
     graph_dialog: Option<graph_menu::GraphDialog>,
     diff_rx: Option<PendingDiff>,
     open_jobs: Vec<file_open::OpenJob>,
@@ -418,6 +426,8 @@ pub struct App {
     last_caret: Option<egui::Rect>,
     confirm: Option<Confirm>,
     open_folder_requested: bool,
+    /// The requested folder opens in a new window instead of this one.
+    open_folder_in_new_window: bool,
     open_folder: Option<String>,
     search: SearchState,
     find: find::Find,
@@ -505,6 +515,7 @@ impl App {
             graph_sel: None,
             graph_detail: commit_view::CommitView::default(),
             graph_rx: None,
+            settings_page: Default::default(),
             graph_dialog: None,
             diff_rx: None,
             open_jobs: Vec::new(),
@@ -520,6 +531,7 @@ impl App {
             last_caret: None,
             confirm: None,
             open_folder_requested: false,
+            open_folder_in_new_window: false,
             open_folder: None,
             search: SearchState::default(),
             lsp: problems::LanguageServers::default(),
@@ -620,8 +632,36 @@ impl App {
         .unwrap_or_else(|| PathBuf::from("."))
     }
 
-    fn request_open_folder(&mut self) {
+    fn request_open_folder(&mut self, new_window: bool) {
         self.open_folder_requested = true;
+        self.open_folder_in_new_window = new_window;
+    }
+
+    /// Starts another edittr process: an empty window, or one showing `folder`.
+    fn new_window(&mut self, folder: Option<&Path>) {
+        let spawned = std::env::current_exe().and_then(|exe| {
+            let mut command = std::process::Command::new(exe);
+            match folder {
+                Some(folder) => command.arg(folder),
+                None => command.arg(NEW_WINDOW_ARG),
+            };
+            command
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+                command.creation_flags(CREATE_NO_WINDOW);
+            }
+            command.spawn()
+        });
+        // Reap the child when it exits so it doesn't linger as a zombie.
+        match spawned {
+            Ok(mut child) => drop(std::thread::spawn(move || child.wait())),
+            Err(err) => self.message = format!("Could not open a new window: {err}"),
+        }
     }
 
     fn open_requested_folder(&mut self, frame: &eframe::Frame) {
@@ -648,6 +688,7 @@ impl App {
 
         if let Some(path) = path {
             match workspace::canonical(&path) {
+                Ok(path) if self.open_folder_in_new_window => self.new_window(Some(&path)),
                 Ok(path) => self.set_root(path),
                 Err(err) => self.message = format!("Could not open {}: {err}", path.display()),
             }
@@ -1181,7 +1222,10 @@ impl App {
         let same_kind = |t: &Tab| {
             matches!(
                 (t, &tab),
-                (Tab::Diff(_), Tab::Diff(_)) | (Tab::Graph, Tab::Graph) | (Tab::FileHistory(_), Tab::FileHistory(_))
+                (Tab::Diff(_), Tab::Diff(_))
+                    | (Tab::Graph, Tab::Graph)
+                    | (Tab::Settings, Tab::Settings)
+                    | (Tab::FileHistory(_), Tab::FileHistory(_))
             ) || matches!((t, &tab), (Tab::Hex(a), Tab::Hex(b)) if a.comparing() && b.comparing())
         };
         if let Some(i) = self.tabs.iter().position(same_kind) {
@@ -1959,29 +2003,35 @@ impl App {
                 {
                     self.run_command(Command::ToggleTheme);
                 }
-                if activity_button(ui, ic::FOLDER_OPEN, false).on_hover_text("Open folder").clicked() {
+                let folder = activity_button(ui, ic::FOLDER_OPEN, false).on_hover_text("Open folder (right-click for a new window)");
+                if folder.clicked() {
                     self.run_command(Command::OpenFolder);
                 }
-                self.settings_menu(ui);
+                folder.context_menu(|ui| {
+                    for command in [Command::OpenFolder, Command::OpenFolderInNewWindow, Command::NewWindow] {
+                        let entry = commands::entry(command);
+                        if ui
+                            .add(egui::Button::new(entry.title).shortcut_text(entry.shortcut_text(ui.ctx())))
+                            .clicked()
+                        {
+                            self.run_command(command);
+                        }
+                    }
+                });
+                self.settings_button(ui);
             });
         });
     }
 
-    fn settings_menu(&mut self, ui: &mut egui::Ui) {
-        let gear = activity_button(ui, ic::GEAR, false).on_hover_text("Settings");
-        egui::Popup::menu(&gear)
-            .align(egui::RectAlign::RIGHT_END)
-            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-            .accessible_name("Settings")
-            .show(|ui| {
-                for entry in commands::COMMANDS {
-                    let Command::ToggleSetting(setting) = entry.id else { continue };
-                    let mut enabled = *setting.value(&mut self.settings);
-                    if ui.checkbox(&mut enabled, setting.label()).changed() {
-                        self.run_command(entry.id);
-                    }
-                }
-            });
+    fn settings_button(&mut self, ui: &mut egui::Ui) {
+        let on = matches!(self.tabs.get(self.active), Some(Tab::Settings));
+        let open = commands::entry(Command::OpenSettings);
+        if activity_button(ui, ic::GEAR, on)
+            .on_hover_text(format!("{} ({})", open.title, open.shortcut_text(ui.ctx())))
+            .clicked()
+        {
+            self.run_command(Command::OpenSettings);
+        }
     }
 
     fn save_settings(&mut self, ctx: &egui::Context) {
@@ -2051,6 +2101,7 @@ impl App {
     fn start_page(&mut self, ui: &mut egui::Ui) {
         let width = ui.available_width().min(520.0);
         let mut open = None;
+        let mut open_new = None;
         let mut forget = None;
         ui.vertical_centered(|ui| {
             ui.add_space((ui.available_height() / 6.0).min(120.0));
@@ -2061,7 +2112,13 @@ impl App {
                 .add(egui::Button::new(format!("{} Open Folder…", ic::FOLDER_OPEN)).min_size(egui::vec2(220.0, 30.0)))
                 .clicked()
             {
-                self.request_open_folder();
+                self.request_open_folder(false);
+            }
+            if ui
+                .add(egui::Button::new(format!("{} New Window", ic::APP_WINDOW)).min_size(egui::vec2(220.0, 30.0)))
+                .clicked()
+            {
+                self.run_command(Command::NewWindow);
             }
             ui.add_space(24.0);
             if self.recent.is_empty() {
@@ -2084,13 +2141,20 @@ impl App {
                                     let label = egui::Button::selectable(false, format!("{} {}", ic::FOLDER, dir_name(dir)))
                                         .shortcut_text(RichText::new(parent).small().weak())
                                         .truncate();
-                                    if ui
+                                    let row = ui
                                         .add_sized([ui.available_width(), 26.0], label)
-                                        .on_hover_text(dir.display().to_string())
-                                        .clicked()
-                                    {
+                                        .on_hover_text(dir.display().to_string());
+                                    if row.clicked() {
                                         open = Some(dir.clone());
                                     }
+                                    row.context_menu(|ui| {
+                                        if ui.button("Open").clicked() {
+                                            open = Some(dir.clone());
+                                        }
+                                        if ui.button("Open in New Window").clicked() {
+                                            open_new = Some(dir.clone());
+                                        }
+                                    });
                                 });
                             });
                         });
@@ -2098,6 +2162,9 @@ impl App {
                 });
             });
         });
+        if let Some(dir) = open_new {
+            self.new_window(Some(&dir));
+        }
         self.open_recent(open, forget);
     }
 
@@ -2128,7 +2195,7 @@ impl App {
             .add(egui::Button::new(format!("{} Open Folder…", ic::FOLDER_OPEN)).min_size(egui::vec2(ui.available_width(), 28.0)))
             .clicked()
         {
-            self.request_open_folder();
+            self.request_open_folder(false);
         }
         if self.recent.is_empty() {
             return;
@@ -2260,7 +2327,7 @@ impl App {
             ui.weak("Open a folder to see its changes.");
             ui.add_space(6.0);
             if ui.button(format!("{} Open Folder…", ic::FOLDER_OPEN)).clicked() {
-                self.request_open_folder();
+                self.request_open_folder(false);
             }
             return;
         };
@@ -2471,6 +2538,7 @@ impl App {
                         Tab::FileHistory(history) => format!("{} {}", ic::TREE_STRUCTURE, history.title),
                         Tab::Hex(v) => v.title.clone(),
                         Tab::Graph => format!("{} {}", ic::TREE_STRUCTURE, self.vcs.unwrap_or(Vcs::Git).history_title()),
+                        Tab::Settings => format!("{} Settings", ic::GEAR),
                     };
                     let r = ui.selectable_label(i == self.active, title);
                     #[cfg(feature = "tour")]
@@ -2487,7 +2555,7 @@ impl App {
                         Tab::Large(v) => Some(v.path.clone()),
                         Tab::FileHistory(history) => Some(history.path.clone()),
                         Tab::Hex(v) => Some(v.path.clone()),
-                        Tab::Graph => None,
+                        Tab::Graph | Tab::Settings => None,
                     };
                     let r = match &file_path {
                         Some(p) => r.on_hover_text(p.display().to_string()),
@@ -2750,6 +2818,7 @@ impl App {
                 }
                 Tab::Large(v) => large_view(ui, v),
                 Tab::Hex(v) => v.show(ui),
+                Tab::Settings => self.settings_tab(ui),
                 Tab::FileHistory(v) => v.show(ui, self.settings.diff_ignore_eol),
                 Tab::Graph => {
                     let Some(graph) = &self.graph else {

@@ -64,14 +64,15 @@ fn main() -> eframe::Result {
     }
 
     // Old macOS versions pass "-psn_…" when launched from Finder.
+    let new_window = std::env::args_os().any(|a| a == app::NEW_WINDOW_ARG);
     let arg = std::env::args_os()
         .skip(1)
-        .find(|a| !a.to_string_lossy().starts_with("-psn"))
+        .find(|a| !a.to_string_lossy().starts_with("-psn") && a != app::NEW_WINDOW_ARG)
         .map(PathBuf::from);
     let settings = settings::Settings::load();
     // Without a folder argument, edittr starts on the start page (recent folders)
     // unless "Reopen last folder at startup" is on.
-    let startup = session::Startup::new(arg, settings.restore_previous_session && settings.reopen_last_folder);
+    let startup = session::Startup::new(arg, !new_window && settings.restore_previous_session && settings.reopen_last_folder);
 
     let mut viewport = eframe::egui::ViewportBuilder::default()
         .with_title("edittr")
