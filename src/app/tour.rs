@@ -203,10 +203,11 @@ impl Tour {
                 });
             }
         }
-        if name == "lsp-hover" && self.frames == 20 {
-            if let Some(r) = app.last_caret {
-                self.inject.push(egui::Event::PointerMoved(r.center() + egui::vec2(4.0, 0.0)));
-            }
+        if name == "lsp-hover"
+            && self.frames == 20
+            && let Some(r) = app.last_caret
+        {
+            self.inject.push(egui::Event::PointerMoved(r.center() + egui::vec2(4.0, 0.0)));
         }
         if name == "lsp-completion" {
             match self.frames {
