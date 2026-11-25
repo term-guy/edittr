@@ -10,12 +10,17 @@ A small, fast code editor with built-in git. It's a single native binary written
 - **Multiple cursors**: `Alt+click` adds a cursor, `Ctrl/Cmd+D` selects the next occurrence, and middle-click drag makes a column selection; typing edits every line at once
 - **Editing helpers**: smart indentation (detected from the file or `.editorconfig`), `Tab` / `Shift+Tab` indent, `Ctrl/Cmd+/` toggles comments, undo/redo grouped by typing pauses
 - **Code folding** by indentation (`Ctrl/Cmd+Alt+[` / `]`, or the gutter arrows)
+- **Semantic highlighting**: with a language server, macros, enum members, constants, functions, types and parameters get colors from what the server knows, and code switched off by the preprocessor (`#if 0`, unset configuration macros) is greyed out
+- **Sticky scroll**: the headers of the functions, types and blocks you're scrolling through stay pinned at the top; click one to jump to it
+- **Other uses of the symbol** under the caret are highlighted (where it's written, a little stronger)
 - **Syntax colors**: macros and constants (`#define` names, `const`, `ALL_CAPS` names) get their own color, apart from variables, in C/C++ and other languages
 - **Minimap** (with a clear visible-area band), **split view** (`Ctrl/Cmd+\` or "Open to the Side"), **bracket pair colors**, **current line highlight** and optional **whitespace markers** (spaces as `·`, tabs as `→`)
 - **Gutter change markers**: added, modified and deleted lines compared with the last commit (CRLF files too)
 - **Inline blame**: a dimmed note at the end of the current line saying who changed it, when, and in which commit
 - **Find and replace** in the file (`Ctrl/Cmd+F`, `Ctrl/Cmd+H`) with match case / whole word / regex, all matches highlighted
 - **Format document** (`Shift+Alt+F`) with rustfmt, clang-format, prettier, black or gofmt when installed; **format on save** is optional (off by default)
+- **Binary files** open in a **hex view** (offset, hex and ASCII columns, `Ctrl+G` to jump to an offset, copy as hex or text), even when they are gigabytes large. Binary changes in Source Control, and any two files (**Select for Comparison**, then **Compare with Selected**), are compared byte by byte with next/previous difference
+- **Markdown preview** to the side (the eye icon or **Open Preview to the Side**), updated as you type and scrolling with the editor
 - **Large files**: files of 64 MB or more open in a read-only viewer that indexes them in the background without loading them into memory, with find and go to line
 - **Unicode**: Chinese, Japanese, Korean and other scripts render with the system fonts, and input methods (IME) work
 - **Tab size**: click "Tab size: N" in the status bar (or the command palette) to set how wide tabs are drawn and how many spaces files without an indentation style of their own indent with
@@ -31,6 +36,11 @@ A small, fast code editor with built-in git. It's a single native binary written
 - **Outline** below the Explorer, following the cursor: symbols grouped into collapsible **Macros**, **Constants**, **Variables**, **Types** and **Functions** (collapsed groups are remembered), or in source order. For C/C++ it lists macros with their values, global and `static` variables, and functions
 - **Go to definition** (`Ctrl/Cmd+click` or `F12`; go back with `Alt+Left` (macOS `Ctrl+-`) and forward with `Alt+Right` (macOS `Ctrl+Shift+-`), or the mouse back/forward buttons): uses a language server when available, otherwise a built-in text search that understands common definition syntax (`fn`, `def`, `class`, `const`, `#define`, …)
 - **Find all references** (`Shift+F12`), **hover info**, and **autocomplete** (as you type or `Ctrl+Space`) from the language server
+- **Rename symbol** (`F2`): every use across the project, previewed line by line before it's applied; open files change in the editor (one undo step), the others on disk. Without a language server it renames whole words in the current file
+- **Quick fixes and code actions** (`Ctrl/Cmd+.`, or right-click): the language server's fixes for the diagnostics on the current line (a missing `;`, a missing `#include`, …) and its refactorings
+- **Parameter hints** while typing a call's arguments (or `Ctrl/Cmd+Shift+Space`), with the current parameter underlined; `Alt+Up/Down` switches between overloads
+- **Call hierarchy** (`Shift+Alt+H`): who calls a function and what it calls, expanded level by level
+- The editor's **right-click menu** has these too: go to definition, find references, call hierarchy, rename, quick fix and file history
 - **Diagnostics**: errors and warnings as squiggles, in a Problems panel and as counts in the status bar
 - **Switch between C/C++ source and header** (`Alt+O`)
 
@@ -48,6 +58,7 @@ A small, fast code editor with built-in git. It's a single native binary written
 - Staged and unstaged changes as a list or a tree (remembered), stage/unstage/discard per file, per folder (with a confirmation) or all, commit / amend, switch branches, fetch / pull (fast-forward only) / push
 - **Diffs** side by side or inline. For working-copy changes the right side is the real editor: edit, undo and save right there, with the changes recomputed as you type. **Ignore line endings** (on by default) hides CRLF/LF-only differences
 - **Graph and history**: branch lanes, merges, branch and tag labels in their lane's color. Selecting a commit shows its changed files as a tree with each file's diff (side by side or inline). Right-click a commit or a branch/tag label to check out, create a branch or tag, reset (soft/mixed/hard), cherry-pick, revert, merge, delete a branch, or copy the hash, message, author or ref name. For Subversion, the log and blame are cached so the server isn't asked again, and history times are shown in local time
+- **File history**: the commits that changed a file (following renames), or only the selected lines (`git log -L`); pick one to see its change side by side. From the Explorer, tab or editor right-click menu, or the command palette
 - A **background watcher** keeps the Explorer colors and Source Control view up to date when files or the repository change outside the editor
 
 Git runs through your installed `git` (and Subversion through `svn`), so your config, credential helpers, SSH keys and hooks all apply.
@@ -159,7 +170,11 @@ On Linux you need the usual windowing dev packages (see `.github/workflows/build
 | `Ctrl/Cmd+Shift+F` | Search in files (the selection, if any); `Enter` runs a search |
 | `Ctrl/Cmd+click`, `F12` | Go to definition |
 | `Shift+F12` | Find all references |
+| `F2` | Rename symbol |
+| `Ctrl/Cmd+.` | Quick fix / code actions |
+| `Shift+Alt+H` | Call hierarchy |
 | `Ctrl+Space` | Autocomplete |
+| `Ctrl/Cmd+Shift+Space` | Parameter hints |
 | `Alt+O` | Switch between C/C++ source and header |
 | `Alt+Left` (macOS: `Ctrl+-`), mouse back button | Go back |
 | `Alt+Right` (macOS: `Ctrl+Shift+-`), mouse forward button | Go forward |
