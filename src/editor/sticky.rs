@@ -46,22 +46,55 @@ pub(crate) fn outline_scopes<'a>(symbols: impl Iterator<Item = &'a Symbol>, text
     scopes.into()
 }
 
-fn fold_scopes(text: &str, ix: &LineIndex, regions: &[Range<usize>]) -> BTreeMap<usize, usize> {
+/// A block header of control flow: `if`, `} else {`, loops, `switch`, `case X:` (indented case bodies are
+/// fold regions too), `try` / `catch`...
+fn control_flow(line: &str) -> bool {
+    let first = line
+        .trim_start_matches(|c: char| c == '}' || c.is_whitespace())
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .next()
+        .unwrap_or_default();
+    matches!(
+        first,
+        "if" | "else"
+            | "elif"
+            | "elsif"
+            | "unless"
+            | "for"
+            | "foreach"
+            | "while"
+            | "until"
+            | "do"
+            | "loop"
+            | "match"
+            | "switch"
+            | "select"
+            | "case"
+            | "default"
+            | "when"
+            | "try"
+            | "catch"
+            | "except"
+            | "finally"
+            | "with"
+    )
+}
+
+fn fold_scopes(text: &str, ix: &LineIndex, regions: &[Range<usize>], control: bool) -> BTreeMap<usize, usize> {
     let mut scopes = BTreeMap::new();
     let mut continuations = BTreeMap::new();
     for region in regions {
         let line = text[ix.line_range(text, region.start)].trim();
         let continued = line.starts_with(')').then(|| continuations.remove(&region.start)).flatten();
         let first = line.split(|c: char| !c.is_alphanumeric() && c != '_').next().unwrap_or_default();
-        if matches!(
-            first,
-            "if" | "else" | "for" | "while" | "match" | "switch" | "try" | "catch" | "with" | "loop" | "do"
-        ) {
+        let flow = control_flow(line);
+        if flow && !control {
             continue;
         }
         let header = if let Some(header) = continued {
             header
-        } else if first == "impl"
+        } else if flow
+            || first == "impl"
             || goto::definitions(line)
                 .next()
                 .is_some_and(|def| declaration(def.kind) || (def.kind == "Type" && line.ends_with('{')))
@@ -92,7 +125,8 @@ fn fold_scopes(text: &str, ix: &LineIndex, regions: &[Range<usize>]) -> BTreeMap
 
 #[derive(Default)]
 pub(super) struct Cache {
-    version: Option<u64>,
+    /// (version, control flow included) the fold scopes were computed for.
+    version: Option<(u64, bool)>,
     folds: BTreeMap<usize, usize>,
     outline: Option<(u64, Scopes)>,
     entries: Vec<(usize, Headers)>,
@@ -108,15 +142,15 @@ impl Cache {
             return;
         }
         self.outline = Some((version, scopes.clone()));
-        if self.version == Some(version) {
+        if self.version.is_some_and(|(v, _)| v == version) {
             self.rebuild(version);
         }
     }
 
-    pub(super) fn update(&mut self, version: u64, text: &str, ix: &LineIndex, regions: &[Range<usize>]) {
-        if self.version != Some(version) {
-            self.version = Some(version);
-            self.folds = fold_scopes(text, ix, regions);
+    pub(super) fn update(&mut self, version: u64, text: &str, ix: &LineIndex, regions: &[Range<usize>], control: bool) {
+        if self.version != Some((version, control)) {
+            self.version = Some((version, control));
+            self.folds = fold_scopes(text, ix, regions, control);
             self.rebuild(version);
         }
     }
@@ -219,19 +253,37 @@ impl Overlay {
                 .is_some_and(|pos| pos.y < self.viewport.top() + height && self.viewport.contains(pos))
     }
 
-    pub(super) fn interact(&self, ui: &egui::Ui, id: egui::Id, view: &fold::View) -> Option<f32> {
-        let mut clicked = None;
+    /// Clicks on the pinned lines: the scroll offset to jump to, and a command from their context menu.
+    pub(super) fn interact(
+        &self,
+        ui: &egui::Ui,
+        id: egui::Id,
+        view: &fold::View,
+        control_flow: bool,
+    ) -> (Option<f32>, Option<crate::commands::Command>) {
+        use crate::commands::{Command, Setting};
+        let (mut clicked, mut command) = (None, None);
         for (line, rect) in self.rows() {
-            if ui
+            let response = ui
                 .interact(rect, id.with(("sticky_header", line)), Sense::click())
-                .on_hover_cursor(egui::CursorIcon::PointingHand)
-                .clicked()
-            {
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
+            if response.clicked() {
                 // Leave space for any enclosing headers that will still be pinned after the jump.
                 clicked = Some(view.row(line).saturating_sub(self.available) as f32 * self.row_h);
             }
+            response.context_menu(|ui| {
+                let mut on = control_flow;
+                if ui.checkbox(&mut on, "Pin control flow (if, else, loops, switch, case)").clicked() {
+                    command = Some(Command::ToggleSetting(Setting::StickyControlFlow));
+                    ui.close();
+                }
+                if ui.button("Turn off sticky scroll").clicked() {
+                    command = Some(Command::ToggleSetting(Setting::StickyScroll));
+                    ui.close();
+                }
+            });
         }
-        clicked
+        (clicked, command)
     }
 
     pub(super) fn paint(&self, lines: &Lines<'_>, text_x: f32, gutter_w: f32, char_w: f32) {
@@ -270,7 +322,7 @@ impl Overlay {
 #[cfg(feature = "tour")]
 pub(crate) fn tour_line(text: &str) -> Option<usize> {
     let ix = LineIndex::new(text);
-    let scopes = fold_scopes(text, &ix, &fold::regions(text, &ix));
+    let scopes = fold_scopes(text, &ix, &fold::regions(text, &ix), false);
     let (start, end) = scopes.into_iter().max_by_key(|&(start, end)| end - start)?;
     (end > start).then_some((start + 3).min(end))
 }
@@ -284,7 +336,7 @@ mod tests {
         let text = "impl Example {\n    fn f() {\n        if condition {\n            work();\n        }\n    }\n}\nfn outside() {}\n";
         let ix = LineIndex::new(text);
         let mut cache = Cache::default();
-        cache.update(1, text, &ix, &fold::regions(text, &ix));
+        cache.update(1, text, &ix, &fold::regions(text, &ix), false);
         assert_eq!(cache.headers(0), [NO_LINE; MAX_HEADERS]);
         assert_eq!(cache.headers(1), [0, NO_LINE, NO_LINE, NO_LINE, NO_LINE]);
         assert_eq!(cache.headers(3), [0, 1, NO_LINE, NO_LINE, NO_LINE]);
@@ -293,16 +345,46 @@ mod tests {
     }
 
     #[test]
+    fn control_flow_is_pinned_only_when_enabled() {
+        let text = "\
+void something() {
+    if (something) {
+        asdf();
+    } else {
+        switch (something) {
+            case ASDF:
+                one();
+                two();
+            default:
+                three();
+        }
+    }
+}
+";
+        let ix = LineIndex::new(text);
+        let regions = fold::regions(text, &ix);
+        let mut cache = Cache::default();
+        cache.update(1, text, &ix, &regions, true);
+        let pinned = |cache: &Cache, line| cache.headers(line).into_iter().take_while(|&l| l != NO_LINE).collect::<Vec<_>>();
+        assert_eq!(pinned(&cache, 2), [0, 1]);
+        assert_eq!(pinned(&cache, 7), [0, 3, 4, 5], "function, else, switch, case");
+        assert_eq!(pinned(&cache, 9), [0, 3, 4, 8], "the next case replaces the previous one");
+        cache.update(1, text, &ix, &regions, false);
+        assert_eq!(pinned(&cache, 7), [0], "declarations only");
+        assert!(control_flow("} else if (x) {") && control_flow("for x in y:") && !control_flow("format(x);"));
+    }
+
+    #[test]
     fn outline_ranges_replace_fold_extents_only_for_their_version() {
         let text = "fn f(\n    a: usize,\n) {\n    work(a);\n}\n";
         let ix = LineIndex::new(text);
         let regions = fold::regions(text, &ix);
         let mut cache = Cache::default();
-        cache.update(1, text, &ix, &regions);
+        cache.update(1, text, &ix, &regions, false);
         assert_eq!(cache.headers(3)[0], 0);
         cache.set_outline(1, &Arc::from([(0, 2)]));
         assert_eq!(cache.headers(3)[0], NO_LINE);
-        cache.update(2, text, &ix, &regions);
+        cache.update(2, text, &ix, &regions, false);
         assert_eq!(cache.headers(3)[0], 0);
     }
 

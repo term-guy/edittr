@@ -46,6 +46,8 @@ pub(crate) struct Settings {
     /// Colors from the language server (macros, types, functions, disabled code).
     pub(crate) semantic_highlighting: bool,
     pub(crate) sticky_scroll: bool,
+    /// Sticky scroll also pins if / else / loops / switch / case blocks, not only declarations.
+    pub(crate) sticky_control_flow: bool,
     pub(crate) show_outline: bool,
     pub(crate) outline_expanded: bool,
     pub(crate) outline_grouped: bool,
@@ -77,6 +79,7 @@ impl Default for Settings {
             bracket_colors: true,
             semantic_highlighting: true,
             sticky_scroll: true,
+            sticky_control_flow: true,
             show_outline: true,
             outline_expanded: true,
             outline_grouped: true,
@@ -222,6 +225,7 @@ impl Settings {
                     "bracket_colors" => settings.bracket_colors = value,
                     "semantic_highlighting" => settings.semantic_highlighting = value,
                     "sticky_scroll" => settings.sticky_scroll = value,
+                    "sticky_control_flow" => settings.sticky_control_flow = value,
                     "show_outline" => settings.show_outline = value,
                     "outline_expanded" => settings.outline_expanded = value,
                     "outline_grouped" => settings.outline_grouped = value,
@@ -249,6 +253,7 @@ impl Settings {
                         | "bracket_colors"
                         | "semantic_highlighting"
                         | "sticky_scroll"
+                        | "sticky_control_flow"
                         | "restore_previous_session"
                         | "reopen_last_folder"
                         | "tab_size"
@@ -283,6 +288,7 @@ impl Settings {
         text.push_str(&format!("bracket_colors={}\n", self.bracket_colors));
         text.push_str(&format!("semantic_highlighting={}\n", self.semantic_highlighting));
         text.push_str(&format!("sticky_scroll={}\n", self.sticky_scroll));
+        text.push_str(&format!("sticky_control_flow={}\n", self.sticky_control_flow));
         text.push_str(&format!("restore_previous_session={}\n", self.restore_previous_session));
         text.push_str(&format!("reopen_last_folder={}\n", self.reopen_last_folder));
         text.push_str(&format!("tab_size={}\n", self.tab_size));
@@ -510,7 +516,7 @@ mod tests {
         let text = settings.format(previous);
         assert_eq!(
             text,
-            "future_key=one=two\nfuture_key = three\n# A comment\nchanges_tree=false\nhighlight_line=false\nshow_whitespace=false\ndiff_ignore_eol=true\ninline_blame=true\nminimap=true\nbracket_colors=true\nsemantic_highlighting=true\nsticky_scroll=true\nrestore_previous_session=true\nreopen_last_folder=false\ntab_size=4\neditor_font_size=13\nui_font_size=13\nbreadcrumb_font_size=11\nformat_on_save=false\nshow_outline=true\noutline_expanded=true\noutline_grouped=true\noutline_collapsed_groups=\ntheme_preference=system\ntheme_dark=edittr-dark\ntheme_light=edittr-light\n"
+            "future_key=one=two\nfuture_key = three\n# A comment\nchanges_tree=false\nhighlight_line=false\nshow_whitespace=false\ndiff_ignore_eol=true\ninline_blame=true\nminimap=true\nbracket_colors=true\nsemantic_highlighting=true\nsticky_scroll=true\nsticky_control_flow=true\nrestore_previous_session=true\nreopen_last_folder=false\ntab_size=4\neditor_font_size=13\nui_font_size=13\nbreadcrumb_font_size=11\nformat_on_save=false\nshow_outline=true\noutline_expanded=true\noutline_grouped=true\noutline_collapsed_groups=\ntheme_preference=system\ntheme_dark=edittr-dark\ntheme_light=edittr-light\n"
         );
         assert!(!Settings::parse(&text).changes_tree);
     }

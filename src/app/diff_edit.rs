@@ -260,6 +260,7 @@ impl App {
                 minimap: false,
                 bracket_colors: settings.bracket_colors,
                 sticky_scroll: false,
+                sticky_control_flow: false,
                 navigation_menu: false,
                 read_only: true,
             };

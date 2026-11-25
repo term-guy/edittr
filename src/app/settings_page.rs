@@ -96,6 +96,11 @@ const SECTIONS: &[(&str, &[Item])] = &[
                 "Pin the headers of the functions and types you are scrolling through to the top.",
             ),
             item(
+                Toggle(Setting::StickyControlFlow),
+                "Sticky scroll: control flow",
+                "Also pin the if, else, loop, switch and case lines around the visible code, not only functions and types.",
+            ),
+            item(
                 Toggle(Setting::InlineBlame),
                 "Inline blame",
                 "Show who last changed the current line, dimmed after its end.",

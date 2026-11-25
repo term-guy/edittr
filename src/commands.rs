@@ -67,6 +67,7 @@ pub(crate) enum Setting {
     BracketColors,
     SemanticHighlighting,
     StickyScroll,
+    StickyControlFlow,
     ShowOutline,
 }
 
@@ -85,6 +86,7 @@ impl Setting {
             Self::BracketColors => "Color nested brackets",
             Self::SemanticHighlighting => "Semantic highlighting (colors from the language server)",
             Self::StickyScroll => "Sticky scroll",
+            Self::StickyControlFlow => "Sticky scroll: control flow (if, else, loops, switch, case)",
             Self::ShowOutline => "Show outline",
         }
     }
@@ -103,6 +105,7 @@ impl Setting {
             Self::BracketColors => &mut settings.bracket_colors,
             Self::SemanticHighlighting => &mut settings.semantic_highlighting,
             Self::StickyScroll => &mut settings.sticky_scroll,
+            Self::StickyControlFlow => &mut settings.sticky_control_flow,
             Self::ShowOutline => &mut settings.show_outline,
         }
     }
@@ -266,6 +269,7 @@ pub(crate) const COMMANDS: &[Entry] = &[
     Entry::new(ToggleSetting(Setting::BracketColors), "Toggle bracket pair colors", &[]),
     Entry::new(ToggleSetting(Setting::SemanticHighlighting), "Toggle semantic highlighting", &[]),
     Entry::new(ToggleSetting(Setting::StickyScroll), "Toggle sticky scroll", &[]),
+    Entry::new(ToggleSetting(Setting::StickyControlFlow), "Toggle sticky scroll control flow", &[]),
     Entry::new(ToggleSetting(Setting::ShowOutline), "Show outline", &[]),
     Entry::new(TabSize(2), "Tab size: 2", &[]),
     Entry::new(TabSize(4), "Tab size: 4", &[]),
