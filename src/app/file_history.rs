@@ -157,7 +157,7 @@ impl History {
     pub(super) fn show(&mut self, ui: &mut egui::Ui, ignore_eol: bool) {
         ui.heading(&self.title);
         let Some(log) = &self.log else {
-            ui.weak("Loading file history…");
+            ui.colored_label(secondary_text_color(ui.visuals()), "Loading file history…");
             return;
         };
         let log = match log {
@@ -168,7 +168,7 @@ impl History {
             }
         };
         if log.entries.is_empty() {
-            ui.weak("No commits for this path.");
+            ui.colored_label(secondary_text_color(ui.visuals()), "No commits for this path.");
             return;
         }
         let row_height = ui.spacing().interact_size.y;

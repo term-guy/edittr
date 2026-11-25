@@ -25,7 +25,7 @@ mod tour;
 
 use crate::commands::{self, Command, Setting};
 use crate::editor;
-use crate::graph::Graph;
+use crate::graph::{Graph, secondary_text_color};
 use crate::icons as ic;
 use crate::search::{self, FileHits};
 use crate::session::{Side, Startup, Writer};
@@ -2777,7 +2777,7 @@ impl App {
                             if let (Some(commit), Some(repo), Some(vcs)) = (commit, &self.repo, self.vcs) {
                                 self.graph_detail.show(ui, commit, repo, vcs);
                             } else {
-                                ui.weak("Select a commit to see its details.");
+                                ui.colored_label(secondary_text_color(ui.visuals()), "Select a commit to see its details.");
                             }
                         });
                     egui::CentralPanel::default().show(ui, |ui| {
