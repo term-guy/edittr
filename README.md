@@ -25,6 +25,7 @@ A small, fast code editor with built-in git. It's a single native binary written
 - **Unicode**: Chinese, Japanese, Korean and other scripts render with the system fonts, and input methods (IME) work
 - **Tab size**: click "Tab size: N" in the status bar (or the command palette) to set how wide tabs are drawn and how many spaces files without an indentation style of their own indent with
 - **Files changed outside edittr**: nothing is reloaded behind your back. A bar offers **Reload**, **Compare** (the disk version against the editor text) or **Keep mine**
+- **New file / New folder** (`Ctrl/Cmd+N`, the buttons in the Explorer header, or right-click a folder): type a name, subfolders included (`notes/todo.md`); the file is created and opened, and an existing file is never overwritten. With no folder open, New file asks where to save
 - **Start page**: edittr opens on a start page with your recent folders; the ✕ in the Explorer header (or **Close folder**) goes back to it
 - **Session restore**: reopens each folder's tabs, cursor positions and layout
 - **Multiple windows**: **New window** (`Ctrl/Cmd+Shift+N`, the start page, or right-click the folder icon in the activity bar) opens another edittr window, so several projects can be open at once; **Open folder in new window…** and right-clicking a recent folder open a project directly in a new window
@@ -70,7 +71,10 @@ Shows the language of the current file, the cursor position, problem counts, and
 
 ### Settings
 
-The gear in the activity bar (or `Ctrl/Cmd+,`) opens the **Settings** page: every option grouped by area, with a search box, switches, the tab size, the theme and the C/C++ build settings. Changes apply and save immediately. Each option is also in the command palette.
+The gear in the activity bar (or `Ctrl/Cmd+,`) opens the **Settings** page: every option grouped by area, with a search box, switches, the tab size, the theme, fonts and the C/C++ build settings. Changes apply and save immediately. Each option is also in the command palette.
+
+- **Themes**: built-in color themes, mostly dark (edittr Dark, Tidal Glass, Kiln Ash, Plum Circuit, Fern Relay, Graphite Signal; edittr Light and Oat Paper), with a live preview. The **theme editor** has a color for each part (background, selection, current line, line numbers, comments, keywords, strings, numbers, constants, macros, types, functions, variables, operators, disabled code and bracket depths); edits are kept as your custom theme and **Reset to preset** undoes them. Syntax and language-server colors both follow the theme, in the editor and in diffs
+- **Fonts**: the **editor font** (code, line numbers, diffs) and the **UI font** (menus, panels, dialogs) can each be any installed font, with their own size; monospace fonts are listed first for the editor. **Default** goes back to the bundled fonts
 
 | Setting | Default |
 | --- | --- |
@@ -89,6 +93,8 @@ The gear in the activity bar (or `Ctrl/Cmd+,`) opens the **Settings** page: ever
 | Diff: ignore line endings | on |
 | Outline: grouped by kind | on |
 | Tab size | 4 |
+| Theme | System (edittr Dark / edittr Light) |
+| Editor font, UI font | Default (bundled), 13 pt |
 
 ## Language servers
 
@@ -166,6 +172,7 @@ On Linux you need the usual windowing dev packages (see `.github/workflows/build
 | `Ctrl/Cmd+Shift+P`, `F1` | Command palette |
 | `Ctrl/Cmd+,` | Settings |
 | `Ctrl/Cmd+Shift+N` | New window |
+| `Ctrl/Cmd+N` | New file |
 | `Ctrl/Cmd+P` | Go to file (`name:line`, `name:line-line`) |
 | `Ctrl+G` | Go to line (`line` or `line:column`) |
 | `Ctrl/Cmd+Shift+O` | Go to symbol in file |

@@ -35,14 +35,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 - Lookup order (`lsp::resolve`): PATH, then a bundle (`src/bundled.rs`: `servers/servers.json` next to the exe, in `Contents/Resources`, or `../lib/edittr`), then on-demand installs (`src/installer.rs`). `edittr --list-servers` prints what each language resolves to.
 - Full downloads are assembled by `.github/scripts/bundle-servers.sh <platform> <dest>` (runs on macOS locally too). To test a bundle against the real servers: symlink it to `target/release/deps/servers` and run `cargo test --release -- --ignored lsp_round_trip`.
-- clangd flags are resolved in `clangd::CompilationDatabase::prepare` (project database → generated one in the cache → clangd's own compile_flags.txt/nested discovery → inferred from Makefiles by `makeflags.rs`). Commands of compilers clangd can't use (IAR, TI, Keil, ...) are rewritten by `ccompilers::translate`; "Generate compile database" is `compdb.rs`. Real-clangd tests: `cargo test --release -- --ignored lsp_round_trip_clangd`.
+- clangd flags are resolved in `clangd::CompilationDatabase::prepare` (project database → generated one in the cache → clangd's own compile_flags.txt/nested discovery → inferred from Makefiles by `makeflags.rs`). Commands of compilers clangd can't use (IAR, TI, Keil, ...) are rewritten by `ccompilers::translate`; "Generate compile database" is `compdb.rs`. Real-clangd tests: `cargo test --release -- --ignored lsp_round_trip_clangd`. rename / code actions / signature help / highlights / semantic tokens / call hierarchy also have real-server tests for rust-analyzer and gopls (`lsp_round_trip_rust_analyzer_editing_features`, `lsp_round_trip_gopls_editing_features`; servers on PATH).
 - `typescript` must stay pinned to `@6` (installer + bundle script): TypeScript 7 dropped the `tsserver.js` that typescript-language-server needs.
 
 ## Gotchas
 
 - The editor is a custom widget (`src/editor/`: `buffer.rs` text model + undo, `fold.rs`, `mod.rs` widget) that lays out only visible lines; don't reintroduce `egui::TextEdit` for code. Its keyboard behavior is covered by headless widget tests in `src/editor/mod.rs` (drive the real widget with injected events). Headless `ctx.run_ui` calls must `textures_delta.clear()` the output, or epaint panics in debug builds.
 - Editor text changes must bump `Doc::version` (use `Doc::reload` / `Doc::mark_saved`): highlighting, blame, dirty state and the gutter are cached per version. Syntax highlighting is incremental (`src/highlight.rs`), not egui_extras' whole-buffer highlighter.
-- VCS calls go through `src/vcs.rs` (Git or Subversion) on background workers; refreshes are driven by the file watcher (`src/watch.rs`), not a timer. `svn` is not installed on the dev Mac: svn code is only unit-tested against sample XML.
+- VCS calls go through `src/vcs.rs` (Git or Subversion) on background workers; refreshes are driven by the file watcher (`src/watch.rs`), not a timer. Real-Subversion test: `cargo test -- --ignored svn_path_history` (needs `svn` and `svnadmin`).
 - The release workflow builds macOS on `macos-15-intel` (Apple Silicon runners were often not assigned in time); it still produces the universal app, and the `verify` job runs it on Apple Silicon. A run that fails only because a runner wasn't assigned or `hdiutil` was busy can be re-run with `gh run rerun <id> --failed`.
 - To measure frame times, time `App::ui` temporarily and run the tour against a demo repo containing a ~20k-line file; remove the timer afterwards.
 
@@ -53,4 +53,4 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Every spawned process needs `CREATE_NO_WINDOW` on Windows (see `git::cmd`), or a console window flashes.
 - Downloads use ureq with `RootCerts::PlatformVerifier` (OS trust store). Don't switch back to bundled webpki roots: that broke clangd downloads.
 - `rfd` is pinned to `=0.18.0` because Linux portal-failure detection in `app.rs` hooks its internal log target.
-- egui's default fonts lack most symbols (they render as boxes); use the Phosphor constants in `src/icons.rs`.
+- egui's default fonts lack most symbols (they render as boxes); use the Phosphor constants in `src/icons.rs`. They use Phosphor's codepoints + 0xF2000 (Supplementary Private Use Area-B), aliased in the patched `assets/Phosphor.ttf`, so a user-chosen font with its own BMP private-use glyphs (Nerd Fonts) can't replace the icons. New icon: verify the glyph by rendering the font, then add 0xF2000.
