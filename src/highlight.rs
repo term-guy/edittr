@@ -81,6 +81,24 @@ pub struct Cache {
     version: Option<u64>,
 }
 
+/// Grammars that have highlighted something already. A grammar compiles its regexes
+/// on first use (Markdown, which embeds other languages, took ~40 ms), so the first
+/// file of each language is highlighted in the background however short it is.
+fn warmed_set() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static W: OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    W.get_or_init(Default::default)
+}
+
+fn warmed(name: &str) -> bool {
+    warmed_set().lock().is_ok_and(|w| w.contains(name))
+}
+
+fn mark_warmed(name: &str) {
+    if let Ok(mut w) = warmed_set().lock() {
+        w.insert(name.to_string());
+    }
+}
+
 fn hash_str(s: &str) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     s.hash(&mut h);
@@ -118,12 +136,13 @@ impl Cache {
                 Err(std::sync::mpsc::TryRecvError::Empty) => return false,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => self.pending = None,
             }
-        } else if self.lines.is_empty() && text.bytes().filter(|&b| b == b'\n').count() > BACKGROUND_LINES {
+        } else if self.lines.is_empty() && (!warmed(&syntax.name) || text.bytes().filter(|&b| b == b'\n').count() > BACKGROUND_LINES) {
             let (tx, rx) = std::sync::mpsc::channel();
             let (text, ctx) = (text.to_string(), ctx.clone());
             std::thread::spawn(move || {
                 let mut c = Cache::default();
                 c.update(&text, syntax, dark);
+                mark_warmed(&syntax.name);
                 let _ = tx.send(c.lines);
                 ctx.request_repaint();
             });

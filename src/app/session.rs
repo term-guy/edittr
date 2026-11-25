@@ -78,15 +78,15 @@ struct LoadedWorkspace {
     search_replace_shown: bool,
     tabs: Vec<(FileTab, DiskText)>,
     active: Option<PathBuf>,
-    error: Option<String>,
+    requested_file: Option<PathBuf>,
 }
 
 impl LoadedWorkspace {
     fn load(root: Option<PathBuf>, file: Option<PathBuf>) -> Self {
         let Workspace { layout, sidebar_ui } = Workspace::load(root.as_deref());
         let expanded = root.as_deref().map(|root| sidebar_ui.restore_expanded(root)).unwrap_or_default();
-        let mut active = layout.active.map(|p| workspace::plain_path(Path::new(&p)));
-        let mut tabs: Vec<_> = layout
+        let active = layout.active.map(|p| workspace::plain_path(Path::new(&p)));
+        let tabs: Vec<_> = layout
             .tabs
             .into_iter()
             .filter_map(|mut tab| {
@@ -103,28 +103,6 @@ impl LoadedWorkspace {
                 Some((tab, text))
             })
             .collect();
-        let mut error = None;
-        if let Some(path) = file {
-            if tabs.iter().any(|(tab, _)| tab.path == path.as_os_str()) {
-                active = Some(path);
-            } else {
-                match read_doc_text(&path) {
-                    Ok(Some(text)) => {
-                        tabs.push((
-                            FileTab {
-                                path: path.as_os_str().to_owned(),
-                                cursor: 0,
-                                anchor: 0,
-                            },
-                            text,
-                        ));
-                        active = Some(path);
-                    }
-                    Ok(None) => error = Some(format!("{} looks binary; not opening", path.display())),
-                    Err(err) => error = Some(format!("{}: {err}", path.display())),
-                }
-            }
-        }
         let ignored = root.as_deref().map(workspace::load_ignored).unwrap_or_default();
         let search_filters = root.as_deref().map(workspace::load_search_filters).unwrap_or_default();
         Self {
@@ -138,7 +116,7 @@ impl LoadedWorkspace {
             search_replace_shown: sidebar_ui.search_replace_shown,
             tabs,
             active,
-            error,
+            requested_file: file,
         }
     }
 }
@@ -248,6 +226,7 @@ impl App {
                 // Closing a folder lands on an empty start page, not the no-folder session's files.
                 loaded.tabs.clear();
                 loaded.active = None;
+                loaded.requested_file = None;
             }
             self.tabs.clear();
             self.active = 0;
@@ -296,8 +275,8 @@ impl App {
                 Some(Tab::File(doc)) => Some(doc.path.clone()),
                 _ => None,
             };
-            if let Some(error) = loaded.error {
-                self.message = error;
+            if let Some(path) = loaded.requested_file {
+                self.open_file(&path);
             }
         }
         self.sessions.loading.is_some()

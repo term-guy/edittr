@@ -163,6 +163,29 @@ impl Vcs {
         }
     }
 
+    pub(crate) fn path_history(
+        self,
+        root: &Path,
+        path: &str,
+        directory: bool,
+        lines: Option<std::ops::RangeInclusive<usize>>,
+    ) -> Result<Vec<crate::file_history::Entry>, String> {
+        crate::file_history::log(self, root, path, directory, lines)
+    }
+
+    pub(crate) fn path_history_patch(self, root: &Path, path: &str, entry: &crate::file_history::Entry) -> Result<String, String> {
+        crate::file_history::patch(root, path, entry)
+    }
+
+    pub(crate) fn path_history_binary_sides(
+        self,
+        root: &Path,
+        path: &str,
+        entry: &crate::file_history::Entry,
+    ) -> Result<crate::hex::Pair, String> {
+        crate::file_history::binary_patch_sides(root, path, entry)
+    }
+
     pub fn refresh_log(self, root: &Path, limit: usize, cached: impl FnOnce(Vec<Commit>)) -> Result<Vec<Commit>, String> {
         match self {
             Self::Git => self.log(root, limit, cached),

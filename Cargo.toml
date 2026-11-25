@@ -28,6 +28,7 @@ ureq = { version = "3.5.2", features = ["platform-verifier", "win-system-proxy"]
 url = "2.5.9"
 yaml-rust = "0.4.5"
 zip = { version = "9.8.2", default-features = false, features = ["deflate"] }
+pulldown-cmark = { version = "0.13", default-features = false }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 log = "0.4"

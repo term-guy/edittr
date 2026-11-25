@@ -17,14 +17,18 @@ pub(super) fn show(resp: &Response, st: &mut State, lines: &Lines<'_>, lay: &Lay
         .filter(|&(v, _)| v == version);
     let mut command = None;
     resp.context_menu(|ui| {
-        const ITEMS: [Option<Command>; 6] = [
+        const ITEMS: [Option<Command>; 9] = [
             Some(Command::GoToDefinition),
             Some(Command::FindReferences),
             Some(Command::ShowCallHierarchy),
             None, // separator
             Some(Command::RenameSymbol),
             Some(Command::CodeActions),
+            None,
+            Some(Command::FileHistory),
+            Some(Command::SelectionHistory),
         ];
+        let selected = st.sels.iter().any(|s| !s.is_empty());
         for item in ITEMS {
             let Some(id) = item else {
                 ui.separator();
@@ -37,10 +41,13 @@ pub(super) fn show(resp: &Response, st: &mut State, lines: &Lines<'_>, lay: &Lay
                 Command::ShowCallHierarchy => "Show call hierarchy",
                 Command::RenameSymbol => "Rename symbol…",
                 Command::CodeActions => "Quick fix…",
+                Command::FileHistory => "File history",
+                Command::SelectionHistory => "File history for selection",
                 _ => entry.title,
             };
             let button = egui::Button::new(label).shortcut_text(entry.shortcut_text(ui.ctx()));
-            if ui.add_enabled(target.is_some(), button).clicked() {
+            let enabled = target.is_some() && (id != Command::SelectionHistory || selected);
+            if ui.add_enabled(enabled, button).clicked() {
                 command = Some(id);
                 ui.close();
             }
