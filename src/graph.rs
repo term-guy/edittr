@@ -31,10 +31,19 @@ pub fn lane_color(i: usize) -> Color32 {
     PALETTE[i % PALETTE.len()]
 }
 
+/// Commit subjects: between egui's normal text (dim gray in the dark theme) and its strong text.
+pub(crate) fn primary_text_color(vis: &egui::Visuals) -> Color32 {
+    vis.text_color()
+        .lerp_to_gamma(vis.strong_text_color(), if vis.dark_mode { 0.6 } else { 0.5 })
+}
+
+/// Author, date and hash: softer than the subject, still at least 4.5:1 against the background.
 pub(crate) fn secondary_text_color(vis: &egui::Visuals) -> Color32 {
-    // Dark theme's normal text has less contrast to spare, especially on hovered rows.
-    let weak_mix = if vis.dark_mode { 0.12 } else { 0.4 };
-    vis.text_color().lerp_to_gamma(vis.weak_text_color(), weak_mix)
+    if vis.dark_mode {
+        vis.text_color().lerp_to_gamma(vis.strong_text_color(), 0.25)
+    } else {
+        vis.text_color().lerp_to_gamma(vis.weak_text_color(), 0.4)
+    }
 }
 
 impl Graph {
@@ -181,7 +190,7 @@ impl Graph {
                         // The selection foreground has less contrast to spare on the blue fill.
                         (text, text.gamma_multiply(0.95))
                     } else {
-                        (vis.text_color(), secondary_text_color(vis))
+                        (primary_text_color(vis), secondary_text_color(vis))
                     };
                     let mut px = rect.left() + graph_w + 4.0;
                     let cy = rect.center().y;

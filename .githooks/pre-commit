@@ -1,0 +1,17 @@
+#!/bin/sh
+# Formats the staged Rust files before each commit (enable with: git config core.hooksPath .githooks).
+# Files that also have unstaged edits are only checked, so a partial commit never picks up extra changes.
+set -e
+files=$(git diff --cached --name-only --diff-filter=ACMR -- '*.rs')
+[ -z "$files" ] && exit 0
+status=0
+for f in $files; do
+    if git diff --quiet -- "$f"; then
+        rustfmt --edition 2024 "$f"
+        git add -- "$f"
+    elif ! rustfmt --edition 2024 --check "$f" >/dev/null 2>&1; then
+        echo "pre-commit: $f needs formatting but has unstaged changes; run cargo fmt and stage it." >&2
+        status=1
+    fi
+done
+exit $status

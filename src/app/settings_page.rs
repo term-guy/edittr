@@ -144,13 +144,17 @@ impl Page {
 }
 
 fn matches(filter: &str, section: &str, item: &Item) -> bool {
-    let filter = filter.trim().to_lowercase();
-    filter.is_empty()
-        || filter.split_whitespace().all(|word| {
-            [section, item.title, item.detail]
-                .iter()
-                .any(|text| text.to_lowercase().contains(word))
-        })
+    // Every word of the filter must start a word of the title, description or section ("tab" finds "Tab size", not "database").
+    let words = |text: &str| {
+        text.split(|c: char| !c.is_alphanumeric())
+            .map(str::to_lowercase)
+            .collect::<Vec<_>>()
+    };
+    let haystack: Vec<String> = [section, item.title, item.detail].into_iter().flat_map(words).collect();
+    filter
+        .split_whitespace()
+        .map(str::to_lowercase)
+        .all(|word| haystack.iter().any(|w| w.starts_with(&word)))
 }
 
 /// An on/off switch, drawn like the ones in system settings.
@@ -166,14 +170,15 @@ fn switch(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
         let t = ui.ctx().animate_bool_responsive(response.id, *on);
         let visuals = ui.style().interact_selectable(&response, *on);
         let radius = rect.height() / 2.0;
-        let fill = if *on { ui.visuals().selection.bg_fill } else { visuals.bg_fill };
+        // Light mode's selection fill is too pale behind a white knob: use the selection text color instead.
+        let fill = match (*on, ui.visuals().dark_mode) {
+            (true, true) => ui.visuals().selection.bg_fill,
+            (true, false) => ui.visuals().selection.stroke.color,
+            (false, _) => visuals.bg_fill,
+        };
         ui.painter().rect(rect, radius, fill, visuals.bg_stroke, egui::StrokeKind::Inside);
         let x = egui::lerp((rect.left() + radius)..=(rect.right() - radius), t);
-        let knob = if *on {
-            ui.visuals().strong_text_color()
-        } else {
-            visuals.fg_stroke.color
-        };
+        let knob = if *on { egui::Color32::WHITE } else { visuals.fg_stroke.color };
         ui.painter().circle_filled(egui::pos2(x, rect.center().y), radius * 0.72, knob);
     }
     response
@@ -268,14 +273,9 @@ impl App {
                 }
                 TabSize => {
                     let mut n = self.settings.tab_size;
-                    let response = ui.add(egui::DragValue::new(&mut n).range(1..=16).speed(0.1));
+                    let response = ui.add(egui::DragValue::new(&mut n).range(1..=16).speed(0.05).suffix(" spaces"));
                     if response.changed() && n != self.settings.tab_size {
                         *tab_size = Some(n);
-                    }
-                    for preset in [8, 4, 2].into_iter().filter(|&p| p != self.settings.tab_size) {
-                        if ui.small_button(preset.to_string()).clicked() {
-                            *tab_size = Some(preset);
-                        }
                     }
                 }
                 Theme => {
@@ -321,5 +321,8 @@ mod tests {
         assert!(super::matches("tab", "Editor", tab));
         assert!(super::matches("editor indentation", "Editor", tab));
         assert!(!super::matches("tab minimap", "Editor", tab));
+        let database = &SECTIONS[4].1[1];
+        assert!(!super::matches("tab", "C / C++", database));
+        assert!(super::matches("comp", "C / C++", database));
     }
 }

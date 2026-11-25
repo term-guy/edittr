@@ -13,7 +13,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Build/test: `cargo build --release`, `cargo test --release`. CI's lint job runs `cargo test --locked` in debug, which enables extra egui/epaint debug asserts: run it too before pushing.
 - Real-network / real-server tests are `#[ignore]`d. Run them with a throwaway servers dir, never the real one: `EDITTR_SERVERS_DIR=<tmp dir> cargo test --release -- --ignored` (downloads rust-analyzer and clangd; `lsp_round_trip_c` needs `clangd` on PATH).
 - App icon assets are generated: `python3 packaging/make_icon.py` (rewrites `assets/icon*` and `packaging/macos/edittr.icns`).
-- Formatting/lint: `rustfmt.toml` sets `max_width = 140` (a hook formats edited `.rs` files). CI fails on `cargo fmt --check` or `cargo clippy --all-targets -- -D warnings`; run both before pushing.
+- Formatting/lint: `rustfmt.toml` sets `max_width = 140`. The git pre-commit hook in `.githooks/` formats staged `.rs` files (enable it once per clone: `git config core.hooksPath .githooks`); edits are not formatted until then, so run `cargo fmt` before testing a formatted result. CI fails on `cargo fmt --check` or `cargo clippy --all-targets -- -D warnings`; run both before pushing.
 
 ## Local GUI testing (macOS)
 

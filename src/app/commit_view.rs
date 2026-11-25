@@ -1,6 +1,6 @@
 use super::{DiffSource, DiffTab, background, diff_colors, diff_navigation, diff_view, receive, side_by_side_view};
 use crate::git::{self, Commit};
-use crate::graph::secondary_text_color;
+use crate::graph::{primary_text_color, secondary_text_color};
 use crate::icons as ic;
 use crate::tree::{self, Row};
 use crate::vcs::Vcs;
@@ -181,13 +181,12 @@ impl CommitView {
             .id_salt(("commit header", &self.hash))
             .max_height(76.0)
             .show(ui, |ui| {
-                ui.add(
-                    egui::Label::new(format!(
-                        "{}  •  {}  •  {}\n{}",
-                        commit.hash, commit.author, commit.date, commit.message
-                    ))
-                    .selectable(true),
-                );
+                let vis = ui.visuals();
+                let header =
+                    RichText::new(format!("{}  •  {}  •  {}", commit.hash, commit.author, commit.date)).color(secondary_text_color(vis));
+                let message = RichText::new(&commit.message).color(primary_text_color(vis));
+                ui.add(egui::Label::new(header).selectable(true));
+                ui.add(egui::Label::new(message).selectable(true));
             });
         ui.separator();
 
