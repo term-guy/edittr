@@ -7,6 +7,7 @@
 
 pub mod buffer;
 pub mod fold;
+pub mod highlights;
 mod navigation_menu;
 pub(crate) mod sticky;
 
@@ -243,6 +244,8 @@ pub struct Extras<'a> {
     pub symbol_marks: &'a [(Range<usize>, bool)],
     /// Sorted ranges and color roles from the language server, per line.
     pub semantic: &'a [highlight::TokenLine],
+    /// Terms the user highlighted (Ctrl/Cmd+Shift+H), each occurrence in its own color.
+    pub highlights: &'a [highlights::Highlight],
 }
 
 #[derive(Default)]
@@ -448,6 +451,7 @@ pub fn show(
             (f.row_height(&font), char_w, char_w)
         }
     });
+    let band_dy = band_offset(ui, &font, row_h);
     let is_mac = ui.ctx().os() == egui::os::OperatingSystem::Mac;
     let focused = ui.memory(|m| m.has_focus(id));
     out.focused = focused;
@@ -608,7 +612,7 @@ pub fn show(
         let over_sticky = sticky.as_ref().is_some_and(|overlay| overlay.contains_pointer(ui));
         if opts.navigation_menu && (!over_sticky || resp.context_menu_opened()) {
             // Don't drop a command the pinned lines' menu gave this frame (its menu can open below them).
-            if let Some(command) = navigation_menu::show(&resp, st, &lines, &lay, *version) {
+            if let Some(command) = navigation_menu::show(&resp, st, &lines, &lay, *version, extras.highlights) {
                 out.context_command = Some(command);
             }
         }
@@ -629,13 +633,13 @@ pub fn show(
 
         for &(l, color) in extras.line_bg {
             if shown(l) {
-                let y = lay.line_y(l);
+                let y = lay.line_y(l) + band_dy;
                 let band = Rect::from_min_max(Pos2::new(clip.min.x - gutter_w, y), Pos2::new(clip.max.x, y + row_h));
                 ui.painter().with_clip_rect(ui.clip_rect()).rect_filled(band, 0.0, color);
             }
         }
         if opts.current_line && single_line && st.sels.len() == 1 && shown(pl) {
-            let y = lay.line_y(pl);
+            let y = lay.line_y(pl) + band_dy;
             let band = Rect::from_min_max(Pos2::new(clip.min.x - gutter_w, y), Pos2::new(clip.max.x, y + row_h));
             ui.painter()
                 .with_clip_rect(ui.clip_rect())
@@ -663,7 +667,7 @@ pub fn show(
                     if extend_eol && r.end > lr.end {
                         b += char_w * 0.6;
                     }
-                    let y = lay.line_y(*l);
+                    let y = lay.line_y(*l) + band_dy;
                     painter.rect_filled(Rect::from_min_max(Pos2::new(a, y), Pos2::new(b, y + row_h)), 2.0, color);
                 }
             }
@@ -674,6 +678,14 @@ pub fn show(
         // Other uses of the symbol under the caret: neutral, a bit stronger where written.
         let uses = ui.visuals().text_color();
         let (read, write) = if ui.visuals().dark_mode { (0.13, 0.22) } else { (0.10, 0.17) };
+        // User highlights (Ctrl/Cmd+Shift+H), searched in the visible lines only.
+        for h in extras.highlights {
+            let mut found = galleys.iter().flat_map(|&(l, _)| {
+                let lr = ix.line_range(text, l);
+                highlights::matches(&text[lr.clone()], &h.term).map(move |r| lr.start + r.start..lr.start + r.end)
+            });
+            paint_ranges(&mut found, highlights::color(h.color, ui.visuals().dark_mode), false);
+        }
         paint_ranges(
             &mut extras.symbol_marks.iter().filter(|m| !m.1).map(|m| m.0.clone()),
             uses.gamma_multiply(read),
@@ -742,7 +754,7 @@ pub fn show(
             let (l, _) = ix.line_col(s.head);
             if let Some((_, g)) = galleys.iter().find(|(gl, _)| *gl == l) {
                 let x = x_in(l, g, s.head);
-                let y = lay.line_y(l);
+                let y = lay.line_y(l) + band_dy;
                 if focused || st.sels.len() > 1 {
                     painter.line_segment([Pos2::new(x, y), Pos2::new(x, y + row_h)], Stroke::new(2.0, caret_color));
                 }
@@ -1034,6 +1046,31 @@ fn squiggle(p: &egui::Painter, a: f32, b: f32, y: f32, color: Color32) {
     if pts.len() > 1 {
         p.add(egui::Shape::line(pts, Stroke::new(1.0, color)));
     }
+}
+
+/// How far to move row-high backgrounds (selection, marks, current line, caret) so they
+/// are centered on capital letters: fonts with a large descent (e.g. Consolas) sit high
+/// in egui's row, so a band covering the whole row looks shifted down. Measured from the
+/// rendered glyph, so it follows the chosen font and size.
+fn band_offset(ui: &egui::Ui, font: &egui::FontId, row_h: f32) -> f32 {
+    let g = ui.fonts_mut(|f| f.layout_no_wrap("H".into(), font.clone(), Color32::WHITE));
+    let (mut top, mut bottom) = (f32::INFINITY, f32::NEG_INFINITY);
+    for placed in &g.rows {
+        for glyph in &placed.row.glyphs {
+            if glyph.uv_rect.size.y > 0.0 {
+                let y = placed.pos.y + glyph.pos.y + glyph.uv_rect.offset.y;
+                top = top.min(y);
+                bottom = bottom.max(y + glyph.uv_rect.size.y);
+            }
+        }
+    }
+    if !top.is_finite() {
+        return 0.0;
+    }
+    let dy = (top + bottom) / 2.0 - row_h / 2.0;
+    // Never more than the gap that causes it.
+    let ppp = ui.ctx().pixels_per_point();
+    (dy.clamp(-row_h * 0.25, row_h * 0.25) * ppp).round() / ppp
 }
 
 fn paint_whitespace(p: &egui::Painter, g: &egui::Galley, origin: Pos2, color: Color32) {

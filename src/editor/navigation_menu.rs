@@ -1,8 +1,15 @@
-use super::{Layout, Lines, State, buffer::Sel};
+use super::{Layout, Lines, State, buffer::Sel, highlights};
 use crate::commands::{self, Command};
 use eframe::egui::{self, Response};
 
-pub(super) fn show(resp: &Response, st: &mut State, lines: &Lines<'_>, lay: &Layout<'_>, version: u64) -> Option<Command> {
+pub(super) fn show(
+    resp: &Response,
+    st: &mut State,
+    lines: &Lines<'_>,
+    lay: &Layout<'_>,
+    version: u64,
+    highlighted: &[highlights::Highlight],
+) -> Option<Command> {
     let key = resp.id.with("navigation_menu_position");
     if resp.secondary_clicked()
         && let Some(pos) = resp.interact_pointer_pos()
@@ -17,13 +24,22 @@ pub(super) fn show(resp: &Response, st: &mut State, lines: &Lines<'_>, lay: &Lay
         .filter(|&(v, _)| v == version);
     let mut command = None;
     resp.context_menu(|ui| {
-        const ITEMS: [Option<Command>; 9] = [
+        // The word or selection a highlight command would act on.
+        let term = target.and_then(|(_, byte)| {
+            let sel = st.sels.iter().find(|s| s.range().contains(&byte)).map_or(byte..byte, |s| s.range());
+            highlights::term_at(lines.text, lines.ix, sel, byte)
+        });
+        let is_highlighted = term.as_ref().is_some_and(|t| highlighted.iter().any(|h| &h.term == t));
+        const ITEMS: [Option<Command>; 12] = [
             Some(Command::GoToDefinition),
             Some(Command::FindReferences),
             Some(Command::ShowCallHierarchy),
             None, // separator
             Some(Command::RenameSymbol),
             Some(Command::CodeActions),
+            None,
+            Some(Command::ToggleHighlight),
+            Some(Command::ClearHighlights),
             None,
             Some(Command::FileHistory),
             Some(Command::SelectionHistory),
@@ -43,10 +59,19 @@ pub(super) fn show(resp: &Response, st: &mut State, lines: &Lines<'_>, lay: &Lay
                 Command::CodeActions => "Quick fix…",
                 Command::FileHistory => "File history",
                 Command::SelectionHistory => "File history for selection",
+                Command::ToggleHighlight if is_highlighted => "Remove highlight",
+                Command::ToggleHighlight => "Highlight",
+                Command::ClearHighlights => "Clear all highlights",
                 _ => entry.title,
             };
             let button = egui::Button::new(label).shortcut_text(entry.shortcut_text(ui.ctx()));
-            let enabled = target.is_some() && (id != Command::SelectionHistory || selected);
+            let enabled = target.is_some()
+                && match id {
+                    Command::SelectionHistory => selected,
+                    Command::ToggleHighlight => term.is_some(),
+                    Command::ClearHighlights => !highlighted.is_empty(),
+                    _ => true,
+                };
             if ui.add_enabled(enabled, button).clicked() {
                 command = Some(id);
                 ui.close();

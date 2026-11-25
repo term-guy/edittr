@@ -441,6 +441,8 @@ pub struct App {
     call_hierarchy: Option<call_hierarchy::CallHierarchy>,
     /// Screen rect of the active editor's caret (last frame).
     last_caret: Option<egui::Rect>,
+    /// Terms highlighted with Ctrl/Cmd+Shift+H, in every editor of this window.
+    highlights: Vec<editor::highlights::Highlight>,
     confirm: Option<Confirm>,
     open_folder_requested: bool,
     /// The requested folder opens in a new window instead of this one.
@@ -561,6 +563,7 @@ impl App {
             assist: Default::default(),
             call_hierarchy: None,
             last_caret: None,
+            highlights: Vec::new(),
             confirm: None,
             open_folder_requested: false,
             open_folder_in_new_window: false,
@@ -1156,6 +1159,7 @@ impl App {
         }
         let diags = self.squiggles_for(si, ui.visuals());
         let settings = &self.settings;
+        let highlights = &self.highlights;
         let (mut close, mut goto, mut context_command) = (false, None, None);
         egui::Panel::right("split-pane")
             .resizable(true)
@@ -1177,7 +1181,7 @@ impl App {
                 {
                     doc.ed.set_sticky_outline(doc.version, scopes);
                 }
-                let out = editor(ui, doc, settings, None, &diags, &[], 1, &[], &[]);
+                let out = editor(ui, doc, settings, None, &diags, &[], 1, &[], &[], highlights);
                 goto = out.goto;
                 context_command = out.context_command;
             });
@@ -2861,7 +2865,18 @@ impl App {
                     {
                         doc.ed.set_sticky_outline(doc.version, scopes);
                     }
-                    let out = editor(ui, doc, &self.settings, inline, &diags, &marks, 0, &[], &global_marks);
+                    let out = editor(
+                        ui,
+                        doc,
+                        &self.settings,
+                        inline,
+                        &diags,
+                        &marks,
+                        0,
+                        &[],
+                        &global_marks,
+                        &self.highlights,
+                    );
                     if let Some(idx) = out.goto {
                         goto_at = Some(idx);
                     }
@@ -3608,6 +3623,7 @@ fn editor(
     pane: u8,
     line_bg: &[(usize, Color32)],
     global_marks: &[std::ops::Range<usize>],
+    highlights: &[editor::highlights::Highlight],
 ) -> EditorOut {
     let id = ui.make_persistent_id(("editor", doc.id, pane));
     // A pending selection from elsewhere (search hit, go to definition): char range.
@@ -3686,6 +3702,7 @@ fn editor(
         line_bg,
         symbol_marks: doc.lsp.marks_for(doc.version),
         semantic,
+        highlights,
     };
     let before = doc.version;
     let out = editor::show(ui, id, &mut doc.ed, &mut doc.text, &mut doc.version, &mut doc.hl, &opts, &extras);

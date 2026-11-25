@@ -189,6 +189,7 @@ impl App {
             }
         };
         let settings = &self.settings;
+        let highlights = &self.highlights;
         let dark = ui.visuals().dark_mode;
         let (Tab::Diff(d), Tab::File(doc)) = two_tabs(&mut self.tabs, active, file) else {
             return None;
@@ -267,6 +268,7 @@ impl App {
             };
             let extras = ed::Extras {
                 line_bg: &live.left_bg,
+                highlights,
                 ..Default::default()
             };
             let id = cols[0].make_persistent_id(("diff-base", doc.id));
@@ -282,7 +284,18 @@ impl App {
             );
             left_top = left.top_line;
             cols[1].weak(format!("{} (working copy)", file_name(&path.to_string_lossy())));
-            out = Some(editor(&mut cols[1], doc, settings, None, &[], &[], 3, &live.right_bg, &[]));
+            out = Some(editor(
+                &mut cols[1],
+                doc,
+                settings,
+                None,
+                &[],
+                &[],
+                3,
+                &live.right_bg,
+                &[],
+                highlights,
+            ));
         });
         // Keep the panes lined up: whichever one the user scrolled leads.
         let right_top = out.as_ref().map_or(live.tops.1, |o| o.top_line);

@@ -277,6 +277,17 @@ impl App {
             Command::CodeActions => self.request_code_actions(),
             Command::SignatureHelp => self.request_signature_help(true),
             Command::ShowCallHierarchy => self.show_call_hierarchy(),
+            Command::ToggleHighlight => {
+                let term = match self.tabs.get_mut(self.active) {
+                    Some(Tab::File(doc)) => doc.ed.highlight_term(&doc.text, doc.version),
+                    _ => None,
+                };
+                match term {
+                    Some(term) => crate::editor::highlights::toggle(&mut self.highlights, term),
+                    None => self.message = "Highlight: put the caret on a word or select text on one line".into(),
+                }
+            }
+            Command::ClearHighlights => self.highlights.clear(),
             Command::Explorer => {
                 self.side = Side::Explorer;
                 self.side_open = true;

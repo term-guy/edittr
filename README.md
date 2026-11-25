@@ -13,11 +13,12 @@ A small, fast code editor with built-in git. It's a single native binary written
 - **Semantic highlighting**: with a language server, macros, enum members, constants, functions, types and parameters get colors from what the server knows, and code switched off by the preprocessor (`#if 0`, unset configuration macros) is greyed out
 - **Sticky scroll**: the headers of the functions, types and blocks you're scrolling through stay pinned at the top; click one to jump to it
 - **Other uses of the symbol** under the caret are highlighted (where it's written, a little stronger)
+- **Highlight** (`Ctrl/Cmd+Shift+H`, or right-click → **Highlight**): every occurrence of the word at the caret or of the selected text gets a background in its own color (yellow, blue, green, pink, …, then stronger shades of them). Run it again on a highlighted term (or **Remove highlight**) to take it off; **Clear all highlights** removes them all
 - **Syntax colors**: macros and constants (`#define` names, `const`, `ALL_CAPS` names) get their own color, apart from variables, in C/C++ and other languages
 - **Minimap** (with a clear visible-area band), **split view** (`Ctrl/Cmd+\` or "Open to the Side"), **bracket pair colors**, **current line highlight** and optional **whitespace markers** (spaces as `·`, tabs as `→`)
 - **Gutter change markers**: added, modified and deleted lines compared with the last commit (CRLF files too)
 - **Inline blame**: a dimmed note at the end of the current line saying who changed it, when, and in which commit
-- **Find and replace** in the file (`Ctrl/Cmd+F`, `Ctrl/Cmd+H`) with match case / whole word / regex, all matches highlighted
+- **Find and replace** in the file (`Ctrl/Cmd+F`, `Ctrl/Cmd+H`) with match case / whole word / regex, all matches highlighted; `Tab` moves from the find box to the replace box (`Shift+Tab` back)
 - **Format document** (`Shift+Alt+F`) with rustfmt, clang-format, prettier, black or gofmt when installed; **format on save** is optional (off by default)
 - **Binary files** open in a **hex view** (offset, hex and ASCII columns, `Ctrl+G` to jump to an offset, copy as hex or text), even when they are gigabytes large. Binary changes in Source Control, and any two files (**Select for Comparison**, then **Compare with Selected**), are compared byte by byte with next/previous difference
 - **Markdown preview** to the side (the eye icon or **Open Preview to the Side**), updated as you type and scrolling with the editor
@@ -179,6 +180,7 @@ On Linux you need the usual windowing dev packages (see `.github/workflows/build
 | `Ctrl/Cmd+T` | Go to symbol in workspace |
 | `Ctrl/Cmd+F` | Find in file (the selection, if any) |
 | `Ctrl/Cmd+H`, `Ctrl/Cmd+Alt+F` | Replace in file |
+| `Ctrl/Cmd+Shift+H` | Highlight all occurrences of the word / selection (again: remove) |
 | `Ctrl/Cmd+Shift+F` | Search in files (the selection, if any); `Enter` runs a search |
 | `Ctrl/Cmd+click`, `F12` | Go to definition |
 | `Shift+F12` | Find all references |

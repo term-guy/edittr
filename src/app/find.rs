@@ -136,6 +136,30 @@ impl Find {
             self.pending_step = step(Key::F3).or_else(|| focus.and_then(|_| step(Key::Enter))).or(self.pending_step);
         }
 
+        // Tab moves from the find box to the replace box (Shift+Tab back), instead of
+        // through the option toggles in between.
+        if self.replacing && !dialog_open {
+            let tab = ui.input(|i| {
+                let pressed = |m: Modifiers| {
+                    i.events
+                        .iter()
+                        .any(|e| matches!(e, egui::Event::Key { key: Key::Tab, pressed: true, modifiers, .. } if *modifiers == m))
+                };
+                (pressed(Modifiers::NONE), pressed(Modifiers::SHIFT))
+            });
+            let target = match (focus, tab) {
+                (Some(id), (true, _)) if id == query_id => Some(replace_id),
+                (Some(id), (_, true)) if id == replace_id => Some(query_id),
+                _ => None,
+            };
+            if let Some(id) = target {
+                ui.memory_mut(|m| {
+                    m.move_focus(egui::FocusDirection::None);
+                    m.request_focus(id);
+                });
+            }
+        }
+
         let mut close = false;
         ui.horizontal_wrapped(|ui| {
             let caret = if self.replacing { ic::CARET_DOWN } else { ic::CARET_RIGHT };

@@ -22,6 +22,8 @@ pub(crate) enum Command {
     CodeActions,
     SignatureHelp,
     ShowCallHierarchy,
+    ToggleHighlight,
+    ClearHighlights,
     GoBack,
     GoForward,
     Explorer,
@@ -192,6 +194,13 @@ pub(crate) const COMMANDS: &[Entry] = &[
     // Ctrl+G on every platform (also on macOS, like VS Code).
     Entry::new(GoToLine, "Go to line…", &[KeyboardShortcut::new(Modifiers::CTRL, Key::G)]),
     Entry::new(Find, "Find in file", &[KeyboardShortcut::new(CMD, Key::F)]),
+    // Before Replace: egui also matches Cmd+H when Shift is held.
+    Entry::new(
+        ToggleHighlight,
+        "Highlight all occurrences (toggle)",
+        &[KeyboardShortcut::new(CMD_SHIFT, Key::H)],
+    ),
+    Entry::new(ClearHighlights, "Clear all highlights", &[]),
     Entry::new(
         Replace,
         "Replace in file",
@@ -321,6 +330,8 @@ mod tests {
         assert!(first(CMD_SHIFT, Key::F) == Some(FindInFiles));
         assert!(first(CMD.plus(Modifiers::ALT), Key::F) == Some(Replace));
         assert!(first(CMD, Key::F) == Some(Find));
+        assert!(first(CMD_SHIFT, Key::H) == Some(ToggleHighlight));
+        assert!(first(CMD, Key::H) == Some(Replace));
         assert!(first(CMD_SHIFT, Key::P) == Some(Palette));
         assert!(first(CMD, Key::P) == Some(QuickOpen));
         assert!(first(CMD_SHIFT, Key::O) == Some(DocumentSymbols));
