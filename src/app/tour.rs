@@ -113,6 +113,8 @@ impl Tour {
             return;
         }
         let Some(&name) = STEPS.get(self.step) else {
+            // The tour leaves edited files behind: quit without the unsaved-changes prompt.
+            app.quit_confirmed = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         };

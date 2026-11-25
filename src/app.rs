@@ -339,6 +339,8 @@ enum Confirm {
     DiscardFolder(String, Vec<FileChange>),
     /// Stage (true) or unstage a folder (path, number of files).
     StageFolder(String, usize, bool),
+    /// The window is closing with unsaved changes.
+    Quit,
 }
 
 type DetectedRepo = Option<(PathBuf, Vcs)>;
@@ -442,6 +444,8 @@ pub struct App {
     new_entry: Option<new_file::NewEntry>,
     /// Tab (doc id) to ask a file name for: an Untitled tab being saved, or Save As (needs the window).
     save_as_request: Option<u64>,
+    /// The user chose to quit without saving: let the next close request through.
+    quit_confirmed: bool,
     open_folder: Option<String>,
     search: SearchState,
     find: find::Find,
@@ -553,6 +557,7 @@ impl App {
             open_folder_in_new_window: false,
             new_entry: None,
             save_as_request: None,
+            quit_confirmed: false,
             open_folder: None,
             search: SearchState::default(),
             lsp: problems::LanguageServers::default(),
@@ -3318,6 +3323,24 @@ impl App {
                 }
                 Confirm::SwitchWorkspace(_) => "Discard unsaved changes and open the folder?".into(),
                 Confirm::CloseFolder => "Discard unsaved changes and close the folder?".into(),
+                Confirm::Quit => {
+                    let dirty: Vec<String> = self
+                        .tabs
+                        .iter()
+                        .filter_map(|t| match t {
+                            Tab::File(d) if d.dirty() => Some(d.name()),
+                            _ => None,
+                        })
+                        .collect();
+                    match dirty.as_slice() {
+                        [one] => format!("{one} has unsaved changes.\nQuit edittr and discard them?"),
+                        many => format!(
+                            "{} files have unsaved changes:\n{}\n\nQuit edittr and discard them?",
+                            many.len(),
+                            many.join("\n")
+                        ),
+                    }
+                }
                 Confirm::Discard(f) => format!("Discard all changes to {}?\nThis cannot be undone.", f.path),
                 Confirm::DiscardFolder(path, changes) => {
                     let new = changes.iter().filter(|c| c.code == '?').count();
@@ -3345,6 +3368,7 @@ impl App {
             let button = match c {
                 Confirm::StageFolder(_, _, true) => "Stage",
                 Confirm::StageFolder(_, _, false) => "Unstage",
+                Confirm::Quit => "Quit without saving",
                 Confirm::CloseTabs(_)
                 | Confirm::SwitchWorkspace(_)
                 | Confirm::CloseFolder
@@ -3383,6 +3407,10 @@ impl App {
                             }
                         }
                         Confirm::StageFolder(path, _, stage) => self.stage_change(Some(path), stage),
+                        Confirm::Quit => {
+                            self.quit_confirmed = true;
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
                     }
                 }
             }
@@ -3390,9 +3418,23 @@ impl App {
     }
 }
 
+impl App {
+    /// Closing the window (or quitting) with unsaved changes asks first.
+    fn confirm_quit(&mut self, ctx: &egui::Context) {
+        if !ctx.input(|i| i.viewport().close_requested()) || self.quit_confirmed {
+            return;
+        }
+        if self.tabs.iter().any(|t| matches!(t, Tab::File(d) if d.dirty())) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.confirm = Some(Confirm::Quit);
+        }
+    }
+}
+
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.confirm_quit(&ctx);
         if self.poll_session_restore() {
             egui::CentralPanel::default().show(ui, |ui| {
                 ui.centered_and_justified(|ui| ui.weak("Restoring session…"));
