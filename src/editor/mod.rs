@@ -545,7 +545,10 @@ pub fn show(
     let arrow = ui.spacing().scroll.bar_width.max(14.0);
     let arrows = content.y > main_rect.height() && main_rect.height() > 4.0 * arrow;
     if arrows {
-        area = area.scroll_bar_rect(main_rect.shrink2(Vec2::new(0.0, arrow)));
+        // The horizontal bar stops before the arrows' column, or it takes presses on the down arrow (it senses drags).
+        let mut bars = main_rect.shrink2(Vec2::new(0.0, arrow));
+        bars.max.x -= arrow;
+        area = area.scroll_bar_rect(bars);
     }
     let scroll = area.show_viewport(&mut main_ui, |ui, vp| {
         let (rect, _) = ui.allocate_exact_size(content, Sense::hover());
@@ -870,7 +873,8 @@ fn scroll_arrows(
     let mut held = false;
     for (up, y) in [(true, rect.min.y..=rect.min.y + size), (false, rect.max.y - size..=rect.max.y)] {
         let r = Rect::from_x_y_ranges(x.clone(), y);
-        let resp = ui.interact(r, id.with(("scroll-arrow", up)), Sense::click());
+        // Drags too: a press that moves a pixel is a drag, which would otherwise go to a scroll bar below.
+        let resp = ui.interact(r, id.with(("scroll-arrow", up)), Sense::click_and_drag());
         let fg = palette.color(Part::Foreground);
         if resp.hovered() || resp.is_pointer_button_down_on() {
             ui.painter().rect_filled(r, 2.0, fg.gamma_multiply(0.12));
@@ -1802,6 +1806,8 @@ mod tests {
         id: egui::Id,
         clipboard: Option<String>,
         read_only: bool,
+        /// Input time, advanced 0.1 s per frame (None: no time, as before), for hover animations.
+        clock: Option<f64>,
     }
 
     impl Harness {
@@ -1815,6 +1821,7 @@ mod tests {
                 id: egui::Id::NULL.with("test-editor"),
                 clipboard: None,
                 read_only: false,
+                clock: None,
             };
             let id = h.id;
             h.ctx.memory_mut(|m| m.request_focus(id));
@@ -1827,8 +1834,12 @@ mod tests {
             let input = egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0))),
                 events,
+                time: self.clock,
                 ..Default::default()
             };
+            if let Some(t) = &mut self.clock {
+                *t += 0.1;
+            }
             let mut out = Output::default();
             let (st, text, version, hl, id, read_only) = (
                 &mut self.st,
@@ -1908,6 +1919,36 @@ mod tests {
         assert!((click(&mut h, false) - 21.0).abs() < 0.1);
         assert!((click(&mut h, true) - 20.0).abs() < 0.1);
         assert!((click(&mut h, true) - 19.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn the_down_arrow_wins_over_the_horizontal_scroll_bar() {
+        let mut h = Harness::new(&format!("{}\n", "x".repeat(400)).repeat(200));
+        h.clock = Some(1.0);
+        h.st.scroll_to_line(20.0);
+        h.frame(vec![]);
+        let arrow = h.ctx.read_response(h.id.with(("scroll-arrow", false))).expect("arrow shown").rect;
+        // Bottom edge of the arrow, where the horizontal bar runs.
+        let pos = Pos2::new(arrow.center().x, arrow.bottom() - 2.0);
+        // Hover long enough for the floating bars to expand, as a real pointer would.
+        for _ in 0..10 {
+            h.frame(vec![Event::PointerMoved(pos)]);
+        }
+        // A real click: the pointer moves a little while pressed, which makes it a drag.
+        let moved = pos + Vec2::new(-12.0, 0.0);
+        let press = |pos, pressed| Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: NONE,
+        };
+        h.frame(vec![press(pos, true)]);
+        h.frame(vec![Event::PointerMoved(moved)]);
+        // The arrow keeps the drag (the horizontal bar below would scroll sideways with it).
+        let arrow_id = h.ctx.read_response(h.id.with(("scroll-arrow", false))).map(|r| r.id);
+        assert_eq!(h.ctx.dragged_id(), arrow_id);
+        h.frame(vec![press(moved, false)]);
+        assert!((h.frame(vec![]).top_line - 21.0).abs() < 0.1);
     }
 
     #[test]
