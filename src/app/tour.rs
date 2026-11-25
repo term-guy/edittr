@@ -49,6 +49,11 @@ const STEPS: &[&str] = &[
     "c-settings",
     "disk-changed",
     "disk-compare",
+    "file-history",
+    "file-history-diff",
+    "markdown-preview",
+    "hex-view",
+    "hex-comparison",
 ];
 
 impl Tour {
@@ -210,7 +215,21 @@ impl Tour {
                 _ => {}
             }
         }
-        let ready = app.search.rx.is_none()
+        let feature_ready = match name {
+            "file-history" | "file-history-diff" => !app
+                .tabs
+                .iter()
+                .any(|tab| matches!(tab, Tab::FileHistory(history) if history.loading())),
+            "markdown-preview" => app.preview.as_ref().is_some_and(|preview| !preview.loading()),
+            "hex-view" | "hex-comparison" => matches!(app.tabs.get(app.active), Some(Tab::Hex(viewer)) if !viewer.loading()),
+            _ => true,
+        };
+        if name == "markdown-preview" && self.frames == 14 {
+            self.inject.push(egui::Event::Text("Live preview".into()));
+        }
+        let ready = feature_ready
+            && app.open_jobs.is_empty()
+            && app.search.rx.is_none()
             && app.goto_rx.is_none()
             && app.repo_rx.is_none()
             && app.status_rx.is_none()
@@ -220,7 +239,7 @@ impl Tour {
             && app.quick_open.as_ref().is_none_or(|q| q.files_rx.is_none());
         let elapsed = self.started.elapsed();
         let min_frames = match name {
-            "column-select" | "diff-side-by-side" => 40,
+            "column-select" | "diff-side-by-side" | "markdown-preview" => 40,
             // Give the language server time to answer.
             "lsp-hover" | "lsp-completion" | "c-flags" | "disk-changed" => 150,
             _ => 10,
@@ -393,6 +412,63 @@ impl Tour {
                 }
             }
             "disk-compare" => app.disk_changed(app.active, super::DiskAction::Compare),
+            "file-history" => app.open_file_history(&demo.join("src/ui/graph.rs"), None),
+            "file-history-diff" => {
+                if let Some(Tab::FileHistory(history)) = app.tabs.get_mut(app.active) {
+                    history.select(0, ctx, app.settings.diff_ignore_eol);
+                }
+            }
+            "markdown-preview" => {
+                let text = String::from(concat!(
+                    "# Markdown Preview\n\n",
+                    "**Bold**, *italic*, and `inline code` with a [link](https://example.com).\n\n",
+                    "- [x] Write the draft\n- [ ] Review the changes\n\n",
+                    "> This preview follows the editor as you scroll.\n\n",
+                    "```rust\nfn main() {\n    println!(\"Hello!\");\n}\n```\n\n",
+                    "| Section | Status |\n| :--- | :---: |\n| Draft | Ready |\n\n---\n\n",
+                ));
+                let end = text.chars().count();
+                app.add_file_tab(&demo.join("preview-tour.md"), text, false);
+                let index = app.tabs.len() - 1;
+                if let Tab::File(doc) = &mut app.tabs[index] {
+                    doc.goto = Some((end, end));
+                }
+                app.open_markdown_preview(index);
+            }
+            "hex-view" | "hex-comparison" => {
+                app.preview = None;
+                app.side_open = false;
+                let path = demo.join("sample.bin");
+                let compare = name == "hex-comparison";
+                let worker_ctx = ctx.clone();
+                app.diff_rx = Some(background(ctx, move || {
+                    use crate::hex::{Pair, Source};
+                    let fixture = |bytes: &[u8]| Source::fixture(bytes).map_err(|error| error.to_string());
+                    let mut bytes = (0..=255).collect::<Vec<u8>>();
+                    let left = fixture(&bytes)?;
+                    let mut viewer = if compare {
+                        bytes[0x27..0x2c].fill(0xEE);
+                        bytes[0x51..0x56].copy_from_slice(b"hello");
+                        let pair = Pair {
+                            left,
+                            right: fixture(&bytes)?,
+                        };
+                        hex_view::Viewer::comparison(
+                            path,
+                            "sample.bin comparison".into(),
+                            pair,
+                            ("Original".into(), "Modified".into()),
+                            &worker_ctx,
+                        )
+                    } else {
+                        hex_view::Viewer::file(path, left)
+                    };
+                    if !compare {
+                        viewer.go_to(0x20);
+                    }
+                    Ok((Tab::Hex(Box::new(viewer)), false))
+                }));
+            }
             "split-editor" => {
                 app.side_open = false;
                 let graph = app

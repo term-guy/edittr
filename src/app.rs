@@ -4,10 +4,14 @@ mod code_navigation;
 mod commit_view;
 mod diff_edit;
 mod document_save;
+mod file_history;
+mod file_open;
 mod find;
 mod goto_line;
 mod graph_menu;
 mod gutter;
+mod hex_view;
+mod markdown_preview;
 mod navigation;
 mod outline;
 mod problems;
@@ -176,8 +180,12 @@ enum Tab {
     /// A very large file, read-only (see src/large.rs).
     Large(Box<crate::large::Viewer>),
     Diff(Box<DiffTab>),
+    FileHistory(Box<file_history::History>),
+    Hex(Box<hex_view::Viewer>),
     Graph,
 }
+
+type PendingDiff = Receiver<Result<(Tab, bool), String>>;
 
 struct DiffTab {
     title: String,
@@ -218,7 +226,7 @@ enum DiffSource {
         editor: Arc<str>,
         editor_crlf: bool,
     },
-    /// A file's change in a commit (history view): shown as recorded, never reloaded.
+    /// An immutable snapshot, such as a file's change in a commit.
     Commit,
 }
 
@@ -387,7 +395,9 @@ pub struct App {
     graph_detail: commit_view::CommitView,
     graph_rx: Option<Receiver<Result<Graph, String>>>,
     graph_dialog: Option<graph_menu::GraphDialog>,
-    diff_rx: Option<Receiver<(DiffTab, bool)>>,
+    diff_rx: Option<PendingDiff>,
+    open_jobs: Vec<file_open::OpenJob>,
+    compare_path: Option<PathBuf>,
 
     bg_task: Option<VcsJob>,
     message: String,
@@ -395,6 +405,7 @@ pub struct App {
     picker: Option<navigation::Picker>,
     /// Tab shown in the side editor (Open to the Side).
     split: Option<usize>,
+    preview: Option<markdown_preview::Preview>,
     /// Hover info, completion, references.
     assist: assist::Assist,
     /// Screen rect of the active editor's caret (last frame).
@@ -489,11 +500,14 @@ impl App {
             graph_rx: None,
             graph_dialog: None,
             diff_rx: None,
+            open_jobs: Vec::new(),
+            compare_path: None,
             bg_task: None,
             message: String::new(),
             quick_open: None,
             picker: None,
             split: None,
+            preview: None,
             assist: Default::default(),
             last_caret: None,
             confirm: None,
@@ -550,6 +564,11 @@ impl App {
     }
 
     fn clear_project(&mut self) {
+        self.open_jobs.clear();
+        self.diff_rx = None;
+        self.preview = None;
+        self.split = None;
+        self.compare_path = None;
         self.ignored_off.clear();
         self.explorer_revealed = None;
         self.explorer_scroll_to = None;
@@ -817,6 +836,9 @@ impl App {
     }
 
     fn poll_background(&mut self, ctx: &egui::Context) {
+        self.poll_open_files();
+        self.poll_file_history();
+        self.poll_hex_tabs(ctx);
         self.poll_goto();
         self.poll_problems();
         self.poll_c_flags();
@@ -970,28 +992,7 @@ impl App {
             }
         }
         self.graph_detail.poll();
-        if let Some((mut tab, refresh)) = receive(&mut self.diff_rx) {
-            let current = self.tabs.iter_mut().find_map(|t| match t {
-                Tab::Diff(d) => Some(d),
-                _ => None,
-            });
-            if refresh && current.is_none() {
-                return;
-            }
-            if tab.ignore_eol != self.settings.diff_ignore_eol {
-                self.load_diff(tab.title, tab.path, tab.source, refresh);
-            } else if let Some(current) = current {
-                tab.inline = current.inline;
-                if refresh {
-                    tab.live = current.live.take();
-                    **current = tab;
-                } else {
-                    self.show_tab(Tab::Diff(Box::new(tab)));
-                }
-            } else {
-                self.show_tab(Tab::Diff(Box::new(tab)));
-            }
-        }
+        self.poll_loaded_diff();
     }
 
     fn poll_project_changes(&mut self, ctx: &egui::Context) {
@@ -1087,47 +1088,6 @@ impl App {
         }
     }
 
-    fn open_file(&mut self, path: &Path) {
-        // One spelling per file (Windows `\\?\C:\...` vs `C:\...`), or it opens twice.
-        let plain = workspace::plain_path(path);
-        let path = plain.as_path();
-        if let Some(i) = self.tabs.iter().position(|t| matches!(t, Tab::File(d) if d.path == path)) {
-            self.active = i;
-            return;
-        }
-        if self.search_replace.is_writing(path) {
-            self.message = "Wait for replacements to finish before opening this file".into();
-            return;
-        }
-        if let Some(i) = self.tabs.iter().position(|t| matches!(t, Tab::Large(v) if v.path == path)) {
-            self.active = i;
-            return;
-        }
-        // Very large files open read-only, without loading them into memory.
-        if let Ok(meta) = std::fs::metadata(path)
-            && meta.len() >= crate::large::THRESHOLD
-        {
-            let viewer = crate::large::Viewer::open(path, meta.len(), &self.ctx);
-            self.tabs.push(Tab::Large(Box::new(viewer)));
-            self.active = self.tabs.len() - 1;
-            return;
-        }
-        let DiskText { text, crlf, .. } = match read_doc_text(path) {
-            Ok(Some(text)) => text,
-            Ok(None) => {
-                self.message = format!("{} looks binary; not opening", path.display());
-                return;
-            }
-            Err(e) => {
-                self.message = format!("{}: {e}", path.display());
-                return;
-            }
-        };
-        // The active document's sync starts its language server (see sync_active_document).
-        self.add_file_tab(path, text, crlf);
-        self.active = self.tabs.len() - 1;
-    }
-
     fn add_file_tab(&mut self, path: &Path, text: String, crlf: bool) {
         let lang = path
             .extension()
@@ -1193,8 +1153,14 @@ impl App {
     }
 
     fn show_tab(&mut self, tab: Tab) {
+        self.unfocus_pending_opens();
         // Reuse the existing diff / graph tab rather than piling up new ones.
-        let same_kind = |t: &Tab| matches!((t, &tab), (Tab::Diff(_), Tab::Diff(_)) | (Tab::Graph, Tab::Graph));
+        let same_kind = |t: &Tab| {
+            matches!(
+                (t, &tab),
+                (Tab::Diff(_), Tab::Diff(_)) | (Tab::Graph, Tab::Graph) | (Tab::FileHistory(_), Tab::FileHistory(_))
+            ) || matches!((t, &tab), (Tab::Hex(a), Tab::Hex(b)) if a.comparing() && b.comparing())
+        };
         if let Some(i) = self.tabs.iter().position(same_kind) {
             self.tabs[i] = tab;
             self.active = i;
@@ -1214,7 +1180,7 @@ impl App {
             "working copy"
         };
         let title = format!("{} ({kind})", file_name(&change.path));
-        let path = repo.join(&change.path);
+        let path = workspace::plain_path(&repo.join(&change.path));
         let source = DiffSource::Vcs {
             repo,
             vcs,
@@ -1244,11 +1210,19 @@ impl App {
 
     fn load_diff(&mut self, title: String, path: PathBuf, source: DiffSource, refresh: bool) {
         let ignore_eol = self.settings.diff_ignore_eol;
+        let ctx = self.ctx.clone();
         self.diff_rx = Some(background(&self.ctx, move || {
             let mut live = None;
             let (text, only_line_endings) = match &source {
                 DiffSource::Vcs { repo, vcs, change, staged } => {
+                    let binary = !refresh && !staged && crate::hex::Source::open(&path).and_then(|file| file.is_binary()).unwrap_or(false);
+                    if binary {
+                        return hex_view::vcs_comparison(path, title, *vcs, repo, change, *staged, &ctx);
+                    }
                     let diff = vcs.diff(repo, change, *staged, ignore_eol);
+                    if !refresh && hex_view::binary_patch(&diff.text) {
+                        return hex_view::vcs_comparison(path, title, *vcs, repo, change, *staged, &ctx);
+                    }
                     // Unstaged changes can be edited in place. Load both sides off the UI thread.
                     if !refresh
                         && !staged
@@ -1272,7 +1246,7 @@ impl App {
             };
             let mut tab = DiffTab::new(title, path, &text, source, ignore_eol, only_line_endings);
             tab.live = live;
-            (tab, refresh)
+            Ok((Tab::Diff(Box::new(tab)), refresh))
         }));
     }
 
@@ -1459,12 +1433,7 @@ impl App {
     }
 
     fn go_to(&mut self, (path, idx): (PathBuf, usize)) {
-        self.open_file(&path);
-        if let Some(Tab::File(d)) = self.tabs.get_mut(self.active)
-            && d.path == path
-        {
-            d.goto = Some((idx, idx));
-        }
+        self.open_with_target(&path, file_open::Target::Caret(idx));
     }
 
     fn offer_install(&mut self, ext: &str) {
@@ -1640,12 +1609,7 @@ impl App {
     }
 
     fn open_at(&mut self, path: &Path, line: usize, cols: impl Into<symbols::Columns>) {
-        self.open_file(path);
-        if let Some(Tab::File(doc)) = self.tabs.get_mut(self.active)
-            && doc.path == path
-        {
-            doc.goto = Some(symbols::selection(&doc.text, line, cols.into()));
-        }
+        self.open_with_target(path, file_open::Target::Position(line, cols.into()));
     }
 
     fn search_panel(&mut self, ui: &mut egui::Ui) {
@@ -2177,10 +2141,7 @@ impl App {
             }
             return;
         };
-        let active_path = match self.tabs.get(self.active) {
-            Some(Tab::File(d)) => Some(d.path.clone()),
-            _ => None,
-        };
+        let active_path = self.active_path().map(Path::to_owned);
         for (path, is_dir) in entries {
             let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
             ui.horizontal(|ui| {
@@ -2206,6 +2167,7 @@ impl App {
                         }
                     }
                     row.context_menu(|ui| {
+                        self.file_history_menu(ui, &path, false);
                         if let Some(rel) = self.root.as_deref().and_then(|root| workspace::relative_path(root, &path)) {
                             let enabled = workspace::valid_folder(&rel) && !workspace::is_ignored(&rel, &self.ignored);
                             if ui.add_enabled(enabled, egui::Button::new("Ignore folder in search")).clicked() {
@@ -2227,6 +2189,7 @@ impl App {
                     if row.clicked() {
                         *open = Some(path.clone());
                     }
+                    row.context_menu(|ui| self.file_history_menu(ui, &path, true));
                 }
             });
             if is_dir && self.expanded.contains(&path) {
@@ -2471,6 +2434,7 @@ impl App {
 
     fn tab_strip(&mut self, ui: &mut egui::Ui) {
         let mut close = None;
+        let mut selected = None;
         let mut menu: Option<TabMenu> = None;
         #[cfg(feature = "tour")]
         let mut tab_rects = Vec::new();
@@ -2481,13 +2445,15 @@ impl App {
                         Tab::File(d) => format!("{}{}", d.name(), if d.dirty() { " ●" } else { "" }),
                         Tab::Diff(d) => format!("{} {}", ic::GIT_DIFF, d.title),
                         Tab::Large(v) => format!("{} (read-only)", file_name(&v.path.to_string_lossy())),
+                        Tab::FileHistory(history) => format!("{} {}", ic::TREE_STRUCTURE, history.title),
+                        Tab::Hex(v) => v.title.clone(),
                         Tab::Graph => format!("{} {}", ic::TREE_STRUCTURE, self.vcs.unwrap_or(Vcs::Git).history_title()),
                     };
                     let r = ui.selectable_label(i == self.active, title);
                     #[cfg(feature = "tour")]
                     tab_rects.push(r.rect);
                     if r.clicked() {
-                        self.active = i;
+                        selected = Some(i);
                     }
                     if r.middle_clicked() {
                         close = Some(i);
@@ -2496,6 +2462,8 @@ impl App {
                         Tab::File(d) => Some(d.path.clone()),
                         Tab::Diff(d) => Some(d.path.clone()),
                         Tab::Large(v) => Some(v.path.clone()),
+                        Tab::FileHistory(history) => Some(history.path.clone()),
+                        Tab::Hex(v) => Some(v.path.clone()),
                         Tab::Graph => None,
                     };
                     let r = match &file_path {
@@ -2520,6 +2488,16 @@ impl App {
                                 item(ui, "Open to the Side", true, TabMenu::Split(i));
                                 item(ui, "Format document (Shift+Alt+F)", true, TabMenu::Format(i));
                             }
+                            item(ui, "File History", true, TabMenu::History(p.clone()));
+                            if matches!(tab, Tab::File(_) | Tab::Large(_) | Tab::Hex(_)) {
+                                item(ui, "Select for Comparison", true, TabMenu::SelectForCompare(p.clone()));
+                                item(
+                                    ui,
+                                    "Compare with Selected",
+                                    self.compare_path.is_some(),
+                                    TabMenu::Compare(p.clone()),
+                                );
+                            }
                             item(ui, "Copy Path", true, TabMenu::Copy(p.display().to_string()));
                             let rel = self.display_path(p);
                             item(ui, "Copy Relative Path", true, TabMenu::Copy(rel));
@@ -2536,6 +2514,10 @@ impl App {
         if let Some(t) = &mut self.tour {
             t.tab_rects = tab_rects;
         }
+        if let Some(i) = selected {
+            self.unfocus_pending_opens();
+            self.active = i;
+        }
         if let Some(i) = close {
             self.close_tab(i, false);
         }
@@ -2546,7 +2528,13 @@ impl App {
             Some(TabMenu::CloseAll) => self.run_command(Command::CloseAllTabs),
             Some(TabMenu::Copy(text)) => ui.ctx().copy_text(text),
             Some(TabMenu::Format(i)) => self.format_document(i),
-            Some(TabMenu::Split(i)) => self.split = Some(i),
+            Some(TabMenu::Split(i)) => {
+                self.preview = None;
+                self.split = Some(i);
+            }
+            Some(TabMenu::History(path)) => self.open_file_history(&path, None),
+            Some(TabMenu::SelectForCompare(path)) => self.select_for_compare(path),
+            Some(TabMenu::Compare(path)) => self.compare_with_selected(path),
             None => {}
         }
     }
@@ -2554,15 +2542,15 @@ impl App {
     /// Below the tabs: the shown file's path relative to the folder, as breadcrumbs;
     /// clicking a folder shows it in the Explorer.
     fn path_bar(&mut self, ui: &mut egui::Ui) {
-        let path = match self.tabs.get(self.active) {
-            Some(Tab::File(d)) => d.path.clone(),
-            Some(Tab::Diff(d)) => d.path.clone(),
-            Some(Tab::Large(v)) => v.path.clone(),
-            Some(Tab::Graph) | None => return,
+        let Some(path) = self.active_path().map(Path::to_owned) else {
+            return;
         };
         let mut reveal = None;
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
+            if self.can_preview(self.active) && icon_button(ui, ic::EYE).on_hover_text("Open Preview to the Side").clicked() {
+                self.open_markdown_preview(self.active);
+            }
             let sep = |ui: &mut egui::Ui| {
                 ui.weak(ic::CARET_RIGHT);
             };
@@ -2646,11 +2634,14 @@ impl App {
         let mut goto_at = None;
         let mut editor_out = None;
         let mut disk_action = None;
+        let mut selection_history = false;
         // Diagnostics of the active file, for squiggles (collected before borrowing the tab).
         let diags = self.squiggles_for(active, ui.visuals());
         // The completion popup takes its keys before the editor sees them.
         self.completion_keys(&ui.ctx().clone());
-        self.split_pane(ui);
+        if !self.markdown_pane(ui) {
+            self.split_pane(ui);
+        }
         let marks: Vec<std::ops::Range<usize>> = self.find_matches().map(<[_]>::to_vec).unwrap_or_default();
         let global_marks = self.search_marks(active);
         // .editorconfig's indent wins over the one detected from the file.
@@ -2692,11 +2683,22 @@ impl App {
                     if let Some(idx) = out.goto {
                         goto_at = Some(idx);
                     }
+                    if doc.anchor != doc.cursor
+                        && let Some(response) = &out.response
+                    {
+                        response.context_menu(|ui| {
+                            if ui.button("File History for Selection").clicked() {
+                                selection_history = true;
+                                ui.close();
+                            }
+                        });
+                    }
                     editor_out = Some(out);
                     self.find.after_editor(ui, doc);
                 }
                 Tab::Diff(d) => {
-                    let mut ignore_eol = self.settings.diff_ignore_eol;
+                    let immutable = matches!(d.source, DiffSource::Commit);
+                    let mut ignore_eol = if immutable { d.ignore_eol } else { self.settings.diff_ignore_eol };
                     ui.horizontal(|ui| {
                         if ui.button(format!("{} Open file", ic::ARROW_SQUARE_OUT)).clicked() {
                             open_path = Some(d.path.clone());
@@ -2708,10 +2710,12 @@ impl App {
                         if ui.selectable_label(d.inline, format!("{} Inline", ic::ROWS)).clicked() {
                             d.inline = true;
                         }
-                        ui.checkbox(&mut ignore_eol, "Ignore line endings");
+                        if !immutable {
+                            ui.checkbox(&mut ignore_eol, "Ignore line endings");
+                        }
                         diff_navigation(ui, d);
                     });
-                    if ignore_eol != self.settings.diff_ignore_eol {
+                    if !immutable && ignore_eol != self.settings.diff_ignore_eol {
                         self.run_command(Command::ToggleSetting(Setting::DiffIgnoreEol));
                     } else if d.ignore_eol != ignore_eol {
                         ui.weak("Loading diff…");
@@ -2726,6 +2730,8 @@ impl App {
                     self.refresh_diff();
                 }
                 Tab::Large(v) => large_view(ui, v),
+                Tab::Hex(v) => v.show(ui),
+                Tab::FileHistory(v) => v.show(ui, self.settings.diff_ignore_eol),
                 Tab::Graph => {
                     let Some(graph) = &self.graph else {
                         ui.label(if self.graph_rx.is_some() {
@@ -2783,6 +2789,10 @@ impl App {
         if let Some(out) = &editor_out {
             self.last_caret = out.caret;
             self.after_editor(out);
+            self.sync_markdown_preview(active, out);
+        }
+        if selection_history {
+            self.active_history(true);
         }
         if let Some(idx) = goto_at {
             self.go_to_definition(idx, ui.ctx());
@@ -2830,6 +2840,9 @@ impl App {
         }
         if self.diff_rx.is_some() {
             activity.push(("Loading diff…".into(), None));
+        }
+        if !self.open_jobs.is_empty() {
+            activity.push(("Opening file…".into(), None));
         }
         activity
     }
@@ -3039,13 +3052,11 @@ impl App {
             let (name, target) = goto_line::split_line_target(&q.query);
             // `:183` on its own: a line in the current file.
             let here = name.is_empty() && target.is_some() && chosen.is_none() && ctx.input(|i| i.key_pressed(Key::Enter));
-            let mut opened = false;
             if let (Some(f), Some(root)) = (chosen, self.root.clone()) {
-                self.open_file(&root.join(f));
-                opened = true;
+                self.open_with_target(&root.join(f), target.map_or(file_open::Target::None, file_open::Target::Line));
                 close = true;
             }
-            if (opened || here)
+            if here
                 && let Some(target) = target
                 && let Some(Tab::File(doc)) = self.tabs.get_mut(self.active)
             {
@@ -3468,6 +3479,7 @@ fn editor(
         changed: out.changed,
         focused: out.focused,
         top_line: out.top_line,
+        response: out.response,
     }
 }
 
@@ -3574,6 +3586,7 @@ pub(super) struct EditorOut {
     focused: bool,
     /// First visible line (fractional), for syncing two panes.
     top_line: f32,
+    response: Option<egui::Response>,
 }
 
 fn diff_view(ui: &mut egui::Ui, lines: &[String], id: &str) {
@@ -3657,6 +3670,9 @@ enum TabMenu {
     Copy(String),
     Format(usize),
     Split(usize),
+    History(PathBuf),
+    SelectForCompare(PathBuf),
+    Compare(PathBuf),
 }
 
 /// (added, removed) text colors.
@@ -4244,7 +4260,7 @@ fn disk_vs_editor(path: &Path, disk: &str, editor: &str, ignore_eol: bool) -> (S
 
 fn read_doc_text(path: &Path) -> std::io::Result<Option<DiskText>> {
     let bytes = std::fs::read(path)?;
-    Ok((!bytes.iter().take(8000).any(|&b| b == 0)).then(|| {
+    Ok((!crate::hex::is_binary(&bytes[..bytes.len().min(8000)])).then(|| {
         let text = String::from_utf8_lossy(&bytes);
         let crlf = text.contains("\r\n");
         DiskText {

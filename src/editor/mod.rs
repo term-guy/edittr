@@ -215,6 +215,8 @@ pub struct Output {
     pub focused: bool,
     /// The (fractional) line at the top of the view, for keeping two editors in sync.
     pub top_line: f32,
+    /// Interaction surface for the application context menu.
+    pub response: Option<egui::Response>,
 }
 
 struct Layout<'a> {
@@ -692,6 +694,7 @@ pub fn show(
             let r = r.translate(Vec2::new(-gutter_w, 0.0)).union(r); // keep the gutter from covering it
             ui.scroll_to_rect(r, if center { Some(egui::Align::Center) } else { None });
         }
+        out.response = Some(resp);
         ptr
     });
     ui.allocate_rect(full, Sense::hover());

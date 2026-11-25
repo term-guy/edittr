@@ -83,7 +83,7 @@ fn run_xml<T: DeserializeOwned>(root: &Path, args: &[&str]) -> Result<T, String>
 }
 
 /// Escape a literal @ in an SVN target (otherwise the suffix is a peg revision).
-fn target(path: &str) -> String {
+pub(crate) fn target(path: &str) -> String {
     if path.contains('@') { format!("{path}@") } else { path.into() }
 }
 
@@ -530,6 +530,27 @@ struct LogXml {
     entries: Vec<Revision>,
 }
 
+fn parse_path_history(xml: LogXml) -> Vec<crate::file_history::Entry> {
+    xml.entries
+        .into_iter()
+        .map(|rev| {
+            let subject = rev.subject().to_owned();
+            crate::file_history::Entry::svn(rev.number, rev.author, date_time(&rev.date), subject)
+        })
+        .collect()
+}
+
+pub(crate) fn path_history(root: &Path, path: &str) -> Result<Vec<crate::file_history::Entry>, String> {
+    run_xml(root, &["log", "--xml", "-r", "HEAD:1", "--", &target(path)]).map(parse_path_history)
+}
+
+pub(crate) fn path_history_patch(root: &Path, path: &str, revision: &str) -> Result<String, String> {
+    run(
+        root,
+        &["diff", "--internal-diff", "-x", "-U1000000", "-c", revision, "--", &target(path)],
+    )
+}
+
 #[derive(Default, Deserialize, Serialize)]
 struct History {
     entries: BTreeMap<u64, Revision>,
@@ -847,6 +868,22 @@ Body &lt;details&gt;</msg>
 <author>harry</author><date>2008-05-29T13:26:12.293121Z</date>
 </commit></entry>
 </target></blame>"#;
+
+    #[test]
+    fn parses_path_history_in_log_order() {
+        let input = r#"<log>
+        <logentry revision="14"><author>A &amp; B</author><date>2008-05-29T13:26:12.293121Z</date><msg>Fix
+Details</msg></logentry>
+        <logentry revision="9"><msg>Create</msg></logentry>
+        </log>"#;
+        let entries = parse_path_history(xml(input).unwrap());
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].short_hash, "r14");
+        assert_eq!(entries[0].author, "A & B");
+        assert_eq!(entries[0].subject, "Fix");
+        assert_eq!(entries[0].date, date_time("2008-05-29T13:26:12Z"));
+        assert_eq!(entries[1].hash, "r9");
+    }
 
     #[test]
     fn parses_working_copy_info() {

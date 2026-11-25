@@ -91,7 +91,7 @@ pub(super) fn select_target(doc: &mut super::Doc, target: LineTarget) {
 
 impl App {
     pub(super) fn open_goto_line(&mut self) {
-        if matches!(self.tabs.get(self.active), Some(Tab::File(_) | Tab::Large(_))) {
+        if matches!(self.tabs.get(self.active), Some(Tab::File(_) | Tab::Large(_) | Tab::Hex(_))) {
             self.goto_line = Some(GotoLine {
                 text: String::new(),
                 focus: true,
@@ -101,9 +101,10 @@ impl App {
 
     pub(super) fn goto_line_dialog(&mut self, ctx: &egui::Context) {
         let Some(state) = &mut self.goto_line else { return };
-        let (current, total) = match self.tabs.get(self.active) {
-            Some(Tab::File(doc)) => (doc.line_col().0 + 1, doc.text.lines().count().max(1)),
-            Some(Tab::Large(v)) => (v.window.0 + 1, v.index.lines()),
+        let (hint, hex_size) = match self.tabs.get(self.active) {
+            Some(Tab::File(doc)) => (line_hint(doc.line_col().0 + 1, doc.text.lines().count().max(1)), None),
+            Some(Tab::Large(v)) => (line_hint(v.window.0 + 1, v.index.lines()), None),
+            Some(Tab::Hex(v)) if v.size() != 0 => (format!("Byte offset (0–0x{:X}), decimal or hex", v.size() - 1), Some(v.size())),
             _ => {
                 self.goto_line = None;
                 return;
@@ -111,7 +112,8 @@ impl App {
         };
         let mut close = ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape));
         let mut go = None;
-        egui::Window::new("Go to line")
+        let mut offset = None;
+        egui::Window::new(if hex_size.is_some() { "Go to offset" } else { "Go to line" })
             .id(egui::Id::unique("goto_line"))
             .title_bar(false)
             .resizable(false)
@@ -120,20 +122,32 @@ impl App {
             .show(ctx, |ui| {
                 let r = ui.add(
                     egui::TextEdit::singleline(&mut state.text)
-                        .hint_text(format!("Line (1-{total}), or line:column. Now on line {current}"))
+                        .hint_text(hint)
                         .desired_width(f32::INFINITY),
                 );
                 if std::mem::take(&mut state.focus) {
                     r.request_focus();
                 }
-                let target = parse(&state.text);
-                if !state.text.trim().is_empty() && target.is_none() {
-                    ui.colored_label(ui.visuals().error_fg_color, "Type a line number, e.g. 120 or 120:8");
-                }
-                if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                    match target {
-                        Some(t) => go = Some(t),
-                        None => close = true,
+                let submit = r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                if let Some(size) = hex_size {
+                    let target = crate::hex::parse_offset(&state.text).filter(|&offset| offset < size);
+                    if !state.text.trim().is_empty() && target.is_none() {
+                        ui.colored_label(ui.visuals().error_fg_color, "Enter an in-range offset, e.g. 255 or 0xFF");
+                    }
+                    if submit {
+                        offset = target;
+                        if target.is_none() {
+                            r.request_focus();
+                        }
+                    }
+                } else {
+                    let target = parse(&state.text);
+                    if !state.text.trim().is_empty() && target.is_none() {
+                        ui.colored_label(ui.visuals().error_fg_color, "Type a line number, e.g. 120 or 120:8");
+                    }
+                    if submit {
+                        go = target;
+                        close |= target.is_none();
                     }
                 }
             });
@@ -145,10 +159,20 @@ impl App {
             }
             close = true;
         }
+        if let Some(offset) = offset
+            && let Some(Tab::Hex(viewer)) = self.tabs.get_mut(self.active)
+        {
+            viewer.go_to(offset);
+            close = true;
+        }
         if close {
             self.goto_line = None;
         }
     }
+}
+
+fn line_hint(current: usize, total: usize) -> String {
+    format!("Line (1-{total}), or line:column. Now on line {current}")
 }
 
 #[cfg(test)]

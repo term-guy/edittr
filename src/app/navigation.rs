@@ -283,6 +283,19 @@ impl App {
                     self.message = "No repository history available".into();
                 }
             }
+            Command::FileHistory => self.active_history(false),
+            Command::SelectionHistory => self.active_history(true),
+            Command::MarkdownPreview => self.open_markdown_preview(self.active),
+            Command::SelectForComparison => {
+                if let Some(path) = self.active_path().map(Path::to_owned) {
+                    self.select_for_compare(path);
+                }
+            }
+            Command::CompareWithSelected => {
+                if let Some(path) = self.active_path().map(Path::to_owned) {
+                    self.compare_with_selected(path);
+                }
+            }
             Command::Refresh => {
                 self.invalidate_tree(|_| true);
                 self.refresh_vcs();
@@ -303,6 +316,9 @@ impl App {
             Command::CSettings => self.open_c_settings(),
             Command::GenerateCompileDatabase => self.plan_compile_database(),
             Command::SplitEditor => {
+                if self.preview.take().is_some() {
+                    return;
+                }
                 self.split = match self.split {
                     Some(_) => None,
                     None => matches!(self.tabs.get(self.active), Some(Tab::File(_))).then_some(self.active),
