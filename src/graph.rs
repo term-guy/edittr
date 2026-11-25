@@ -31,6 +31,12 @@ pub fn lane_color(i: usize) -> Color32 {
     PALETTE[i % PALETTE.len()]
 }
 
+pub(crate) fn secondary_text_color(vis: &egui::Visuals) -> Color32 {
+    // Dark theme's normal text has less contrast to spare, especially on hovered rows.
+    let weak_mix = if vis.dark_mode { 0.12 } else { 0.4 };
+    vis.text_color().lerp_to_gamma(vis.weak_text_color(), weak_mix)
+}
+
 impl Graph {
     pub fn build(commits: Vec<Commit>) -> Self {
         use std::collections::HashMap;
@@ -160,7 +166,8 @@ impl Graph {
                     let resp = ui.interact(rect, ui.make_persistent_id(&c.hash), Sense::click());
                     let painter = ui.painter_at(rect);
                     let vis = ui.visuals();
-                    if selected == Some(r) {
+                    let is_selected = selected == Some(r);
+                    if is_selected {
                         painter.rect_filled(rect, 0.0, vis.selection.bg_fill);
                     } else if resp.hovered() {
                         painter.rect_filled(rect, 0.0, vis.faint_bg_color);
@@ -169,8 +176,13 @@ impl Graph {
                     self.paint_row(&painter, graph_rect, r, lane_w);
 
                     let font = egui::FontId::proportional(13.0);
-                    let text_col = vis.text_color();
-                    let weak = vis.weak_text_color();
+                    let (text_col, secondary) = if is_selected {
+                        let text = vis.selection.stroke.color;
+                        // The selection foreground has less contrast to spare on the blue fill.
+                        (text, text.gamma_multiply(0.95))
+                    } else {
+                        (vis.text_color(), secondary_text_color(vis))
+                    };
                     let mut px = rect.left() + graph_w + 4.0;
                     let cy = rect.center().y;
                     for (i, (reference, galley, color)) in refs.into_iter().enumerate() {
@@ -192,15 +204,21 @@ impl Graph {
                         egui::Align2::RIGHT_CENTER,
                         &c.short_hash,
                         mono.clone(),
-                        weak,
+                        secondary,
                     );
-                    painter.text(Pos2::new(right - 74.0, cy), egui::Align2::RIGHT_CENTER, &c.date, font.clone(), weak);
+                    painter.text(
+                        Pos2::new(right - 74.0, cy),
+                        egui::Align2::RIGHT_CENTER,
+                        &c.date,
+                        font.clone(),
+                        secondary,
+                    );
                     painter.text(
                         Pos2::new(right - 210.0, cy),
                         egui::Align2::RIGHT_CENTER,
                         &c.author,
                         font.clone(),
-                        weak,
+                        secondary,
                     );
                     let subj_clip = Rect::from_x_y_ranges(px..=right - 330.0, rect.y_range());
                     ui.painter_at(subj_clip)

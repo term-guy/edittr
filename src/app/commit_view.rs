@@ -1,5 +1,6 @@
 use super::{DiffSource, DiffTab, background, diff_colors, diff_navigation, diff_view, receive, side_by_side_view};
 use crate::git::{self, Commit};
+use crate::graph::secondary_text_color;
 use crate::icons as ic;
 use crate::tree::{self, Row};
 use crate::vcs::Vcs;
@@ -191,7 +192,7 @@ impl CommitView {
         ui.separator();
 
         let Some(files) = &mut self.files else {
-            ui.weak("Loading changed files…");
+            ui.colored_label(secondary_text_color(ui.visuals()), "Loading changed files…");
             if self.list_rx.is_none() {
                 let (root, hash, parent) = (root.to_owned(), commit.hash.clone(), commit.parents.first().cloned());
                 self.list_rx = Some(background(ui.ctx(), move || {
@@ -212,7 +213,7 @@ impl CommitView {
             }
         };
         if files.changes.is_empty() {
-            ui.weak("No changed files.");
+            ui.colored_label(secondary_text_color(ui.visuals()), "No changed files.");
             return;
         }
 
@@ -270,7 +271,7 @@ impl CommitView {
                 }
             }
         } else {
-            ui.weak("Loading file changes…");
+            ui.colored_label(secondary_text_color(ui.visuals()), "Loading file changes…");
             if self.diff_rx.is_none() {
                 let (root, hash, parent) = (root.to_owned(), commit.hash.clone(), commit.parents.first().cloned());
                 let (change, svn_url) = (change.clone(), files.svn_url.clone());
