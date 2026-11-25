@@ -372,7 +372,8 @@ impl App {
                 .tabs
                 .iter()
                 .filter_map(|tab| match tab {
-                    Tab::File(doc) => {
+                    // Untitled tabs exist only in this window: their text is never written anywhere.
+                    Tab::File(doc) if !doc.untitled => {
                         let (anchor, cursor) = doc.goto.unwrap_or((doc.anchor, doc.cursor));
                         Some(FileTab {
                             path: doc.path.as_os_str().to_owned(),
@@ -384,7 +385,7 @@ impl App {
                 })
                 .collect(),
             active: match self.tabs.get(self.active) {
-                Some(Tab::File(doc)) => Some(doc.path.as_os_str().to_owned()),
+                Some(Tab::File(doc)) if !doc.untitled => Some(doc.path.as_os_str().to_owned()),
                 _ => None,
             },
             sidebar: Sidebar {

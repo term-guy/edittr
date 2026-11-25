@@ -245,7 +245,7 @@ impl App {
             Command::OpenFolder => self.request_open_folder(false),
             Command::OpenFolderInNewWindow => self.request_open_folder(true),
             Command::NewWindow => self.new_window(None),
-            Command::NewFile => self.request_new_entry(None, false),
+            Command::NewFile => self.new_untitled(),
             Command::NewFolder => self.request_new_entry(None, true),
             Command::CloseFolder => self.close_folder(false),
             Command::QuickOpen => self.start_quick_open(),
@@ -320,6 +320,10 @@ impl App {
                 }
             }
             Command::Save => self.save_active(),
+            Command::SaveAs => {
+                let index = self.live_diff_doc(self.active).unwrap_or(self.active);
+                self.request_save_as(index);
+            }
             Command::FormatDocument => self.format_document(self.active),
             Command::CSettings => self.open_c_settings(),
             Command::OpenSettings => self.open_settings(),

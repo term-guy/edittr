@@ -22,7 +22,7 @@ pub(super) struct History {
 impl App {
     pub(super) fn active_path(&self) -> Option<&Path> {
         match self.tabs.get(self.active)? {
-            Tab::File(doc) => Some(&doc.path),
+            Tab::File(doc) => (!doc.untitled).then_some(doc.path.as_path()),
             Tab::Large(view) => Some(&view.path),
             Tab::Diff(diff) => Some(&diff.path),
             Tab::FileHistory(history) => Some(&history.path),

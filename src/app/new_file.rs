@@ -1,4 +1,5 @@
-//! Creating files and folders from the Explorer, the command palette and `Ctrl/Cmd+N`.
+//! New files: unsaved "Untitled" tabs (`Ctrl/Cmd+N`) that ask for a name when saved (Save As),
+//! and files or folders created by name from the Explorer.
 
 use super::*;
 
@@ -48,12 +49,29 @@ impl App {
         Some(dir.unwrap_or_else(|| root.clone()))
     }
 
+    /// An empty, unsaved tab; saving it asks where to put it.
+    pub(super) fn new_untitled(&mut self) {
+        let taken = |name: &str| {
+            self.tabs
+                .iter()
+                .any(|t| matches!(t, Tab::File(d) if d.untitled && d.path == Path::new(name)))
+        };
+        let name = (1..).map(|n| format!("Untitled-{n}")).find(|name| !taken(name)).unwrap_or_default();
+        self.add_file_tab(Path::new(&name), String::new(), false);
+        if let Some(Tab::File(doc)) = self.tabs.last_mut() {
+            doc.untitled = true;
+            // Focus the editor so typing goes straight into the new file.
+            doc.goto = Some((0, 0));
+        }
+        self.active = self.tabs.len() - 1;
+    }
+
     pub(super) fn request_new_entry(&mut self, dir: Option<PathBuf>, folder: bool) {
         let Some(dir) = dir.or_else(|| self.new_file_dir()) else {
             if folder {
                 self.message = "Open a folder first".into();
             } else {
-                self.new_file_save_dialog = true;
+                self.new_untitled();
             }
             return;
         };
@@ -65,20 +83,75 @@ impl App {
         });
     }
 
-    /// Without a project there is no folder to put the file in: ask where to save it.
-    pub(super) fn new_file_without_folder(&mut self, frame: &eframe::Frame) {
-        if !std::mem::take(&mut self.new_file_save_dialog) {
-            return;
+    /// Ask where to save tab `index` (an Untitled tab when saved, or Save As); the dialog
+    /// runs in `save_as_dialog`, which needs the window.
+    pub(super) fn request_save_as(&mut self, index: usize) {
+        if let Some(Tab::File(doc)) = self.tabs.get(index) {
+            self.save_as_request = Some(doc.id);
         }
-        let Some(path) = rfd::FileDialog::new().set_title("New file").set_parent(frame).save_file() else {
+    }
+
+    pub(super) fn save_as_dialog(&mut self, frame: &eframe::Frame) {
+        let Some(id) = self.save_as_request.take() else { return };
+        let Some(index) = self.tabs.iter().position(|t| matches!(t, Tab::File(d) if d.id == id)) else {
             return;
         };
-        // The dialog already asked before replacing an existing file; keep its contents.
-        let created = if path.exists() { Ok(()) } else { std::fs::write(&path, "") };
-        match created {
-            Ok(()) => self.open_file(&workspace::plain_path(&path)),
-            Err(err) => self.message = format!("Could not create {}: {err}", path.display()),
+        let Tab::File(doc) = &self.tabs[index] else { return };
+        let dir = if doc.untitled {
+            self.new_file_dir()
+        } else {
+            doc.path.parent().map(Path::to_owned)
+        };
+        let mut dialog = rfd::FileDialog::new()
+            .set_title(if doc.untitled { "Save" } else { "Save As" })
+            .set_file_name(doc.name())
+            .set_parent(frame);
+        if let Some(dir) = dir {
+            dialog = dialog.set_directory(dir);
         }
+        // The system dialog already asked before replacing an existing file.
+        let Some(path) = dialog.save_file() else { return };
+        let path = workspace::plain_path(&path);
+        if self
+            .tabs
+            .iter()
+            .enumerate()
+            .any(|(i, t)| i != index && matches!(t, Tab::File(d) if d.path == path))
+        {
+            self.message = format!("{} is open in another tab: close it first", path.display());
+            return;
+        }
+        self.retarget(index, path.clone());
+        self.save_doc(index);
+        if let Some(root) = self.root.clone()
+            && path.starts_with(&root)
+        {
+            let parents: Vec<PathBuf> = path
+                .ancestors()
+                .skip(1)
+                .take_while(|dir| dir.starts_with(&root))
+                .map(Path::to_owned)
+                .collect();
+            self.invalidate_tree(|dir| parents.iter().any(|p| p == dir));
+            self.refresh_vcs();
+        }
+    }
+
+    /// Point tab `index` at `path`: the language, grammar and language server follow the new name.
+    fn retarget(&mut self, index: usize, path: PathBuf) {
+        let Some(Tab::File(doc)) = self.tabs.get_mut(index) else { return };
+        doc.lang = language_of(&path);
+        doc.comment = editor::comment_token(&doc.lang.to_lowercase());
+        doc.path = path.clone();
+        doc.untitled = false;
+        doc.hl = Default::default();
+        doc.lsp = Default::default();
+        doc.markers = Default::default();
+        doc.blame = None;
+        doc.blame_version = None;
+        doc.blame_rx = None;
+        doc.disk = None;
+        self.prime_editorconfig(path);
     }
 
     pub(super) fn new_entry_dialog(&mut self, ctx: &egui::Context) {

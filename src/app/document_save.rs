@@ -50,6 +50,15 @@ impl App {
     pub(super) fn save_active(&mut self) {
         // In an editable diff, save the file being edited there.
         let index = self.live_diff_doc(self.active).unwrap_or(self.active);
+        self.save_doc(index);
+    }
+
+    /// Save tab `index`; an Untitled tab asks for a file name first.
+    pub(super) fn save_doc(&mut self, index: usize) {
+        if matches!(self.tabs.get(index), Some(Tab::File(doc)) if doc.untitled) {
+            self.request_save_as(index);
+            return;
+        }
         self.request_document_action(
             index,
             Action::Save {

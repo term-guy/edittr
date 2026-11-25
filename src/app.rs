@@ -56,7 +56,10 @@ type SearchMarks = Arc<Vec<std::ops::Range<usize>>>;
 
 struct Doc {
     id: u64,
+    /// For an Untitled tab, a placeholder name (`Untitled-1`) that is not on disk.
     path: PathBuf,
+    /// Never saved: saving asks for a name (see new_file.rs).
+    untitled: bool,
     text: String,
     saved: String,
     crlf: bool,
@@ -434,8 +437,8 @@ pub struct App {
     /// The requested folder opens in a new window instead of this one.
     open_folder_in_new_window: bool,
     new_entry: Option<new_file::NewEntry>,
-    /// New file with no folder open: ask where to save it (needs the frame, see `new_file_without_folder`).
-    new_file_save_dialog: bool,
+    /// Tab (doc id) to ask a file name for: an Untitled tab being saved, or Save As (needs the window).
+    save_as_request: Option<u64>,
     open_folder: Option<String>,
     search: SearchState,
     find: find::Find,
@@ -544,7 +547,7 @@ impl App {
             open_folder_requested: false,
             open_folder_in_new_window: false,
             new_entry: None,
-            new_file_save_dialog: false,
+            save_as_request: None,
             open_folder: None,
             search: SearchState::default(),
             lsp: problems::LanguageServers::default(),
@@ -1169,16 +1172,13 @@ impl App {
     }
 
     fn add_file_tab(&mut self, path: &Path, text: String, crlf: bool) {
-        let lang = path
-            .extension()
-            .or_else(|| path.file_name())
-            .map(|e| e.to_string_lossy().into_owned())
-            .unwrap_or_default();
+        let lang = language_of(path);
         let indent = editor::detect_indent(&text, self.settings.tab_size);
         let comment = editor::comment_token(&lang.to_lowercase());
         self.tabs.push(Tab::File(Doc {
             id: self.next_doc_id,
             path: path.to_path_buf(),
+            untitled: false,
             saved: text.clone(),
             disk: None,
             crlf,
@@ -2146,7 +2146,7 @@ impl App {
                 self.request_open_folder(false);
             }
             if ui
-                .add(egui::Button::new(format!("{} New File…", ic::FILE_PLUS)).min_size(egui::vec2(220.0, 30.0)))
+                .add(egui::Button::new(format!("{} New File", ic::FILE_PLUS)).min_size(egui::vec2(220.0, 30.0)))
                 .clicked()
             {
                 self.run_command(Command::NewFile);
@@ -3399,7 +3399,7 @@ impl eframe::App for App {
         self.call_hierarchy_panel(ui);
         egui::CentralPanel::default().show(ui, |ui| self.central(ui));
         self.open_requested_folder(frame);
-        self.new_file_without_folder(frame);
+        self.save_as_dialog(frame);
         self.dialogs(&ctx);
         self.sync_active_document();
         self.refresh_outline();
@@ -3775,6 +3775,14 @@ fn diff_view(ui: &mut egui::Ui, lines: &[String], id: &str) {
                 ui.add(egui::Label::new(t).extend());
             }
         });
+}
+
+/// The language key for a path: its extension, or the file name (Makefile, Dockerfile, …).
+fn language_of(path: &Path) -> String {
+    path.extension()
+        .or_else(|| path.file_name())
+        .map(|e| e.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 fn activity_button(ui: &mut egui::Ui, icon: &str, on: bool) -> egui::Response {
