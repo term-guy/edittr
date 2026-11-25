@@ -24,6 +24,7 @@ pub(crate) struct Settings {
     pub(crate) minimap: bool,
     /// Color nested brackets by depth.
     pub(crate) bracket_colors: bool,
+    pub(crate) sticky_scroll: bool,
     pub(crate) show_outline: bool,
     pub(crate) outline_expanded: bool,
     pub(crate) outline_grouped: bool,
@@ -47,6 +48,7 @@ impl Default for Settings {
             inline_blame: true,
             minimap: true,
             bracket_colors: true,
+            sticky_scroll: true,
             show_outline: true,
             outline_expanded: true,
             outline_grouped: true,
@@ -131,6 +133,7 @@ impl Settings {
                     "inline_blame" => settings.inline_blame = value,
                     "minimap" => settings.minimap = value,
                     "bracket_colors" => settings.bracket_colors = value,
+                    "sticky_scroll" => settings.sticky_scroll = value,
                     "show_outline" => settings.show_outline = value,
                     "outline_expanded" => settings.outline_expanded = value,
                     "outline_grouped" => settings.outline_grouped = value,
@@ -156,6 +159,7 @@ impl Settings {
                         | "inline_blame"
                         | "minimap"
                         | "bracket_colors"
+                        | "sticky_scroll"
                         | "restore_previous_session"
                         | "reopen_last_folder"
                         | "tab_size"
@@ -178,6 +182,7 @@ impl Settings {
         text.push_str(&format!("inline_blame={}\n", self.inline_blame));
         text.push_str(&format!("minimap={}\n", self.minimap));
         text.push_str(&format!("bracket_colors={}\n", self.bracket_colors));
+        text.push_str(&format!("sticky_scroll={}\n", self.sticky_scroll));
         text.push_str(&format!("restore_previous_session={}\n", self.restore_previous_session));
         text.push_str(&format!("reopen_last_folder={}\n", self.reopen_last_folder));
         text.push_str(&format!("tab_size={}\n", self.tab_size));
@@ -315,7 +320,7 @@ mod tests {
         let text = settings.format(previous);
         assert_eq!(
             text,
-            "future_key=one=two\nfuture_key = three\n# A comment\nchanges_tree=false\nhighlight_line=false\nshow_whitespace=false\ndiff_ignore_eol=true\ninline_blame=true\nminimap=true\nbracket_colors=true\nrestore_previous_session=true\nreopen_last_folder=false\ntab_size=4\nformat_on_save=false\nshow_outline=true\noutline_expanded=true\noutline_grouped=true\noutline_collapsed_groups=\n"
+            "future_key=one=two\nfuture_key = three\n# A comment\nchanges_tree=false\nhighlight_line=false\nshow_whitespace=false\ndiff_ignore_eol=true\ninline_blame=true\nminimap=true\nbracket_colors=true\nsticky_scroll=true\nrestore_previous_session=true\nreopen_last_folder=false\ntab_size=4\nformat_on_save=false\nshow_outline=true\noutline_expanded=true\noutline_grouped=true\noutline_collapsed_groups=\n"
         );
         assert!(!Settings::parse(&text).changes_tree);
     }
@@ -331,6 +336,16 @@ mod tests {
         let s = Settings::default();
         let once = s.format("");
         assert_eq!(s.format(&once), once);
+    }
+
+    #[test]
+    fn sticky_scroll_defaults_on_and_round_trips() {
+        assert!(Settings::parse("").sticky_scroll);
+        assert!(Settings::parse("sticky_scroll=maybe").sticky_scroll);
+        let settings = Settings::parse("sticky_scroll=false");
+        let text = settings.format(" sticky_scroll = true\n");
+        assert_eq!(text.matches("sticky_scroll=").count(), 1);
+        assert!(!Settings::parse(&text).sticky_scroll);
     }
 
     #[test]

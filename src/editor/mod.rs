@@ -7,6 +7,9 @@
 
 pub mod buffer;
 pub mod fold;
+mod navigation_menu;
+#[path = "../sticky_scroll.rs"]
+pub(crate) mod sticky;
 
 use crate::highlight;
 use buffer::{History, Kind, LineIndex, Sel};
@@ -52,6 +55,7 @@ pub struct State {
     pub folded: BTreeSet<usize>,
     regions: Vec<Range<usize>>,
     view: fold::View,
+    sticky: sticky::Cache,
     /// (version, folded) the regions/view were computed for.
     view_key: Option<(u64, Vec<usize>)>,
     /// Vertical scroll offset to apply next frame (minimap clicks).
@@ -64,6 +68,10 @@ pub struct State {
 }
 
 impl State {
+    pub(crate) fn set_sticky_outline(&mut self, version: u64, scopes: &sticky::Scopes) {
+        self.sticky.set_outline(version, scopes);
+    }
+
     /// Scroll so that `line` (fractional) is at the top on the next frame.
     pub fn scroll_to_line(&mut self, line: f32) {
         self.scroll_line = Some(line.max(0.0));
@@ -181,6 +189,8 @@ pub struct Options<'a> {
     pub minimap: bool,
     /// Color brackets by nesting depth.
     pub bracket_colors: bool,
+    pub sticky_scroll: bool,
+    pub navigation_menu: bool,
     /// Selecting, copying, finding and scrolling only (e.g. the base side of a diff).
     pub read_only: bool,
 }
@@ -208,6 +218,7 @@ pub struct Output {
     pub changed: bool,
     /// Cmd/Ctrl+click on a symbol: go to its definition (byte offset).
     pub goto: Option<usize>,
+    pub context_command: Option<crate::commands::Command>,
     /// The pointer has rested on this byte offset for a while (hover info).
     pub hover: Option<(usize, Pos2)>,
     /// Screen position of the primary caret (for popups such as completion).
@@ -421,6 +432,9 @@ pub fn show(
     st.update_view(text, *version);
     let ix = st.index(text, *version).clone();
     let view = st.view.clone();
+    if opts.sticky_scroll {
+        st.sticky.update(*version, text, &ix, &st.regions);
+    }
     let spans = if opts.highlight {
         hl.spans(ui.ctx(), *version, text, opts.lang, ui.visuals().dark_mode)
     } else {
@@ -508,8 +522,26 @@ pub fn show(
             rect.min + vp.max.to_vec2(),
         );
 
-        // ---- mouse
-        let ptr = mouse(ui, st, &resp, &lines, &lay, &mut out, rect.min.x + vp.min.x + fold_w);
+        let sticky = opts.sticky_scroll.then(|| {
+            let viewport = vp.translate(rect.min.to_vec2()).intersect(ui.clip_rect());
+            sticky::Overlay::new(&st.sticky, &view, viewport, row_h, visible_rows.start)
+        });
+        if let Some(offset) = sticky.as_ref().and_then(|overlay| overlay.interact(ui, id, &view)) {
+            st.scroll_to = Some(offset);
+            resp.request_focus();
+            ui.ctx().request_repaint();
+        }
+        let over_sticky = sticky.as_ref().is_some_and(|overlay| overlay.contains_pointer(ui));
+        if opts.navigation_menu && (!over_sticky || resp.context_menu_opened()) {
+            out.context_command = navigation_menu::show(&resp, st, &lines, &lay, *version);
+        }
+
+        // A drag started in the text can still finish over a pinned header.
+        let ptr = if over_sticky && st.drag.is_none() && st.goto_press.is_none() {
+            None
+        } else {
+            mouse(ui, st, &resp, &lines, &lay, &mut out, rect.min.x + vp.min.x + fold_w)
+        };
 
         // ---- paint
         let painter = ui.painter().with_clip_rect(clip);
@@ -686,9 +718,16 @@ pub fn show(
             }
         }
 
+        if let Some(overlay) = &sticky {
+            overlay.paint(&lines, lay.text_x, gutter_w, char_w);
+        }
+
         // Scroll requests.
         if let Some(center) = st.reveal.take() {
-            let r = caret_rect.expand2(Vec2::new(4.0 * char_w, row_h));
+            let mut r = caret_rect.expand2(Vec2::new(4.0 * char_w, row_h));
+            if !center && let Some(overlay) = &sticky {
+                r.min.y -= overlay.height();
+            }
             let r = r.translate(Vec2::new(-gutter_w, 0.0)).union(r); // keep the gutter from covering it
             ui.scroll_to_rect(r, if center { Some(egui::Align::Center) } else { None });
         }
@@ -1643,6 +1682,8 @@ mod tests {
                     comment: Some("//"),
                     minimap: false,
                     bracket_colors: true,
+                    sticky_scroll: true,
+                    navigation_menu: false,
                     read_only,
                 };
                 out = show(ui, id, st, text, version, hl, &opts, &Extras::default());
@@ -1672,6 +1713,32 @@ mod tests {
     }
 
     const NONE: egui::Modifiers = egui::Modifiers::NONE;
+
+    #[test]
+    fn clicking_a_sticky_header_scrolls_without_relocating_the_caret() {
+        let text = format!("fn main() {{\n{}}}\n", "    body();\n".repeat(100));
+        let mut h = Harness::new(&text);
+        h.st.scroll_to_line(20.0);
+        assert!((h.frame(vec![]).top_line - 20.0).abs() < 0.1);
+        let header = h
+            .ctx
+            .read_response(h.id.with(("sticky_header", 0usize)))
+            .expect("function header is pinned");
+        let pos = header.rect.center();
+        h.frame(vec![Event::PointerMoved(pos)]);
+        for pressed in [true, false] {
+            h.frame(vec![Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: NONE,
+            }]);
+        }
+        let out = h.frame(vec![]);
+        assert!(out.top_line < 0.1);
+        assert!(out.focused);
+        assert_eq!(h.st.primary().head, 0);
+    }
 
     #[test]
     fn read_only_selects_and_copies_but_never_edits() {

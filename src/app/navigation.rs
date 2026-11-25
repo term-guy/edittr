@@ -267,6 +267,7 @@ impl App {
             Command::GoBack => self.go_back(),
             Command::GoForward => self.go_forward(),
             Command::FindReferences => self.find_references(),
+            Command::ShowCallHierarchy => self.show_call_hierarchy(),
             Command::Explorer => {
                 self.side = Side::Explorer;
                 self.side_open = true;

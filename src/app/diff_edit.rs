@@ -258,6 +258,8 @@ impl App {
                 comment: None,
                 minimap: false,
                 bracket_colors: settings.bracket_colors,
+                sticky_scroll: false,
+                navigation_menu: false,
                 read_only: true,
             };
             let extras = ed::Extras {

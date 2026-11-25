@@ -2,6 +2,9 @@
 //!
 //! One server process per language per project folder, started lazily on first use.
 
+#[path = "lsp_call_hierarchy.rs"]
+pub(crate) mod call_hierarchy;
+
 use crate::diagnostics::{self, ByPath};
 pub use crate::diagnostics::{Diagnostic, Severity};
 use crate::{clangd, workspace};
@@ -259,6 +262,7 @@ pub struct Client {
     next_id: AtomicI64,
     pending: Arc<Mutex<HashMap<i64, Sender<Value>>>>,
     ready: OnceLock<Result<SyncKind, String>>,
+    call_hierarchy: AtomicBool,
     progress: Mutex<HashMap<ProgressToken, Progress>>,
     sync_write: Mutex<()>,
     docs: Mutex<HashMap<PathBuf, Synced>>,
@@ -316,6 +320,7 @@ impl Client {
             next_id: AtomicI64::new(1),
             pending: Arc::new(Mutex::new(HashMap::new())),
             ready: OnceLock::new(),
+            call_hierarchy: AtomicBool::new(false),
             progress: Mutex::new(HashMap::new()),
             sync_write: Mutex::new(()),
             docs: Mutex::new(HashMap::new()),
@@ -399,6 +404,7 @@ impl Client {
                         "hover": {"contentFormat": ["plaintext", "markdown"]},
                         "completion": {"completionItem": {"snippetSupport": false, "documentationFormat": ["plaintext"]}},
                         "references": {},
+                        "callHierarchy": {"dynamicRegistration": false},
                     },
                     "workspace": {"workspaceFolders": true, "configuration": true},
                 },
@@ -407,6 +413,7 @@ impl Client {
                 params["initializationOptions"] = options;
             }
             let res = c.request("initialize", params, Duration::from_secs(60)).map(|result| {
+                c.call_hierarchy.store(call_hierarchy::supported(&result), Ordering::Release);
                 c.notify("initialized", json!({}));
                 SyncKind::from_initialize(&result)
             });
@@ -723,6 +730,32 @@ impl Client {
         let extra = json!({"context": {"includeDeclaration": true}});
         let v = self.at_position("textDocument/references", path, text, revision, pos, extra, timeout)?;
         Ok(parse_locations(&v))
+    }
+
+    pub(crate) fn prepare_call_hierarchy(
+        &self,
+        path: &Path,
+        text: &str,
+        revision: Revision,
+        pos: (usize, usize),
+        timeout: Duration,
+    ) -> Result<Vec<call_hierarchy::Item>, String> {
+        self.wait_ready(timeout)?;
+        if !self.call_hierarchy.load(Ordering::Acquire) {
+            return Err(format!("{} does not support call hierarchy", self.name));
+        }
+        let result = self.at_position("textDocument/prepareCallHierarchy", path, text, revision, pos, Value::Null, timeout)?;
+        Ok(call_hierarchy::parse_roots(result))
+    }
+
+    pub(crate) fn hierarchy_calls(
+        &self,
+        item: Value,
+        direction: call_hierarchy::Direction,
+        timeout: Duration,
+    ) -> Result<Vec<call_hierarchy::Item>, String> {
+        let result = self.request(direction.method(), json!({"item": item}), timeout)?;
+        Ok(call_hierarchy::parse_calls(result, direction))
     }
 
     pub(crate) fn switch_source_header(&self, path: &Path, text: &str, revision: Revision, timeout: Duration) -> Option<PathBuf> {
