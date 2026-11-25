@@ -63,12 +63,15 @@ Name: "{autodesktop}\edittr"; Filename: "{app}\edittr.exe"; Tasks: desktopicon
 ; Right-click a folder, a folder background, or a file.
 Root: HKA; Subkey: "Software\Classes\Directory\shell\edittr"; ValueType: string; ValueName: ""; ValueData: "Open with edittr"; Tasks: contextmenu; Flags: uninsdeletekey
 Root: HKA; Subkey: "Software\Classes\Directory\shell\edittr"; ValueType: string; ValueName: "Icon"; ValueData: """{app}\edittr.exe"""; Tasks: contextmenu
+Root: HKA; Subkey: "Software\Classes\Directory\shell\edittr"; ValueType: string; ValueName: "EdittrVersion"; ValueData: "{#AppVersion}"; Tasks: contextmenu
 Root: HKA; Subkey: "Software\Classes\Directory\shell\edittr\command"; ValueType: string; ValueName: ""; ValueData: """{app}\edittr.exe"" ""%1"""; Tasks: contextmenu
 Root: HKA; Subkey: "Software\Classes\Directory\Background\shell\edittr"; ValueType: string; ValueName: ""; ValueData: "Open with edittr"; Tasks: contextmenu; Flags: uninsdeletekey
 Root: HKA; Subkey: "Software\Classes\Directory\Background\shell\edittr"; ValueType: string; ValueName: "Icon"; ValueData: """{app}\edittr.exe"""; Tasks: contextmenu
+Root: HKA; Subkey: "Software\Classes\Directory\Background\shell\edittr"; ValueType: string; ValueName: "EdittrVersion"; ValueData: "{#AppVersion}"; Tasks: contextmenu
 Root: HKA; Subkey: "Software\Classes\Directory\Background\shell\edittr\command"; ValueType: string; ValueName: ""; ValueData: """{app}\edittr.exe"" ""%V"""; Tasks: contextmenu
 Root: HKA; Subkey: "Software\Classes\*\shell\edittr"; ValueType: string; ValueName: ""; ValueData: "Edit with edittr"; Tasks: contextmenu; Flags: uninsdeletekey
 Root: HKA; Subkey: "Software\Classes\*\shell\edittr"; ValueType: string; ValueName: "Icon"; ValueData: """{app}\edittr.exe"""; Tasks: contextmenu
+Root: HKA; Subkey: "Software\Classes\*\shell\edittr"; ValueType: string; ValueName: "EdittrVersion"; ValueData: "{#AppVersion}"; Tasks: contextmenu
 Root: HKA; Subkey: "Software\Classes\*\shell\edittr\command"; ValueType: string; ValueName: ""; ValueData: """{app}\edittr.exe"" ""%1"""; Tasks: contextmenu
 
 [Run]

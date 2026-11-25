@@ -496,6 +496,10 @@ impl App {
         let mut fonts = fonts::Fonts::default();
         fonts.start(&settings, &cc.egui_ctx);
         highlight::warm_up(cc.egui_ctx.clone());
+        if cfg!(windows) {
+            // A newer copy (e.g. a just-extracted portable) takes over the Explorer menu the user turned on.
+            std::thread::spawn(crate::shell_menu::follow_newest);
+        }
         cc.egui_ctx.set_theme(settings.themes.preference);
         cc.egui_ctx.global_style_mut(|s| {
             s.spacing.item_spacing.y = 3.0;

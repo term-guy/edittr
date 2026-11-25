@@ -11,6 +11,7 @@ enum Control {
     Theme,
     Font(fonts::Target),
     BreadcrumbSize,
+    ExplorerMenu,
     Action(Command, &'static str),
 }
 
@@ -25,6 +26,9 @@ const fn item(control: Control, title: &'static str, detail: &'static str) -> It
 }
 
 use Control::*;
+
+/// Section shown only on Windows.
+const WINDOWS: &str = "Windows";
 
 const SECTIONS: &[(&str, &[Item])] = &[
     (
@@ -148,6 +152,15 @@ const SECTIONS: &[(&str, &[Item])] = &[
             ),
         ],
     ),
+    (
+        WINDOWS,
+        &[item(
+            ExplorerMenu,
+            "Explorer right-click menu",
+            "Add \"Edit with edittr\" to files and \"Open with edittr\" to folders in Windows Explorer, for this copy of edittr \
+             (also the portable one). On Windows 11 they are under \"Show more options\".",
+        )],
+    ),
 ];
 
 #[derive(Default)]
@@ -157,6 +170,8 @@ pub(super) struct Page {
     font_search: [String; 2],
     /// The search box of a just-opened font picker still needs focus (not possible during the popup's invisible sizing pass).
     font_focus: [bool; 2],
+    /// Read from the registry when the Settings tab first shows it.
+    explorer_menu: Option<crate::shell_menu::State>,
 }
 
 impl Page {
@@ -251,6 +266,9 @@ impl App {
                         let section_size = egui::TextStyle::Body.resolve(ui.style()).size * (15.0 / 13.0);
                         let mut shown = 0;
                         for (section, items) in SECTIONS {
+                            if *section == WINDOWS && !cfg!(windows) {
+                                continue;
+                            }
                             let items: Vec<_> = items.iter().filter(|item| matches(&filter, section, item)).collect();
                             if !items.is_empty() {
                                 ui.add_space(18.0);
@@ -415,6 +433,7 @@ impl App {
                     }
                 }
                 Font(target) => self.font_controls(ui, target),
+                ExplorerMenu => self.explorer_menu_switch(ui),
                 BreadcrumbSize => {
                     let size = &mut self.settings.breadcrumb_font_size;
                     let response = ui
@@ -447,6 +466,30 @@ impl App {
                 }
             });
         });
+    }
+
+    fn explorer_menu_switch(&mut self, ui: &mut egui::Ui) {
+        use crate::shell_menu::{self, State};
+        let state = self.settings_page.explorer_menu.get_or_insert_with(shell_menu::state).clone();
+        let mut on = matches!(state, State::This | State::AllUsers);
+        let hover = match &state {
+            State::Off => "Not in the Explorer menu".to_string(),
+            State::This => "In the Explorer menu for this copy of edittr".to_string(),
+            State::Other(command) => format!("The Explorer menu opens another copy: {command}\nTurn on to use this one."),
+            State::AllUsers => "Added for all users by the installer; change it by running the installer again".to_string(),
+        };
+        let response = ui.add_enabled_ui(state != State::AllUsers, |ui| switch(ui, &mut on)).inner;
+        if response
+            .on_hover_text(hover)
+            .on_disabled_hover_text("Added for all users by the installer")
+            .changed()
+        {
+            let result = if on { shell_menu::register() } else { shell_menu::unregister() };
+            if let Err(err) = result {
+                self.message = format!("Couldn't change the Explorer menu: {err}");
+            }
+            self.settings_page.explorer_menu = Some(shell_menu::state());
+        }
     }
 
     fn font_controls(&mut self, ui: &mut egui::Ui, target: fonts::Target) {

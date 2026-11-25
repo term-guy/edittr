@@ -31,6 +31,7 @@ mod search;
 mod server_check;
 mod session;
 mod settings;
+mod shell_menu;
 mod svn;
 mod symbol_cache;
 mod symbols;
