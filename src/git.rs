@@ -289,6 +289,7 @@ pub enum CommitRef {
     Remote(String),
     Tag(String),
     Head,
+    SvnBase,
     Other(String),
 }
 

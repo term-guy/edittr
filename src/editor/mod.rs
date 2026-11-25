@@ -217,6 +217,8 @@ pub struct Options<'a> {
     pub sticky_scroll: bool,
     /// Sticky scroll also pins control flow blocks (if / else / loops / switch / case).
     pub sticky_control_flow: bool,
+    /// A divider line below the pinned sticky scroll lines.
+    pub sticky_line: bool,
     /// Kinds of lines sticky scroll may pin (control flow ones only with `sticky_control_flow`).
     pub sticky_shown: sticky::Kinds,
     pub navigation_menu: bool,
@@ -821,7 +823,7 @@ pub fn show(
         }
 
         if let Some(overlay) = &sticky {
-            overlay.paint(&lines, lay.text_x, gutter_w, char_w);
+            overlay.paint(&lines, lay.text_x, gutter_w, char_w, opts.sticky_line);
         }
 
         // Scroll requests.
@@ -1922,6 +1924,7 @@ mod tests {
                     bracket_colors: true,
                     sticky_scroll: true,
                     sticky_control_flow: true,
+                    sticky_line: true,
                     sticky_shown: sticky::Kinds::ALL,
                     navigation_menu: false,
                     read_only,

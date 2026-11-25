@@ -185,6 +185,7 @@ impl App {
                 }
                 let disk = disk.as_mut().unwrap();
                 self.add_file_tab(&path, std::mem::take(&mut disk.text), disk.crlf);
+                self.record_tab_recent(self.tabs.len() - 1);
                 self.tabs.len() - 1
             }
         };
@@ -262,6 +263,7 @@ impl App {
                 bracket_colors: settings.bracket_colors,
                 sticky_scroll: false,
                 sticky_control_flow: false,
+                sticky_line: true,
                 sticky_shown: crate::editor::sticky::Kinds::ALL,
                 navigation_menu: false,
                 read_only: true,
@@ -316,7 +318,7 @@ impl App {
         // Ctrl/Cmd+click in the working copy: go to the definition, from the file's own
         // tab (the jump and Go back work as in the normal editor).
         if let Some(idx) = goto {
-            self.active = file;
+            self.activate_tab(file);
             self.go_to_definition(idx, &ui.ctx().clone());
         }
         open_path

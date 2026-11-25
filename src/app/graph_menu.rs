@@ -83,7 +83,7 @@ impl GraphMenu<'_> {
                     match reference {
                         CommitRef::Local { name, .. } | CommitRef::Remote(name) => copy(ui, format!("Copy branch name {name}"), name),
                         CommitRef::Tag(name) => copy(ui, format!("Copy tag name {name}"), name),
-                        CommitRef::Head | CommitRef::Other(_) => {}
+                        CommitRef::Head | CommitRef::SvnBase | CommitRef::Other(_) => {}
                     }
                 }
             }

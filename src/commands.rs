@@ -73,6 +73,8 @@ pub(crate) enum Setting {
     StickyScroll,
     StickyControlFlow,
     ShowOutline,
+    ShowFps,
+    HeaderLines,
 }
 
 impl Setting {
@@ -92,6 +94,8 @@ impl Setting {
             Self::StickyScroll => "Sticky scroll",
             Self::StickyControlFlow => "Sticky scroll: control flow (if, else, loops, switch, case)",
             Self::ShowOutline => "Show outline",
+            Self::ShowFps => "Show frames per second in the status bar",
+            Self::HeaderLines => "Lines under the breadcrumbs and sticky scroll",
         }
     }
 
@@ -111,6 +115,8 @@ impl Setting {
             Self::StickyScroll => &mut settings.sticky_scroll,
             Self::StickyControlFlow => &mut settings.sticky_control_flow,
             Self::ShowOutline => &mut settings.show_outline,
+            Self::ShowFps => &mut settings.show_fps,
+            Self::HeaderLines => &mut settings.header_lines,
         }
     }
 }
@@ -282,6 +288,12 @@ pub(crate) const COMMANDS: &[Entry] = &[
     Entry::new(ToggleSetting(Setting::StickyScroll), "Toggle sticky scroll", &[]),
     Entry::new(ToggleSetting(Setting::StickyControlFlow), "Toggle sticky scroll control flow", &[]),
     Entry::new(ToggleSetting(Setting::ShowOutline), "Show outline", &[]),
+    Entry::new(ToggleSetting(Setting::ShowFps), "Toggle frames per second (status bar)", &[]),
+    Entry::new(
+        ToggleSetting(Setting::HeaderLines),
+        "Toggle lines under the breadcrumbs and sticky scroll",
+        &[],
+    ),
     Entry::new(TabSize(2), "Tab size: 2", &[]),
     Entry::new(TabSize(4), "Tab size: 4", &[]),
     Entry::new(TabSize(8), "Tab size: 8", &[]),

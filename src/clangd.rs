@@ -250,6 +250,8 @@ pub(crate) struct CompilationDatabase {
     pub(crate) flags: FlagSource,
     /// The compiler family whose commands were converted for clangd (IAR, TI, ...).
     pub(crate) converted: Option<crate::ccompilers::Family>,
+    /// The compiler found in the database or the Makefiles (before the C/C++ settings' override).
+    pub(crate) detected_compiler: Option<String>,
 }
 
 impl CompilationDatabase {
@@ -302,6 +304,7 @@ impl CompilationDatabase {
             inputs: Vec::new(),
             flags,
             converted: None,
+            detected_compiler: None,
         }
     }
 
@@ -370,6 +373,7 @@ impl CompilationDatabase {
                 }
             }
         }
+        self.detected_compiler.clone_from(&compiler);
         let compiler = Some(settings.compiler.trim())
             .filter(|c| !c.is_empty())
             .map(str::to_owned)

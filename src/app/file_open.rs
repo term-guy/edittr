@@ -55,7 +55,7 @@ impl App {
             Tab::Hex(v) => v.is_file(&path),
             _ => false,
         }) {
-            self.active = i;
+            self.activate_tab(i);
             target.select(&mut self.tabs[i]);
             return;
         }
@@ -126,7 +126,9 @@ impl App {
             }
             job.target.select(&mut self.tabs[index]);
             if job.focus {
-                self.active = index;
+                self.activate_tab(index);
+            } else {
+                self.record_tab_recent(index);
             }
         }
     }

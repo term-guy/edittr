@@ -13,6 +13,7 @@ enum Control {
     BreadcrumbSize,
     ExplorerMenu,
     StickyKinds,
+    About,
     Action(Command, &'static str),
 }
 
@@ -70,6 +71,17 @@ const SECTIONS: &[(&str, &[Item])] = &[
                 Toggle(Setting::ShowWhitespace),
                 "Show whitespace",
                 "Draw spaces as dots and tabs as arrows.",
+            ),
+            item(
+                Toggle(Setting::HeaderLines),
+                "Lines under the breadcrumbs and sticky scroll",
+                "Draw a divider line below the file path bar and below the pinned sticky scroll lines.",
+            ),
+            item(
+                Toggle(Setting::ShowFps),
+                "Show FPS",
+                "Show the frames drawn per second and the time the last frame took in the status bar. \
+                 edittr only redraws when something changes, so an idle window shows few frames.",
             ),
         ],
     ),
@@ -173,7 +185,27 @@ const SECTIONS: &[(&str, &[Item])] = &[
              (also the portable one). On Windows 11 they are under \"Show more options\".",
         )],
     ),
+    (
+        "About",
+        &[item(
+            About,
+            "edittr",
+            "The version of this copy of edittr. New versions are on the releases page.",
+        )],
+    ),
 ];
+
+const RELEASES: &str = "https://github.com/term-guy/edittr/releases";
+
+/// "0.4.2 (abc1234, 2026-11-25)": the version, and the commit it was built from when known.
+pub(crate) fn version_text() -> String {
+    let version = env!("CARGO_PKG_VERSION");
+    match (env!("EDITTR_COMMIT"), env!("EDITTR_COMMIT_DATE")) {
+        ("", _) => version.to_string(),
+        (commit, "") => format!("{version} ({commit})"),
+        (commit, date) => format!("{version} ({commit}, {date})"),
+    }
+}
 
 #[derive(Default)]
 pub(super) struct Page {
@@ -182,6 +214,8 @@ pub(super) struct Page {
     font_search: [String; 2],
     /// The search box of a just-opened font picker still needs focus (not possible during the popup's invisible sizing pass).
     font_focus: [bool; 2],
+    /// Frame each font picker's popup was last drawn in: a popup not drawn in the previous frame has just opened.
+    font_shown: [u64; 2],
     /// Read from the registry when the Settings tab first shows it.
     explorer_menu: Option<crate::shell_menu::State>,
 }
@@ -484,6 +518,17 @@ impl App {
                         self.set_theme_preference(preference);
                     }
                 }
+                About => {
+                    ui.hyperlink_to("Releases", RELEASES);
+                    let version = version_text();
+                    if ui
+                        .add(egui::Label::new(RichText::new(format!("Version {version}")).strong()).sense(egui::Sense::click()))
+                        .on_hover_text("Click to copy")
+                        .clicked()
+                    {
+                        ui.ctx().copy_text(version);
+                    }
+                }
                 Action(command, label) => {
                     if ui.button(label).clicked() {
                         *run = Some(command);
@@ -527,9 +572,12 @@ impl App {
         let saved = target.choice(&mut self.settings);
         let current = saved.as_ref().map_or("Default", |choice| choice.family.as_str());
         let salt = ("font-picker", target);
-        let was_open = egui::ComboBox::is_open(ui.ctx(), ui.make_persistent_id(salt));
+        // Not `ComboBox::is_open(make_persistent_id(salt))`: `from_id_salt` wraps the salt, so that id never matched
+        // and the search text was cleared every frame.
+        let frame = ctx.cumulative_frame_nr();
         let page = &mut self.settings_page;
-        let (search, focus) = (&mut page.font_search[target as usize], &mut page.font_focus[target as usize]);
+        let i = target as usize;
+        let (search, focus, shown) = (&mut page.font_search[i], &mut page.font_focus[i], &mut page.font_shown[i]);
         let picker = egui::ComboBox::from_id_salt(salt)
             .width(ui.available_width().clamp(60.0, 168.0))
             .height(340.0)
@@ -538,6 +586,8 @@ impl App {
             .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
             .show_ui(ui, |ui| {
                 self.fonts.request_list(&ctx);
+                let was_open = *shown + 1 >= frame;
+                *shown = frame;
                 if !was_open {
                     search.clear();
                     *focus = true;
@@ -729,5 +779,59 @@ mod tests {
         let database = &SECTIONS[4].1[1];
         assert!(!super::matches("tab", "C / C++", database));
         assert!(super::matches("comp", "C / C++", database));
+    }
+
+    #[test]
+    fn typing_in_the_font_search_keeps_the_text() {
+        let ctx = egui::Context::default();
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let (writer, worker) = crate::settings::SettingsWriter::start();
+        let startup = Startup {
+            root: None,
+            file: None,
+            restore: false,
+            window: Default::default(),
+        };
+        let mut app = App::new(&cc, startup, Default::default(), writer, None);
+        let frame = |app: &mut App, events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                events,
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 800.0))),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| app.settings_tab(ui));
+            out.textures_delta.clear();
+            out.shapes
+        };
+        // The first font picker ("Default" family) opens on a click.
+        let pos = frame(&mut app, Vec::new())
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == "Default" => Some(text.pos + egui::vec2(3.0, 3.0)),
+                _ => None,
+            })
+            .unwrap();
+        let click = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        frame(&mut app, vec![egui::Event::PointerMoved(pos)]);
+        frame(&mut app, vec![click(true)]);
+        frame(&mut app, vec![click(false)]);
+        for _ in 0..3 {
+            frame(&mut app, Vec::new());
+        }
+        frame(&mut app, vec![egui::Event::Text("mo".into())]);
+        frame(&mut app, vec![egui::Event::Text("n".into())]);
+        frame(&mut app, Vec::new());
+        assert!(
+            app.settings_page.font_search.contains(&"mon".to_string()),
+            "{:?}",
+            app.settings_page.font_search
+        );
+        drop(app);
+        worker.join().unwrap();
     }
 }

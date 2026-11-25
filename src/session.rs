@@ -105,12 +105,39 @@ pub(crate) struct Workspace {
     pub layout: WorkspaceLayout,
     #[serde(default)]
     pub sidebar_ui: SidebarUi,
+    #[serde(default)]
+    pub recent_files: Vec<OsString>,
 }
 
 impl Workspace {
     pub(crate) fn load(root: Option<&Path>) -> Self {
         read(&workspace_filename(root)).unwrap_or_default()
     }
+}
+
+pub(crate) const MAX_RECENT_FILES: usize = 50;
+
+pub(crate) fn is_relative_file_path(path: &Path) -> bool {
+    !path.as_os_str().is_empty() && path.components().all(|component| matches!(component, Component::Normal(_)))
+}
+
+/// Validate saved paths off the UI thread, including symlinks that now lead outside the project.
+pub(crate) fn validate_recent_files(root: &Path, paths: &mut Vec<OsString>) {
+    if paths.is_empty() {
+        return;
+    }
+    let Ok(root) = crate::workspace::canonical(root) else {
+        paths.clear();
+        return;
+    };
+    paths.truncate(MAX_RECENT_FILES);
+    let mut seen = HashSet::new();
+    paths.retain(|path| {
+        let relative = Path::new(path);
+        is_relative_file_path(relative)
+            && crate::workspace::canonical(&root.join(relative)).is_ok_and(|path| path.starts_with(&root) && path.is_file())
+            && seen.insert(relative.to_owned())
+    });
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -228,7 +255,12 @@ pub(crate) enum Update {
 impl Update {
     fn write(self, dir: &Path) -> io::Result<()> {
         let (filename, json) = match self {
-            Self::Workspace(root, data) => (workspace_filename(root.as_deref()), serde_json::to_string(&data)?),
+            Self::Workspace(root, mut data) => {
+                if let Some(root) = &root {
+                    validate_recent_files(root, &mut data.recent_files);
+                }
+                (workspace_filename(root.as_deref()), serde_json::to_string(&data)?)
+            }
             Self::Window(data) => ("window.json".into(), serde_json::to_string(&data)?),
             Self::SearchFilters(root, filters) => return crate::workspace::save_search_filters(&root, &filters),
         };
@@ -352,6 +384,7 @@ mod tests {
                 search_filters_shown: Some(false),
                 search_replace_shown: true,
             },
+            recent_files: vec!["main.rs".into(), "lib.rs".into()],
         };
         let json = serde_json::to_string(&workspace).unwrap();
         assert_eq!(serde_json::from_str::<Workspace>(&json).unwrap(), workspace);
@@ -363,6 +396,27 @@ mod tests {
         let workspace: Workspace = serde_json::from_str(json).unwrap();
         assert_eq!(workspace.layout.sidebar.side, Side::Changes);
         assert_eq!(workspace.sidebar_ui, SidebarUi::default());
+        assert!(workspace.recent_files.is_empty());
+    }
+
+    #[test]
+    fn recent_files_restore_keeps_existing_project_files_in_order() {
+        let dir = std::env::temp_dir().join(format!("edittr-session-recent-{}", std::process::id()));
+        let root = dir.join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        for file in [root.join("last.rs"), root.join("previous.rs"), dir.join("outside.rs")] {
+            std::fs::write(file, "").unwrap();
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(dir.join("outside.rs"), root.join("link.rs")).unwrap();
+        let root = crate::workspace::canonical(&root).unwrap();
+        let mut recent = ["last.rs", "missing.rs", "../outside.rs", "link.rs", "previous.rs", "last.rs"]
+            .map(OsString::from)
+            .to_vec();
+        recent.push(root.join("last.rs").into_os_string());
+        validate_recent_files(&root, &mut recent);
+        std::fs::remove_dir_all(dir).unwrap();
+        assert_eq!(recent, ["last.rs", "previous.rs"]);
     }
 
     #[test]

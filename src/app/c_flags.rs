@@ -8,10 +8,20 @@ use std::collections::VecDeque;
 
 const LOG_LINES: usize = 400;
 
+/// What edittr found by itself, shown at the top of the settings dialog.
+struct Detected {
+    /// Where clangd's flags come from, once clangd has started for this folder.
+    flags: Option<String>,
+    compiler: Option<String>,
+    /// The "Generate compile database" command without a custom build command, or why there is none.
+    build: Result<String, String>,
+}
+
 #[derive(Default)]
 pub(super) struct CFlags {
     /// The settings dialog, with the values being edited.
     editing: Option<workspace::CSettings>,
+    detected: Option<Detected>,
     /// A planned generation waiting for the user's go-ahead (or the reason it can't run).
     confirm: Option<Result<compdb::Plan, String>>,
     job: Option<compdb::Job>,
@@ -36,6 +46,13 @@ impl App {
             self.message = "Open a folder first".into();
             return;
         };
+        let clangd = self.lsp_has_launch("clangd");
+        let database = &self.lsp.database;
+        self.c_flags.detected = Some(Detected {
+            flags: clangd.then(|| database.label(root)),
+            compiler: database.detected_compiler.clone().filter(|_| clangd),
+            build: compdb::plan(root, "").map(|plan| plan.command_line()),
+        });
         self.c_flags.editing = Some(workspace::load_c_settings(root));
     }
 
@@ -96,6 +113,11 @@ impl App {
                 ui.heading("C/C++ compile flags");
                 ui.weak("Saved for this folder. Used when clangd starts.");
                 ui.add_space(6.0);
+                let detected = self.c_flags.detected.as_ref();
+                if let Some(detected) = detected {
+                    detected_summary(ui, detected, settings);
+                    ui.add_space(6.0);
+                }
                 ui.label("Extra flags for every file");
                 ui.add(
                     egui::TextEdit::singleline(&mut settings.flags)
@@ -106,14 +128,20 @@ impl App {
                 ui.label("Compiler (lets clangd find a cross compiler's system headers)");
                 ui.add(
                     egui::TextEdit::singleline(&mut settings.compiler)
-                        .hint_text("detected from the build, e.g. arm-none-eabi-gcc")
+                        .hint_text(match detected.and_then(|d| d.compiler.as_deref()) {
+                            Some(compiler) => format!("detected: {compiler}"),
+                            None => "detected from the build, e.g. arm-none-eabi-gcc".into(),
+                        })
                         .desired_width(f32::INFINITY),
                 );
                 ui.add_space(4.0);
                 ui.label("Build command for \"Generate compile database\"");
                 ui.add(
                     egui::TextEdit::singleline(&mut settings.build)
-                        .hint_text("detected: CMake, Meson or make, e.g. make -C firmware all")
+                        .hint_text(match detected.map(|d| &d.build) {
+                            Some(Ok(command)) => format!("detected: {command}"),
+                            _ => "detected: CMake, Meson or make, e.g. make -C firmware all".into(),
+                        })
                         .desired_width(f32::INFINITY),
                 );
                 ui.add_space(8.0);
@@ -248,4 +276,44 @@ impl App {
             }
         }
     }
+}
+
+/// The "Detected" box of the settings dialog: what clangd uses when the fields below are empty.
+fn detected_summary(ui: &mut egui::Ui, detected: &Detected, settings: &workspace::CSettings) {
+    egui::Frame::group(ui.style()).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.label(RichText::new(format!("{} Auto-detected", ic::MAGNIFYING_GLASS)).strong());
+        egui::Grid::new("c_detected").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
+            let overridden = |ui: &mut egui::Ui, field: &str| {
+                if !field.trim().is_empty() {
+                    ui.weak("(overridden below)");
+                }
+            };
+            ui.weak("Compile flags");
+            match &detected.flags {
+                Some(flags) => ui.label(flags.strip_prefix("flags: ").unwrap_or(flags)),
+                None => ui.weak("clangd hasn't started yet: open a C/C++ file"),
+            };
+            ui.end_row();
+            ui.weak("Compiler");
+            ui.horizontal(|ui| {
+                match (&detected.compiler, &detected.flags) {
+                    (Some(compiler), _) => ui.label(RichText::new(compiler).monospace()),
+                    (None, Some(_)) => ui.weak("none detected"),
+                    (None, None) => ui.weak("—"),
+                };
+                overridden(ui, &settings.compiler);
+            });
+            ui.end_row();
+            ui.weak("Build command");
+            ui.horizontal_wrapped(|ui| {
+                match &detected.build {
+                    Ok(command) => ui.label(RichText::new(command).monospace()),
+                    Err(reason) => ui.weak(reason),
+                };
+                overridden(ui, &settings.build);
+            });
+            ui.end_row();
+        });
+    });
 }

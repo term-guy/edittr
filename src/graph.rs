@@ -205,6 +205,9 @@ impl Graph {
                                 clicked = Some(r);
                             }
                             badge.context_menu(|ui| menu(ui, c, Some(reference)));
+                        } else if matches!(reference, CommitRef::SvnBase) {
+                            ui.interact(bg, resp.id.with(i), Sense::hover())
+                                .on_hover_text(format!("Working copy is at {}", c.short_hash));
                         }
                         px = bg.right() + 4.0;
                     }
@@ -264,6 +267,7 @@ fn ref_style(r: &CommitRef, lane: Color32) -> (String, Color32) {
         CommitRef::Remote(name) | CommitRef::Other(name) => (name.clone(), darker(lane)),
         CommitRef::Tag(name) => (name.clone(), Color32::from_rgb(0x9a, 0x6d, 0x14)),
         CommitRef::Head => ("HEAD".into(), lane),
+        CommitRef::SvnBase => ("●".into(), lane),
     }
 }
 

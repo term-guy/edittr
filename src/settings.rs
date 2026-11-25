@@ -51,6 +51,10 @@ pub(crate) struct Settings {
     /// Kinds of lines sticky scroll pins (saved as the hidden ones).
     pub(crate) sticky_shown: crate::editor::sticky::Kinds,
     pub(crate) show_outline: bool,
+    /// Frames per second and frame time in the status bar.
+    pub(crate) show_fps: bool,
+    /// Divider lines under the breadcrumbs and the sticky scroll lines.
+    pub(crate) header_lines: bool,
     pub(crate) outline_expanded: bool,
     pub(crate) outline_grouped: bool,
     pub(crate) outline_collapsed_groups: CollapsedGroups,
@@ -78,6 +82,8 @@ impl Default for Settings {
             diff_ignore_eol: true,
             inline_blame: true,
             minimap: true,
+            show_fps: false,
+            header_lines: true,
             bracket_colors: true,
             semantic_highlighting: true,
             sticky_scroll: true,
@@ -236,6 +242,8 @@ impl Settings {
                     "sticky_scroll" => settings.sticky_scroll = value,
                     "sticky_control_flow" => settings.sticky_control_flow = value,
                     "show_outline" => settings.show_outline = value,
+                    "show_fps" => settings.show_fps = value,
+                    "header_lines" => settings.header_lines = value,
                     "outline_expanded" => settings.outline_expanded = value,
                     "outline_grouped" => settings.outline_grouped = value,
                     "restore_previous_session" => settings.restore_previous_session = value,
@@ -274,6 +282,8 @@ impl Settings {
                         | "breadcrumb_font_size"
                         | "format_on_save"
                         | "show_outline"
+                        | "show_fps"
+                        | "header_lines"
                         | "outline_expanded"
                         | "outline_grouped"
                         | "outline_collapsed_groups"
@@ -323,6 +333,8 @@ impl Settings {
         text.push_str(&format!("breadcrumb_font_size={}\n", self.breadcrumb_font_size));
         text.push_str(&format!("format_on_save={}\n", self.format_on_save));
         text.push_str(&format!("show_outline={}\n", self.show_outline));
+        text.push_str(&format!("show_fps={}\n", self.show_fps));
+        text.push_str(&format!("header_lines={}\n", self.header_lines));
         text.push_str(&format!("outline_expanded={}\n", self.outline_expanded));
         text.push_str(&format!("outline_grouped={}\n", self.outline_grouped));
         let collapsed = Group::ALL
@@ -532,7 +544,7 @@ mod tests {
         let text = settings.format(previous);
         assert_eq!(
             text,
-            "future_key=one=two\nfuture_key = three\n# A comment\nchanges_tree=false\nhighlight_line=false\nshow_whitespace=false\ndiff_ignore_eol=true\ninline_blame=true\nminimap=true\nbracket_colors=true\nsemantic_highlighting=true\nsticky_scroll=true\nsticky_control_flow=true\nsticky_hidden=\nrestore_previous_session=true\nreopen_last_folder=false\ntab_size=4\neditor_font_size=13\nui_font_size=13\nbreadcrumb_font_size=11\nformat_on_save=false\nshow_outline=true\noutline_expanded=true\noutline_grouped=true\noutline_collapsed_groups=\ntheme_preference=system\ntheme_dark=edittr-dark\ntheme_light=edittr-light\n"
+            "future_key=one=two\nfuture_key = three\n# A comment\nchanges_tree=false\nhighlight_line=false\nshow_whitespace=false\ndiff_ignore_eol=true\ninline_blame=true\nminimap=true\nbracket_colors=true\nsemantic_highlighting=true\nsticky_scroll=true\nsticky_control_flow=true\nsticky_hidden=\nrestore_previous_session=true\nreopen_last_folder=false\ntab_size=4\neditor_font_size=13\nui_font_size=13\nbreadcrumb_font_size=11\nformat_on_save=false\nshow_outline=true\nshow_fps=false\nheader_lines=true\noutline_expanded=true\noutline_grouped=true\noutline_collapsed_groups=\ntheme_preference=system\ntheme_dark=edittr-dark\ntheme_light=edittr-light\n"
         );
         assert!(!Settings::parse(&text).changes_tree);
     }

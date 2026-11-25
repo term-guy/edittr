@@ -324,14 +324,33 @@ enum SearchRow {
 
 struct QuickOpen {
     query: String,
-    files: Vec<String>,
-    /// `files`, lowercased once (matching is case-insensitive).
-    lower: Vec<String>,
-    files_rx: Option<Receiver<(Vec<String>, Vec<String>)>>,
+    files: QuickOpenFiles,
+    recent_count: usize,
+    recent_rx: Option<Receiver<QuickOpenFiles>>,
+    files_rx: Option<Receiver<QuickOpenFiles>>,
     selected: usize,
-    /// Indices into `files` of the best matches, for `matched_query`.
+    /// Indices into `files.paths` of the best matches, for `matched_query`.
     matches: Vec<usize>,
     matched_query: Option<String>,
+}
+
+#[derive(Default)]
+struct QuickOpenFiles {
+    paths: Vec<PathBuf>,
+    lower: Vec<String>,
+}
+
+impl QuickOpenFiles {
+    fn new(paths: Vec<PathBuf>) -> Self {
+        let lower = paths
+            .iter()
+            .map(|path| {
+                let lower = path.to_string_lossy().to_lowercase();
+                if cfg!(windows) { lower.replace('\\', "/") } else { lower }
+            })
+            .collect();
+        Self { paths, lower }
+    }
 }
 
 enum Confirm {
@@ -426,6 +445,7 @@ pub struct App {
     graph_detail: commit_view::CommitView,
     graph_rx: Option<Receiver<Result<Graph, String>>>,
     settings_page: settings_page::Page,
+    fps: FrameStats,
     graph_dialog: Option<graph_menu::GraphDialog>,
     diff_rx: Option<PendingDiff>,
     open_jobs: Vec<file_open::OpenJob>,
@@ -552,6 +572,7 @@ impl App {
             graph_detail: commit_view::CommitView::default(),
             graph_rx: None,
             settings_page: Default::default(),
+            fps: Default::default(),
             graph_dialog: None,
             diff_rx: None,
             open_jobs: Vec::new(),
@@ -659,6 +680,7 @@ impl App {
         self.bg_task = None;
         self.amend = false;
         self.quick_open = None;
+        self.sessions.recent_files.clear();
         self.picker = None;
         self.confirm = None;
     }
@@ -965,12 +987,19 @@ impl App {
         if self.tree_rx.is_none() {
             self.tree_loading.clear();
         }
-        if let Some(q) = &mut self.quick_open
-            && let Some((files, lower)) = receive(&mut q.files_rx)
-        {
-            q.files = files;
-            q.lower = lower;
-            q.matched_query = None; // re-rank
+        if let Some(q) = &mut self.quick_open {
+            if let Some(recent) = receive(&mut q.recent_rx) {
+                q.recent_count = recent.paths.len();
+                q.files = recent;
+                q.matched_query = None;
+            }
+            if q.recent_rx.is_none()
+                && let Some(mut files) = receive(&mut q.files_rx)
+            {
+                q.files.paths.append(&mut files.paths);
+                q.files.lower.append(&mut files.lower);
+                q.matched_query = None;
+            }
         }
     }
 
@@ -1134,6 +1163,22 @@ impl App {
 
     // --------------------------------------------------------------- tabs
 
+    fn activate_tab(&mut self, index: usize) {
+        self.active = index;
+        self.record_tab_recent(index);
+    }
+
+    fn record_tab_recent(&mut self, index: usize) {
+        let Some(root) = &self.root else { return };
+        let path = match self.tabs.get(index) {
+            Some(Tab::File(doc)) if !doc.untitled => &doc.path,
+            Some(Tab::Large(viewer)) => &viewer.path,
+            Some(Tab::Hex(viewer)) if !viewer.comparing() => &viewer.path,
+            _ => return,
+        };
+        self.sessions.record_recent_file(root, path);
+    }
+
     /// Diagnostics of tab `i` as (line, col, end line, end col, color).
     fn squiggles_for(&self, i: usize, v: &egui::Visuals) -> Vec<(usize, usize, usize, usize, Color32, String)> {
         let Some(Tab::File(doc)) = self.tabs.get(i) else {
@@ -1192,11 +1237,11 @@ impl App {
         }
         if let Some(idx) = goto {
             // Go to definition from the side editor: make it the active one first.
-            self.active = si;
+            self.activate_tab(si);
             self.go_to_definition(idx, &self.ctx.clone());
         }
         if let Some(command) = context_command {
-            self.active = si;
+            self.activate_tab(si);
             self.run_command(command);
         }
     }
@@ -1404,6 +1449,9 @@ impl App {
         } else {
             self.active - removed_before_active
         };
+        if active_closed {
+            self.record_tab_recent(self.active);
+        }
     }
 
     /// Tab width (drawn) and the default indent for files without one of their own.
@@ -1431,16 +1479,30 @@ impl App {
         };
         let vcs = self.vcs;
         let ignored = self.ignored.clone();
+        let mut recent = self.sessions.recent_files.clone();
+        let (recent_tx, recent_rx) = channel();
+        let ctx = self.ctx.clone();
         let files_rx = background(&self.ctx, move || {
-            let files = project_files(&root, vcs, &ignored);
-            let lower = files.iter().map(|f| f.to_lowercase()).collect();
-            (files, lower)
+            crate::session::validate_recent_files(&root, &mut recent);
+            let paths = recent.iter().map(PathBuf::from).collect();
+            if recent_tx.send(QuickOpenFiles::new(paths)).is_err() {
+                return QuickOpenFiles::default();
+            }
+            ctx.request_repaint();
+            let recent: HashSet<&Path> = recent.iter().map(Path::new).collect();
+            let paths = project_files(&root, vcs, &ignored)
+                .into_iter()
+                .filter(|path| !recent.contains(Path::new(path)))
+                .map(PathBuf::from)
+                .collect();
+            QuickOpenFiles::new(paths)
         });
         self.picker = None;
         self.quick_open = Some(QuickOpen {
             query: String::new(),
-            files: Vec::new(),
-            lower: Vec::new(),
+            files: QuickOpenFiles::default(),
+            recent_count: 0,
+            recent_rx: Some(recent_rx),
             files_rx: Some(files_rx),
             selected: 0,
             matches: Vec::new(),
@@ -2696,7 +2758,7 @@ impl App {
         }
         if let Some(i) = selected {
             self.unfocus_pending_opens();
-            self.active = i;
+            self.activate_tab(i);
         }
         if let Some(i) = close {
             self.close_tab(i, false);
@@ -2764,7 +2826,11 @@ impl App {
                 }
             }
         });
-        ui.separator();
+        if self.settings.header_lines {
+            ui.separator();
+        } else {
+            ui.add_space(ui.spacing().item_spacing.y);
+        }
         if let Some(dir) = reveal {
             self.reveal_folder(dir);
         }
@@ -3039,6 +3105,10 @@ impl App {
     }
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
+        let fps = self.settings.show_fps.then(|| match self.fps.current(Instant::now()) {
+            (fps, Some(ms)) => format!("{fps} fps · {ms:.1} ms"),
+            (fps, None) => format!("{fps} fps"),
+        });
         let file = match self.tabs.get(self.active) {
             Some(Tab::File(doc)) => Some((doc, doc.ext())),
             _ => None,
@@ -3065,6 +3135,15 @@ impl App {
             }
             open_problems = self.problems.status_button(ui).clicked();
             ui.separator();
+            if let Some(text) = &fps {
+                ui.add(egui::Label::new(RichText::new(text).weak().monospace())).on_hover_text(
+                    "Frames drawn in the last second, and the time the last frame took to build. \
+                         edittr only redraws when something changes, so an idle window shows about 1 fps.",
+                );
+                ui.separator();
+                // Keep the count fresh while idle.
+                ui.ctx().request_repaint_after(Duration::from_secs(1));
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if let Some((doc, ext)) = &file {
                     let (backend, hint) = match server {
@@ -3190,51 +3269,52 @@ impl App {
                     if r.changed() {
                         q.selected = 0;
                     }
+                    let (name, target) = goto_line::split_line_target(&q.query);
                     // Rank only when the query or the file list changed, not every frame.
-                    if q.matched_query.as_deref() != Some(q.query.as_str()) {
+                    let rerank = q.matched_query.as_deref() != Some(q.query.as_str());
+                    if rerank {
                         // `name:183` / `name:183-190`: rank by the name part only.
-                        let (name, _) = goto_line::split_line_target(&q.query);
-                        q.matches = fuzzy_filter(&q.lower, name, 200);
+                        q.matches = fuzzy_filter(&q.files.lower, name, 200, Some(q.recent_count));
+                        q.selected = q.selected.min(q.matches.len().saturating_sub(1));
                         q.matched_query = Some(q.query.clone());
                     }
-                    let mut moved = false;
                     if down {
                         q.selected = (q.selected + 1).min(q.matches.len().saturating_sub(1));
-                        moved = true;
                     }
                     if up {
                         q.selected = q.selected.saturating_sub(1);
-                        moved = true;
                     }
-                    ui.input(|i| {
-                        // `:183` alone goes to a line in the current file, not the first file.
-                        if i.key_pressed(Key::Enter) && !goto_line::split_line_target(&q.query).0.is_empty() {
-                            chosen = q.matches.get(q.selected).map(|&i| q.files[i].clone());
-                        }
-                    });
-                    if let (_, Some(t)) = goto_line::split_line_target(&q.query) {
+                    // `:183` alone goes to a line in the current file.
+                    if (q.query.trim().is_empty() || !name.is_empty()) && ui.input(|i| i.key_pressed(Key::Enter)) {
+                        chosen = q.matches.get(q.selected).map(|&i| q.files.paths[i].clone());
+                    }
+                    if let Some(t) = target {
                         let lines = match t.end {
                             Some(end) => format!("lines {}\u{2013}{}", t.line + 1, end + 1),
                             None => format!("line {}", t.line + 1),
                         };
-                        let what = if goto_line::split_line_target(&q.query).0.is_empty() {
-                            "in this file"
-                        } else {
-                            "of the chosen file"
-                        };
+                        let what = if name.is_empty() { "in this file" } else { "of the chosen file" };
                         ui.weak(format!("Go to {lines} {what}"));
                     }
-                    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                        for (i, &m) in q.matches.iter().enumerate() {
-                            let r = ui.selectable_label(i == q.selected, &q.files[m]);
-                            if i == q.selected && moved {
-                                r.scroll_to_me(None);
+                    let row_height = ui.spacing().interact_size.y;
+                    let step = row_height + ui.spacing().item_spacing.y;
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show_rows(ui, row_height, q.matches.len(), |ui, range| {
+                            if (up || down || rerank) && !q.matches.is_empty() {
+                                let y = ui.max_rect().top() + (q.selected as f32 - range.start as f32) * step;
+                                let rect = egui::Rect::from_min_size(egui::pos2(ui.min_rect().left(), y), egui::vec2(1.0, row_height));
+                                ui.scroll_to_rect_animation(rect, None, egui::style::ScrollAnimation::none());
                             }
-                            if r.clicked() {
-                                chosen = Some(q.files[m].clone());
+                            for i in range {
+                                let path = &q.files.paths[q.matches[i]];
+                                let button = egui::Button::selectable(i == q.selected, path.to_string_lossy())
+                                    .wrap_mode(egui::TextWrapMode::Truncate);
+                                if ui.add_sized([ui.available_width(), row_height], button).clicked() {
+                                    chosen = Some(path.clone());
+                                }
                             }
-                        }
-                    });
+                        });
                 });
             // A click anywhere outside the popup closes it.
             if let Some(popup) = popup {
@@ -3463,6 +3543,9 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        if self.settings.show_fps {
+            self.fps.record(Instant::now(), frame.info().cpu_usage);
+        }
         self.confirm_quit(&ctx);
         if self.poll_session_restore() {
             egui::CentralPanel::default().show(ui, |ui| {
@@ -3557,6 +3640,32 @@ fn language_name(ext: &str) -> &'static str {
 }
 
 // Advance on the activity timer so the spinner doesn't request full-speed animation.
+/// Frames drawn in the last second and the CPU time of the last one (Settings > Show FPS).
+#[derive(Default)]
+struct FrameStats {
+    times: std::collections::VecDeque<Instant>,
+    cpu_ms: Option<f32>,
+}
+
+impl FrameStats {
+    fn record(&mut self, now: Instant, cpu_seconds: Option<f32>) {
+        self.times.push_back(now);
+        self.cpu_ms = cpu_seconds.map(|s| s * 1000.0);
+        self.forget_before(now);
+    }
+
+    fn forget_before(&mut self, now: Instant) {
+        while self.times.front().is_some_and(|t| now.duration_since(*t) > Duration::from_secs(1)) {
+            self.times.pop_front();
+        }
+    }
+
+    fn current(&mut self, now: Instant) -> (usize, Option<f32>) {
+        self.forget_before(now);
+        (self.times.len(), self.cpu_ms)
+    }
+}
+
 fn status_spinner(ui: &mut egui::Ui) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(egui::Vec2::splat(14.0), egui::Sense::hover());
     response.widget_info(|| egui::WidgetInfo::new(egui::Role::ProgressIndicator));
@@ -3653,6 +3762,7 @@ fn editor(
         bracket_colors: settings.bracket_colors,
         sticky_scroll: settings.sticky_scroll && pane != 3,
         sticky_control_flow: settings.sticky_control_flow,
+        sticky_line: settings.header_lines,
         sticky_shown: settings.sticky_shown,
         navigation_menu: pane != 3,
         read_only: false,
@@ -4665,13 +4775,15 @@ fn subsequence_score(text: &[u8], q: &[u8], name_start: usize) -> Option<i32> {
 /// (lowercased paths), best first. Closer matches always win: the exact file name,
 /// then a path ending in the query, a file name starting with it, a file name or path
 /// containing it, and last any subsequence (preferring ones within the file name).
-/// Within a tier, shorter names and paths come first.
-fn fuzzy_filter(lower: &[String], query: &str, limit: usize) -> Vec<usize> {
+/// With `Some(recent_count)`, the first paths are ordered most recent first.
+/// An empty query shows only those paths. Their bonus favors them within a match tier.
+fn fuzzy_filter(lower: &[String], query: &str, limit: usize, recent_count: Option<usize>) -> Vec<usize> {
     let q_str: String = query.to_lowercase().chars().filter(|c| !c.is_whitespace()).collect();
     let q = q_str.as_bytes();
     if q.is_empty() {
-        return (0..lower.len().min(limit)).collect();
+        return (0..recent_count.unwrap_or(lower.len()).min(limit)).collect();
     }
+    let recent_count = recent_count.unwrap_or(0);
     let has_slash = q_str.contains('/');
     let mut scored: Vec<(u8, i64, usize)> = lower
         .iter()
@@ -4701,7 +4813,10 @@ fn fuzzy_filter(lower: &[String], query: &str, limit: usize) -> Vec<usize> {
                 let score = subsequence_score(f.as_bytes(), q, name_start).unwrap_or(path_score);
                 (1, i64::from(score) * 4096 - len)
             };
-            Some((tier, sub, idx))
+            // Keep the largest bonus below the score step for one extra
+            // character in a prefix or substring match's file name.
+            let bonus = if idx < recent_count { 128 - 2 * idx as i64 } else { 0 };
+            Some((tier, sub + bonus, idx))
         })
         .collect();
     let key = |&(tier, sub, idx): &(u8, i64, usize)| (std::cmp::Reverse(tier), std::cmp::Reverse(sub), idx);
@@ -4724,12 +4839,12 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let m = fuzzy_filter(&files, "App", 10);
+        let m = fuzzy_filter(&files, "App", 10, None);
         assert_eq!(files[m[0]], "src/app.rs");
         assert_eq!(m.len(), 3);
-        assert!(fuzzy_filter(&files, "zzz", 10).is_empty());
-        assert_eq!(fuzzy_filter(&files, "", 2), vec![0, 1]);
-        assert_eq!(fuzzy_filter(&files, "  ", 2), vec![0, 1]);
+        assert!(fuzzy_filter(&files, "zzz", 10, None).is_empty());
+        assert_eq!(fuzzy_filter(&files, "", 2, None), [0, 1]);
+        assert_eq!(fuzzy_filter(&files, "  ", 2, None), [0, 1]);
 
         // The closest match wins over longer names that also match.
         let files: Vec<String> = [
@@ -4744,7 +4859,10 @@ mod tests {
         .iter()
         .map(|s| s.to_string())
         .collect();
-        let order: Vec<&str> = fuzzy_filter(&files, "main.c", 10).into_iter().map(|i| files[i].as_str()).collect();
+        let order: Vec<&str> = fuzzy_filter(&files, "main.c", 10, None)
+            .into_iter()
+            .map(|i| files[i].as_str())
+            .collect();
         // main_c_notes.md has no "." before a "c", so it isn't a match at all.
         assert_eq!(
             order,
@@ -4758,15 +4876,39 @@ mod tests {
             ]
         );
         // A folder in the query matches the path's end; partial names still work.
-        assert_eq!(files[fuzzy_filter(&files, "to/main.c", 10)[0]], "very/deep/path/to/main.c");
-        assert_eq!(files[fuzzy_filter(&files, "Main", 10)[0]], "src/main.c");
-        assert_eq!(files[fuzzy_filter(&files, "mjs", 10)[0]], "src/mainsjs.c");
+        assert_eq!(files[fuzzy_filter(&files, "to/main.c", 10, None)[0]], "very/deep/path/to/main.c");
+        assert_eq!(files[fuzzy_filter(&files, "Main", 10, None)[0]], "src/main.c");
+        assert_eq!(files[fuzzy_filter(&files, "mjs", 10, None)[0]], "src/mainsjs.c");
 
         let many: Vec<String> = (0..100_000).map(|i| format!("crates/module{}/src/file_{i}.rs", i % 97)).collect();
         let t = std::time::Instant::now();
-        let m = fuzzy_filter(&many, "mod5file9", 200);
+        let m = fuzzy_filter(&many, "mod5file9", 200, None);
         assert_eq!(m.len(), 200);
         eprintln!("fuzzy_filter over 100k paths: {:?}", t.elapsed());
+    }
+
+    #[test]
+    fn fuzzy_filter_empty_query_shows_only_recent_files_in_order() {
+        let files = ["last.rs", "previous.rs", "older.rs", "unopened.rs"].map(String::from);
+        assert!(super::fuzzy_filter(&files, "", 10, Some(0)).is_empty());
+        assert_eq!(super::fuzzy_filter(&files, "", 10, Some(3)), [0, 1, 2]);
+        assert_eq!(super::fuzzy_filter(&files, "  ", 2, Some(3)), [0, 1]);
+    }
+
+    #[test]
+    fn fuzzy_filter_boosts_similar_recent_matches_without_displacing_stronger_matches() {
+        let files = [
+            "deep/app.rs",
+            "lib/app.rs",
+            "test/a_pp.rs",
+            "main.rs",
+            "app.rs",
+            "src/app.rs",
+            "app",
+        ]
+        .map(String::from);
+        assert_eq!(super::fuzzy_filter(&files, "app", 10, Some(4)), [6, 0, 1, 4, 5, 2]);
+        assert_eq!(super::fuzzy_filter(&files, "app", 3, Some(4)), [6, 0, 1]);
     }
 
     #[test]

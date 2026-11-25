@@ -26,8 +26,8 @@ impl App {
             self.message = "Open a Markdown file to preview it".into();
             return;
         }
+        self.activate_tab(i);
         let Tab::File(doc) = &self.tabs[i] else { return };
-        self.active = i;
         self.split = None;
         if self.preview.as_ref().is_some_and(|preview| preview.doc == doc.id) {
             return;

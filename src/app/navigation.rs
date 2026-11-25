@@ -116,7 +116,7 @@ impl Picker {
         self.matches = if matches!(self.mode, Mode::Workspace) {
             (0..self.rows.len()).collect()
         } else {
-            fuzzy_filter(&self.lower, &self.query, symbols::LIMIT)
+            fuzzy_filter(&self.lower, &self.query, symbols::LIMIT, None)
         };
     }
 

@@ -446,7 +446,7 @@ impl Overlay {
         out
     }
 
-    pub(super) fn paint(&self, lines: &Lines<'_>, text_x: f32, gutter_w: f32, char_w: f32) {
+    pub(super) fn paint(&self, lines: &Lines<'_>, text_x: f32, gutter_w: f32, char_w: f32, divider: bool) {
         let ui = lines.ui;
         let vis = ui.visuals();
         let painter = ui.painter().with_clip_rect(self.viewport);
@@ -469,7 +469,7 @@ impl Overlay {
             );
             bottom = Some(rect.bottom());
         }
-        if let Some(y) = bottom {
+        if let Some(y) = bottom.filter(|_| divider) {
             painter.hline(
                 self.viewport.x_range(),
                 y,

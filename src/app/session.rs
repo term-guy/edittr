@@ -4,6 +4,7 @@ use crate::workspace::{self, SearchFilters};
 use eframe::egui;
 use std::borrow::Borrow;
 use std::collections::HashSet;
+use std::ffi::OsString;
 use std::hash::Hash;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
@@ -47,6 +48,7 @@ impl<T: Eq + Hash> FolderSet<T> {
 #[derive(Default, PartialEq)]
 struct WorkspaceSnapshot {
     layout: WorkspaceLayout,
+    recent_files_revision: u64,
     expanded_revision: u64,
     collapsed_revision: u64,
     search_filters_shown: bool,
@@ -57,6 +59,8 @@ pub(super) struct Sessions {
     writer: Option<Writer>,
     loading: Option<Receiver<LoadedWorkspace>>,
     workspace: Debounce<WorkspaceSnapshot>,
+    pub(super) recent_files: Vec<OsString>,
+    recent_files_revision: u64,
     saved_filters: SearchFilters,
     /// The next restore is "close folder": show the empty start page.
     start_page: bool,
@@ -78,12 +82,22 @@ struct LoadedWorkspace {
     search_replace_shown: bool,
     tabs: Vec<(FileTab, DiskText)>,
     active: Option<PathBuf>,
+    recent_files: Vec<OsString>,
     requested_file: Option<PathBuf>,
 }
 
 impl LoadedWorkspace {
     fn load(root: Option<PathBuf>, file: Option<PathBuf>) -> Self {
-        let Workspace { layout, sidebar_ui } = Workspace::load(root.as_deref());
+        let Workspace {
+            layout,
+            sidebar_ui,
+            mut recent_files,
+        } = Workspace::load(root.as_deref());
+        if let Some(root) = &root {
+            crate::session::validate_recent_files(root, &mut recent_files);
+        } else {
+            recent_files.clear();
+        }
         let expanded = root.as_deref().map(|root| sidebar_ui.restore_expanded(root)).unwrap_or_default();
         let active = layout.active.map(|p| workspace::plain_path(Path::new(&p)));
         let tabs: Vec<_> = layout
@@ -116,6 +130,7 @@ impl LoadedWorkspace {
             search_replace_shown: sidebar_ui.search_replace_shown,
             tabs,
             active,
+            recent_files,
             requested_file: file,
         }
     }
@@ -127,6 +142,8 @@ impl Sessions {
             writer,
             loading: None,
             workspace: Debounce::new(Some(WorkspaceSnapshot::default())),
+            recent_files: Vec::new(),
+            recent_files_revision: 0,
             saved_filters: SearchFilters::default(),
             start_page: false,
             pending_filters: None,
@@ -135,6 +152,17 @@ impl Sessions {
             width: Sidebar::default().width,
             reset_panel_width: false,
         }
+    }
+
+    pub(super) fn record_recent_file(&mut self, root: &Path, path: &Path) {
+        let Ok(relative) = path.strip_prefix(root) else { return };
+        if !crate::session::is_relative_file_path(relative) || self.recent_files.first().is_some_and(|first| Path::new(first) == relative) {
+            return;
+        }
+        self.recent_files.retain(|p| Path::new(p) != relative);
+        self.recent_files.insert(0, relative.as_os_str().to_owned());
+        self.recent_files.truncate(crate::session::MAX_RECENT_FILES);
+        self.recent_files_revision += 1;
     }
 }
 
@@ -248,6 +276,7 @@ impl App {
             self.sessions.width = loaded.sidebar.width.max(160.0);
             self.sessions.reset_panel_width = true;
             self.sessions.workspace = Debounce::new(None);
+            self.sessions.recent_files = loaded.recent_files;
             self.sessions.window.root = self.root.as_ref().map(|path| path.as_os_str().to_owned());
             for (tab, text) in loaded.tabs {
                 // Sessions saved before paths were normalized may hold both spellings.
@@ -271,6 +300,7 @@ impl App {
             }
             // The saved Explorer layout wins on reopen: the restored active file counts
             // as revealed, so its folders aren't expanded until the user switches files.
+            self.activate_tab(self.active);
             self.explorer_revealed = match self.tabs.get(self.active) {
                 Some(Tab::File(doc)) => Some(doc.path.clone()),
                 _ => None,
@@ -396,6 +426,7 @@ impl App {
         };
         let snapshot = WorkspaceSnapshot {
             layout,
+            recent_files_revision: self.sessions.recent_files_revision,
             expanded_revision: self.expanded.revision,
             collapsed_revision: self.changes_collapsed.revision,
             search_filters_shown: self.search.show_filters,
@@ -418,6 +449,7 @@ impl App {
                 let workspace = Workspace {
                     layout: snapshot.layout.clone(),
                     sidebar_ui,
+                    recent_files: self.sessions.recent_files.clone(),
                 };
                 writer.save(Update::Workspace(self.root.clone(), workspace), &self.ctx);
             }

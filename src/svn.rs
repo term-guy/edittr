@@ -1,5 +1,6 @@
 //! Subversion CLI and its local cache. These operations belong on background threads.
 
+use crate::git::CommitRef;
 use crate::vcs::{BlameLine, Commit, FileChange, Status};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
@@ -110,6 +111,8 @@ struct Info {
 #[derive(Deserialize)]
 #[serde(rename_all = "kebab-case")]
 struct InfoEntry {
+    #[serde(rename = "@revision", default)]
+    revision: String,
     url: String,
     #[serde(default)]
     relative_url: String,
@@ -125,6 +128,10 @@ struct Repository {
 }
 
 impl InfoEntry {
+    fn base_revision(&self) -> Option<u64> {
+        self.revision.parse().ok()
+    }
+
     fn branch(&self) -> &str {
         let branch = self
             .relative_url
@@ -566,7 +573,7 @@ impl History {
         self.backfill = self.backfill.max(backfill);
     }
 
-    fn commits(&self, limit: usize) -> Vec<Commit> {
+    fn commits(&self, limit: usize, base_revision: Option<u64>) -> Vec<Commit> {
         let mut entries = self.entries.values().rev().take(limit).peekable();
         let mut commits = Vec::new();
         while let Some(entry) = entries.next() {
@@ -576,7 +583,11 @@ impl History {
                 parents: entries.peek().map(|p| format!("r{}", p.number)).into_iter().collect(),
                 author: entry.author.clone(),
                 date: date_time(&entry.date),
-                refs: Vec::new(),
+                refs: if base_revision == Some(entry.number) {
+                    vec![CommitRef::SvnBase]
+                } else {
+                    Vec::new()
+                },
                 subject: entry.subject().into(),
                 message: entry.message.clone(),
             });
@@ -590,13 +601,14 @@ pub fn log(root: &Path, limit: usize, refresh: bool, cached: impl FnOnce(Vec<Com
         return Ok(Vec::new());
     }
     let info = info(root, ".")?;
+    let base_revision = info.base_revision();
     let file = info.history_file();
     let mut history: History = file.as_deref().and_then(read_cache).unwrap_or_default();
     if !refresh && history.backfill >= limit && file.as_deref().is_some_and(|file| history_is_recent(root, file)) {
-        return Ok(history.commits(limit));
+        return Ok(history.commits(limit, base_revision));
     }
     if !history.entries.is_empty() {
-        cached(history.commits(limit));
+        cached(history.commits(limit, base_revision));
     }
 
     let mut args = vec!["log", "--xml", "-r"];
@@ -623,7 +635,7 @@ pub fn log(root: &Path, limit: usize, refresh: bool, cached: impl FnOnce(Vec<Com
         merge_cache(file, &entries, backfill);
     }
     history.merge(entries, backfill);
-    Ok(history.commits(limit))
+    Ok(history.commits(limit, base_revision))
 }
 
 // A second request can use a recent result directly. An explicit refresh
@@ -895,6 +907,31 @@ Details</msg></logentry>
     }
 
     #[test]
+    fn marks_only_the_loaded_working_copy_base_revision() {
+        let mut history = History::default();
+        history.merge(xml::<LogXml>(LOG).unwrap().entries, 2);
+        history.merge(
+            vec![Revision {
+                number: 21,
+                ..Revision::default()
+            }],
+            0,
+        );
+
+        let base = xml::<Info>(INFO).unwrap().entry.base_revision();
+        let commits = history.commits(3, base);
+        assert!(commits[0].refs.is_empty());
+        assert_eq!(commits[1].hash, "r17");
+        assert_eq!(commits[1].refs, [CommitRef::SvnBase]);
+        assert!(commits[2].refs.is_empty());
+        assert!(history.commits(1, base)[0].refs.is_empty());
+
+        let info = INFO.replace("revision=\"17\"", "revision=\"16\"");
+        let base = xml::<Info>(&info).unwrap().entry.base_revision();
+        assert!(history.commits(3, base).iter().all(|commit| commit.refs.is_empty()));
+    }
+
+    #[test]
     fn parses_status_and_changelists() {
         let entries: Vec<_> = xml::<StatusXml>(STATUS).unwrap().entries().collect();
         let codes: Vec<_> = entries.iter().filter_map(|e| Some((e.path.as_str(), e.status.code()?))).collect();
@@ -936,7 +973,7 @@ Details</msg></logentry>
         assert_eq!(history.backfill, 2);
         assert_eq!(history.entries.len(), 4);
 
-        let commits = history.commits(3);
+        let commits = history.commits(3, None);
         assert_eq!(commits.iter().map(|c| c.hash.as_str()).collect::<Vec<_>>(), ["r25", "r21", "r17"]);
         assert_eq!(commits[0].parents, ["r21"]);
         assert_eq!(commits[1].parents, ["r17"]);
@@ -947,7 +984,7 @@ Details</msg></logentry>
         // Shown in local time, like Git history.
         let utc = crate::blame::date_to_epoch("2008-05-29T13:26:12Z").unwrap();
         assert_eq!(commits[2].date, crate::blame::local_date_time(utc));
-        assert!(history.commits(4)[3].author.is_empty());
+        assert!(history.commits(4, None)[3].author.is_empty());
     }
 
     #[test]
