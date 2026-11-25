@@ -8,10 +8,12 @@ mod find;
 mod goto_line;
 mod graph_menu;
 mod gutter;
+mod lsp_edit;
 mod navigation;
 mod outline;
 mod problems;
 mod search_replace;
+mod semantic;
 mod session;
 #[cfg(feature = "tour")]
 mod tour;
@@ -77,6 +79,8 @@ struct Doc {
     hl: highlight::Cache,
     /// Gutter change markers vs. the committed file.
     markers: gutter::Markers,
+    /// Semantic token colors and symbol marks from the language server.
+    lsp: semantic::DocLsp,
     /// Per-frame values cached by `version` (they are O(file size) to compute).
     dirty_cache: std::cell::Cell<(u64, bool)>,
     line_col_cache: std::cell::Cell<(u64, usize, (usize, usize))>,
@@ -407,6 +411,7 @@ pub struct App {
     search_replace: search_replace::SearchReplace,
     c_flags: c_flags::CFlags,
     goto_line: Option<goto_line::GotoLine>,
+    lsp_edit: lsp_edit::LspEdit,
 
     lsp: problems::LanguageServers,
     problems: problems::Problems,
@@ -506,6 +511,7 @@ impl App {
             search_replace: search_replace::SearchReplace::default(),
             c_flags: c_flags::CFlags::default(),
             goto_line: None,
+            lsp_edit: Default::default(),
             goto_rx: None,
             nav_back: Vec::new(),
             nav_forward: Vec::new(),
@@ -1157,6 +1163,7 @@ impl App {
             blame_rx: None,
             hl: Default::default(),
             markers: Default::default(),
+            lsp: Default::default(),
             dirty_cache: Default::default(),
             line_col_cache: std::cell::Cell::new((u64::MAX, 0, (0, 0))),
         }));
@@ -2658,6 +2665,7 @@ impl App {
             Some(Tab::File(doc)) => self.editorconfig_indent(&doc.path),
             _ => None,
         };
+        let rename_open = self.rename_open();
         if self.is_live_diff(active) {
             open_path = self.live_diff_ui(ui, active);
             self.refresh_diff();
@@ -2675,7 +2683,8 @@ impl App {
                         || self.open_folder.is_some()
                         || self.search_replace.confirming()
                         || self.c_flags.is_open()
-                        || self.goto_line.is_some();
+                        || self.goto_line.is_some()
+                        || rename_open;
                     self.find.bar(ui, doc, dialog_open);
                     disk_action = disk_changed_bar(ui, doc);
                     let fresh = match self.vcs {
@@ -2955,6 +2964,7 @@ impl App {
 
     fn dialogs(&mut self, ctx: &egui::Context) {
         self.goto_line_dialog(ctx);
+        self.lsp_edit_ui(ctx);
         self.graph_dialog(ctx);
         self.c_flags_dialogs(ctx);
         // Quick open
@@ -3432,6 +3442,12 @@ fn editor(
         .iter()
         .map(|&(l, c)| (l, gutter::color(c, dark), c == gutter::Change::Deleted))
         .collect();
+    let semantic = if opts.highlight && settings.semantic_highlighting {
+        doc.lsp.align(&doc.text, doc.version, dark);
+        doc.lsp.colors()
+    } else {
+        &[]
+    };
     let extras = editor::Extras {
         inline: inline.as_deref(),
         squiggles: &squiggles,
@@ -3439,6 +3455,8 @@ fn editor(
         global_marks,
         gutter: &gutter_marks,
         line_bg,
+        symbol_marks: doc.lsp.marks_for(doc.version),
+        semantic,
     };
     let before = doc.version;
     let out = editor::show(ui, id, &mut doc.ed, &mut doc.text, &mut doc.version, &mut doc.hl, &opts, &extras);

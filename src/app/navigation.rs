@@ -267,6 +267,9 @@ impl App {
             Command::GoBack => self.go_back(),
             Command::GoForward => self.go_forward(),
             Command::FindReferences => self.find_references(),
+            Command::RenameSymbol => self.start_rename(),
+            Command::CodeActions => self.request_code_actions(),
+            Command::SignatureHelp => self.request_signature_help(true),
             Command::Explorer => {
                 self.side = Side::Explorer;
                 self.side_open = true;

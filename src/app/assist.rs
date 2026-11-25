@@ -18,6 +18,19 @@ pub(super) struct Assist {
     hover: Option<Hover>,
     completion: Option<Popup>,
     refs: Option<References>,
+    signature: Option<SignatureState>,
+}
+
+/// Parameter hints while typing a call's arguments.
+struct SignatureState {
+    doc: u64,
+    /// (version, caret byte) of the last request.
+    key: (u64, usize),
+    help: Option<lsp::features::SignatureHelp>,
+    rx: Option<Receiver<Option<lsp::features::SignatureHelp>>>,
+    caret: egui::Rect,
+    /// Which signature is shown (Alt+Up/Down cycles).
+    shown: usize,
 }
 
 struct Hover {
@@ -106,7 +119,10 @@ pub(super) fn rank(items: &[lsp::Completion], prefix: &str) -> Vec<usize> {
 impl App {
     /// Keys for the completion popup, taken before the editor sees them.
     pub(super) fn completion_keys(&mut self, ctx: &egui::Context) {
-        if ctx.input_mut(|i| i.consume_key(Modifiers::CTRL, Key::Space)) {
+        self.lsp_edit_keys(ctx);
+        self.signature_keys(ctx);
+        // Not with Shift: Ctrl/Cmd+Shift+Space is parameter hints.
+        if ctx.input_mut(|i| !i.modifiers.shift && i.consume_key(Modifiers::CTRL, Key::Space)) {
             self.request_completion(true);
             return;
         }
@@ -196,6 +212,163 @@ impl App {
     pub(super) fn after_editor(&mut self, out: &EditorOut) {
         self.update_completion(out);
         self.update_hover(out);
+        self.update_signature(out);
+        self.update_doc_lsp(out);
+        if out.caret.is_some() {
+            self.lsp_edit.caret = out.caret;
+        }
+    }
+
+    /// Ask for parameter hints at the caret (`manual`: Ctrl/Cmd+Shift+Space).
+    pub(super) fn request_signature_help(&mut self, manual: bool) {
+        let Some(Tab::File(doc)) = self.tabs.get(self.active) else { return };
+        let (path, ext) = (doc.path.clone(), doc.ext());
+        let launch = (!self.path_is_ignored(&path)).then(|| self.launch_server(&ext, false)).flatten();
+        let Some(launch) = launch else {
+            if manual {
+                self.message = "Parameter hints need a language server for this file".into();
+            }
+            return;
+        };
+        let Some(Tab::File(doc)) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        let head = doc.ed.primary().head.min(doc.text.len());
+        let ix = doc.ed.index(&doc.text, doc.version).clone();
+        let pos = position(&doc.text, &ix, head);
+        let (text, revision) = (doc.text.clone(), (doc.id, doc.version));
+        let rx = background(&self.ctx, move || {
+            let client = launch.wait()?;
+            client.signature_help(&path, &text, revision, pos, TIMEOUT).ok().flatten()
+        });
+        let prev = self.assist.signature.take().filter(|s| s.doc == doc.id);
+        self.assist.signature = Some(SignatureState {
+            doc: doc.id,
+            key: (doc.version, head),
+            caret: prev.as_ref().map_or(egui::Rect::NOTHING, |p| p.caret),
+            help: prev.as_ref().and_then(|p| p.help.clone()),
+            shown: prev.map_or(0, |p| p.shown),
+            rx: Some(rx),
+        });
+    }
+
+    fn update_signature(&mut self, out: &EditorOut) {
+        let Some(Tab::File(doc)) = self.tabs.get(self.active) else {
+            self.assist.signature = None;
+            return;
+        };
+        let head = doc.ed.primary().head.min(doc.text.len());
+        let key = (doc.version, head);
+        let typed = doc.text[..head].chars().next_back();
+        let (id, single) = (doc.id, doc.ed.sels.len() == 1);
+        if let Some(s) = &mut self.assist.signature {
+            if let Some(caret) = out.caret {
+                s.caret = caret;
+            }
+            if let Some(help) = receive(&mut s.rx) {
+                if help.as_ref().map(|h| h.active) != s.help.as_ref().map(|h| h.active) {
+                    s.shown = help.as_ref().map_or(0, |h| h.active);
+                }
+                s.help = help;
+                if s.help.is_none() {
+                    self.assist.signature = None;
+                    return;
+                }
+            }
+            if s.doc != id || !single || !out.focused && out.caret.is_none() {
+                self.assist.signature = None;
+                return;
+            }
+            // The caret moved or the text changed: ask again (the server says when the
+            // caret left the call).
+            if s.rx.is_none() && s.key != key {
+                self.request_signature_help(false);
+            }
+            return;
+        }
+        if out.changed && out.focused && matches!(typed, Some('(' | ',')) {
+            self.request_signature_help(false);
+        }
+    }
+
+    /// Esc closes parameter hints; Alt+Up/Down switches between overloads.
+    pub(super) fn signature_keys(&mut self, ctx: &egui::Context) {
+        let Some(s) = &mut self.assist.signature else { return };
+        if self.assist.completion.as_ref().is_some_and(|p| !p.shown.is_empty()) {
+            return;
+        }
+        let n = s.help.as_ref().map_or(0, |h| h.signatures.len());
+        let (esc, up, down) = ctx.input_mut(|i| {
+            (
+                i.consume_key(Modifiers::NONE, Key::Escape),
+                n > 1 && i.consume_key(Modifiers::ALT, Key::ArrowUp),
+                n > 1 && i.consume_key(Modifiers::ALT, Key::ArrowDown),
+            )
+        });
+        if esc {
+            self.assist.signature = None;
+        } else if n > 1 {
+            if down {
+                s.shown = (s.shown + 1) % n;
+            }
+            if up {
+                s.shown = (s.shown + n - 1) % n;
+            }
+        }
+    }
+
+    fn signature_ui(&self, ctx: &egui::Context) {
+        let Some(s) = &self.assist.signature else { return };
+        let Some(help) = &s.help else { return };
+        if !s.caret.is_finite() {
+            return;
+        }
+        let Some(sig) = help.signatures.get(s.shown.min(help.signatures.len() - 1)) else {
+            return;
+        };
+        egui::Area::new(egui::Id::unique("signature_help"))
+            .order(egui::Order::Tooltip)
+            .pivot(egui::Align2::LEFT_BOTTOM)
+            .fixed_pos(s.caret.left_top() - egui::vec2(0.0, 2.0))
+            .interactable(false)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.set_max_width(640.0);
+                    let font = egui::TextStyle::Monospace.resolve(ui.style());
+                    let normal = ui.visuals().text_color();
+                    let strong = ui.visuals().hyperlink_color;
+                    let mut job = egui::text::LayoutJob::default();
+                    if help.signatures.len() > 1 {
+                        let fmt = egui::TextFormat::simple(font.clone(), ui.visuals().weak_text_color());
+                        job.append(&format!("{}/{}  ", s.shown + 1, help.signatures.len()), 0.0, fmt);
+                    }
+                    let active = sig.active_param.and_then(|i| sig.params.get(i)).cloned();
+                    let mut pos = 0;
+                    if let Some(r) = active
+                        .filter(|r| r.end <= sig.label.len() && sig.label.is_char_boundary(r.start) && sig.label.is_char_boundary(r.end))
+                    {
+                        job.append(&sig.label[..r.start], 0.0, egui::TextFormat::simple(font.clone(), normal));
+                        job.append(
+                            &sig.label[r.clone()],
+                            0.0,
+                            egui::TextFormat {
+                                font_id: font.clone(),
+                                color: strong,
+                                underline: egui::Stroke::new(1.0, strong),
+                                ..Default::default()
+                            },
+                        );
+                        pos = r.end;
+                    }
+                    job.append(&sig.label[pos..], 0.0, egui::TextFormat::simple(font, normal));
+                    ui.label(job);
+                    if let Some(doc) = &sig.doc {
+                        let shown: String = doc.lines().take(8).collect::<Vec<_>>().join("\n");
+                        ui.separator();
+                        ui.weak(shown);
+                    }
+                });
+            });
     }
 
     fn update_completion(&mut self, out: &EditorOut) {
@@ -434,6 +607,8 @@ impl App {
             self.accept_completion();
         }
 
+        self.signature_ui(ctx);
+
         // Hover.
         if let Some(h) = &self.assist.hover
             && (h.info.is_some() || h.diagnostic.is_some())
@@ -512,8 +687,9 @@ impl App {
             self.open_at(&path, line, cols);
         }
         // Keep polling while a request is pending (results also request a repaint).
-        let pending =
-            self.assist.hover.as_ref().is_some_and(|h| h.rx.is_some()) || self.assist.completion.as_ref().is_some_and(|p| p.rx.is_some());
+        let pending = self.assist.hover.as_ref().is_some_and(|h| h.rx.is_some())
+            || self.assist.completion.as_ref().is_some_and(|p| p.rx.is_some())
+            || self.assist.signature.as_ref().is_some_and(|s| s.rx.is_some());
         if pending {
             ctx.request_repaint_after(Duration::from_millis(50));
         }

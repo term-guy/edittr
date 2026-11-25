@@ -2,6 +2,7 @@
 //!
 //! One server process per language per project folder, started lazily on first use.
 
+pub mod features;
 use crate::diagnostics::{self, ByPath};
 pub use crate::diagnostics::{Diagnostic, Severity};
 use crate::{clangd, workspace};
@@ -264,6 +265,12 @@ pub struct Client {
     docs: Mutex<HashMap<PathBuf, Synced>>,
     diagnostics: Mutex<ByPath>,
     diagnostics_generation: AtomicU64,
+    /// The server's `initialize` capabilities.
+    capabilities: OnceLock<Value>,
+    /// Diagnostics as the server sent them (code actions send them back).
+    raw_diagnostics: Mutex<HashMap<PathBuf, Vec<Value>>>,
+    /// Edits the server asked to apply (`workspace/applyEdit`) during a command.
+    applied_edits: Mutex<Vec<Vec<features::FileEdit>>>,
 }
 
 impl Drop for Client {
@@ -321,6 +328,9 @@ impl Client {
             docs: Mutex::new(HashMap::new()),
             diagnostics: Mutex::new(HashMap::new()),
             diagnostics_generation: AtomicU64::new(0),
+            capabilities: OnceLock::new(),
+            raw_diagnostics: Mutex::new(HashMap::new()),
+            applied_edits: Mutex::new(Vec::new()),
         });
 
         let weak = Arc::downgrade(&client);
@@ -344,6 +354,11 @@ impl Client {
                         let result = if method == "workspace/configuration" {
                             let items = msg["params"]["items"].as_array().map_or(&[][..], Vec::as_slice);
                             Value::Array(items.iter().map(|item| c.configuration(&item["section"])).collect())
+                        } else if method == "workspace/applyEdit" {
+                            // Collected by `execute_command`, which applies them in the editor.
+                            let edits = features::parse_workspace_edit(&msg["params"]["edit"]);
+                            c.applied_edits.lock().unwrap().push(edits);
+                            json!({"applied": true})
                         } else {
                             // Includes window/workDoneProgress/create. Track the token when it begins.
                             Value::Null
@@ -403,11 +418,18 @@ impl Client {
                     "workspace": {"workspaceFolders": true, "configuration": true},
                 },
             });
+            let (text_document, workspace) = features::capabilities();
+            for (section, extra) in [("textDocument", text_document), ("workspace", workspace)] {
+                if let (Some(to), Value::Object(extra)) = (params["capabilities"][section].as_object_mut(), extra) {
+                    to.extend(extra);
+                }
+            }
             if let Some(options) = initialization_options {
                 params["initializationOptions"] = options;
             }
             let res = c.request("initialize", params, Duration::from_secs(60)).map(|result| {
                 c.notify("initialized", json!({}));
+                let _ = c.capabilities.set(result["capabilities"].clone());
                 SyncKind::from_initialize(&result)
             });
             let _ = c.ready.set(res);
@@ -543,6 +565,7 @@ impl Client {
             None
         };
         let diagnostics = diagnostics::parse(items, text.as_deref().or(disk.as_deref()));
+        self.raw_diagnostics.lock().unwrap().insert(path.clone(), items.clone());
         let docs = self.docs.lock().unwrap();
         if docs.get(&path).is_some_and(stale) {
             return false;

@@ -31,6 +31,8 @@ pub const TREE_VIEW: &str = "\u{EE48}";
 pub const LIST: &str = "\u{E2F0}";
 pub const INFO: &str = "\u{E2CE}";
 pub const LIGHTBULB: &str = "\u{E2DC}";
+pub const PENCIL_SIMPLE: &str = "\u{E3B4}";
+pub const WRENCH: &str = "\u{E5D4}";
 pub const WARNING: &str = "\u{E4E0}";
 pub const X_CIRCLE: &str = "\u{E4F8}";
 pub const X: &str = "\u{E4F6}";
@@ -70,7 +72,7 @@ mod tests {
         ctx.set_fonts(fonts);
         let mut full = ctx.run_ui(Default::default(), |ui| {
             ui.fonts_mut(|fonts| {
-                for icon in [INFO, LIGHTBULB, WARNING, X_CIRCLE] {
+                for icon in [INFO, LIGHTBULB, WARNING, X_CIRCLE, PENCIL_SIMPLE, WRENCH] {
                     assert!(fonts.has_glyphs(&FontId::proportional(14.0), icon), "missing glyph {icon:?}");
                 }
             });

@@ -157,6 +157,18 @@ impl State {
         self.preferred_x = None;
     }
 
+    /// Apply several replacements (bytes, in the current text) as one undoable edit,
+    /// keeping the selections on the same text (e.g. a rename or a quick fix).
+    pub fn apply_edits(&mut self, text: &mut String, edits: Vec<(Range<usize>, String)>) {
+        if edits.is_empty() {
+            return;
+        }
+        let before = self.sels.clone();
+        self.sels = buffer::edit_keep(text, &mut self.history, &before, edits);
+        self.history.seal();
+        self.preferred_x = None;
+    }
+
     /// Select a range (byte offsets) and scroll it to the center.
     pub fn select(&mut self, range: Range<usize>) {
         self.sels = vec![Sel {
@@ -201,6 +213,11 @@ pub struct Extras<'a> {
     pub gutter: &'a [(usize, Color32, bool)],
     /// Full-width line backgrounds (e.g. changed lines in a diff).
     pub line_bg: &'a [(usize, Color32)],
+    /// Other uses of the symbol under the caret (byte ranges; `true`: written there).
+    pub symbol_marks: &'a [(Range<usize>, bool)],
+    /// Colors from the language server's semantic tokens, per line: (byte range in
+    /// the line, color), sorted; they override the syntax colors.
+    pub semantic: &'a [Vec<(Range<usize>, Color32)>],
 }
 
 #[derive(Default)]
@@ -239,11 +256,13 @@ struct Brackets<'a> {
     colors: [Color32; 3],
 }
 
+#[allow(clippy::too_many_arguments)]
 fn line_job(
     text: &str,
     ix: &LineIndex,
     l: usize,
     spans: Option<&[highlight::Line]>,
+    semantic: &[(Range<usize>, Color32)],
     font: &egui::FontId,
     color: Color32,
     brackets: Option<Brackets>,
@@ -290,6 +309,13 @@ fn line_job(
         }
     };
     let spans = spans.and_then(|s| s.get(l)).map(|l| l.spans.as_slice()).unwrap_or_default();
+    let merged;
+    let spans = if semantic.is_empty() {
+        spans
+    } else {
+        merged = highlight::overlay(spans, semantic, line.len());
+        &merged[..]
+    };
     let mut pos = 0;
     for s in spans {
         let (a, b) = (s.range.start.min(line.len()), s.range.end.min(line.len()));
@@ -299,11 +325,12 @@ fn line_job(
         if a > pos {
             push(&mut job, pos, a, egui::TextFormat::simple(font.clone(), color));
         }
+        let c = if s.color == Color32::PLACEHOLDER { color } else { s.color };
         let fmt = egui::TextFormat {
             font_id: font.clone(),
-            color: s.color,
+            color: c,
             italics: s.italics,
-            underline: if s.underline { Stroke::new(1.0, s.color) } else { Stroke::NONE },
+            underline: if s.underline { Stroke::new(1.0, c) } else { Stroke::NONE },
             ..Default::default()
         };
         push(&mut job, a, b, fmt);
@@ -323,6 +350,8 @@ struct Lines<'a> {
     text: &'a str,
     ix: &'a LineIndex,
     spans: Option<&'a [highlight::Line]>,
+    /// Semantic token colors per line (may be shorter than the file, or empty).
+    semantic: &'a [Vec<(Range<usize>, Color32)>],
     font: egui::FontId,
     color: Color32,
     /// Depth at each line start + palette, when bracket colors are on.
@@ -339,7 +368,8 @@ impl Lines<'_> {
             }),
             _ => None,
         };
-        let job = line_job(self.text, self.ix, l, self.spans, &self.font, self.color, brackets);
+        let semantic = self.semantic.get(l).map_or(&[][..], Vec::as_slice);
+        let job = line_job(self.text, self.ix, l, self.spans, semantic, &self.font, self.color, brackets);
         self.ui.fonts_mut(|f| f.layout_job(job))
     }
 
@@ -384,6 +414,9 @@ pub fn show(
     let is_mac = ui.ctx().os() == egui::os::OperatingSystem::Mac;
     let focused = ui.memory(|m| m.has_focus(id));
     out.focused = focused;
+    // Semantic colors are per line of the text the app saw: an edit this frame that
+    // adds or removes lines would shift them, so skip them until the app catches up.
+    let lines_before = st.index(text, *version).lines();
 
     // ---- keyboard (before layout, so this frame shows the result)
     if focused {
@@ -496,6 +529,7 @@ pub fn show(
             text,
             ix: &ix,
             spans,
+            semantic: if ix.lines() == lines_before { extras.semantic } else { &[] },
             font: font.clone(),
             color: text_color,
             depth: use_depth.then(|| (depth_arc.as_slice(), bracket_palette)),
@@ -562,6 +596,19 @@ pub fn show(
         let mark = ui.visuals().warn_fg_color.gamma_multiply(0.25);
         // Search-in-files results in blue, under the file's own find matches (amber).
         let global = Color32::from_rgb(0x3d, 0x8b, 0xfd).gamma_multiply(if ui.visuals().dark_mode { 0.35 } else { 0.28 });
+        // Other uses of the symbol under the caret: neutral, a bit stronger where written.
+        let uses = ui.visuals().text_color();
+        let (read, write) = if ui.visuals().dark_mode { (0.13, 0.22) } else { (0.10, 0.17) };
+        paint_ranges(
+            &mut extras.symbol_marks.iter().filter(|m| !m.1).map(|m| m.0.clone()),
+            uses.gamma_multiply(read),
+            false,
+        );
+        paint_ranges(
+            &mut extras.symbol_marks.iter().filter(|m| m.1).map(|m| m.0.clone()),
+            uses.gamma_multiply(write),
+            false,
+        );
         paint_ranges(&mut extras.global_marks.iter().cloned(), global, false);
         paint_ranges(&mut extras.marks.iter().cloned(), mark, false);
         let sel_color = ui.visuals().selection.bg_fill.gamma_multiply(if focused { 0.7 } else { 0.4 });
@@ -1205,6 +1252,7 @@ fn key_press(ui: &egui::Ui, st: &mut State, text: &mut String, version: &mut u64
         text,
         ix: &ix,
         spans: None,
+        semantic: &[],
         font: k.font.clone(),
         color: Color32::WHITE,
         depth: None,

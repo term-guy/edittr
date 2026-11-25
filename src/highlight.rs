@@ -355,6 +355,173 @@ fn identifier_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '_' | '$') || (!c.is_ascii() && !c.is_whitespace())
 }
 
+/// Theme color for a scope, None when the theme only has its default foreground for it.
+fn scope_color(theme: &Theme, scope: &str) -> Option<Color32> {
+    let highlighter = Highlighter::new(theme);
+    let default = highlighter.get_default().foreground;
+    let style = highlighter.style_for_stack(&[Scope::new(scope).ok()?]);
+    (style.foreground != default).then(|| Color32::from_rgb(style.foreground.r, style.foreground.g, style.foreground.b))
+}
+
+struct SemanticColors {
+    function: Option<Color32>,
+    kind: Option<Color32>,
+    namespace: Option<Color32>,
+    parameter: Option<Color32>,
+    comment: Option<Color32>,
+}
+
+fn semantic_colors(dark: bool) -> &'static SemanticColors {
+    static C: [OnceLock<SemanticColors>; 2] = [OnceLock::new(), OnceLock::new()];
+    C[dark as usize].get_or_init(|| {
+        let theme = theme(dark);
+        let first = |scopes: &[&str]| scopes.iter().find_map(|s| scope_color(theme, s));
+        SemanticColors {
+            function: first(&["entity.name.function", "support.function"]),
+            kind: first(&["entity.name.type", "entity.name.class", "support.type", "storage.type"]),
+            namespace: first(&["entity.name.namespace", "entity.name.module", "entity.name.type"]),
+            parameter: first(&["variable.parameter"]),
+            comment: first(&["comment"]),
+        }
+    })
+}
+
+/// Color for a semantic token (type and modifiers as the server names them), or None to
+/// keep the syntax color. Only kinds a grammar can't tell apart are recolored: macros,
+/// enum members and constants (the constant color), functions, types, namespaces,
+/// parameters, and code the preprocessor disables (clangd marks it as a comment).
+pub fn semantic_color(kind: &str, modifiers: &[String], dark: bool) -> Option<Color32> {
+    let has = |m: &str| modifiers.iter().any(|x| x == m);
+    let c = semantic_colors(dark);
+    match kind {
+        "macro" | "enumMember" | "constant" => Some(constant_color(dark)),
+        "variable" if has("readonly") && (has("static") || has("globalScope") || has("fileScope")) => Some(constant_color(dark)),
+        "variable" if has("constant") => Some(constant_color(dark)),
+        "function" | "method" => c.function,
+        "type" | "class" | "struct" | "enum" | "interface" | "typeParameter" | "concept" | "typeAlias" | "union" => c.kind,
+        "namespace" => c.namespace,
+        "parameter" => c.parameter,
+        "comment" => c.comment,
+        _ => None,
+    }
+}
+
+/// `spans` (covering a line of `len` bytes, gaps allowed) with the colors of `over`
+/// (sorted, non-overlapping byte ranges) laid on top. Gaps take `Color32::PLACEHOLDER`
+/// unless covered, so the caller's default text color still applies there.
+pub fn overlay(spans: &[Span], over: &[(Range<usize>, Color32)], len: usize) -> Vec<Span> {
+    let plain = |range: Range<usize>| Span {
+        range,
+        color: Color32::PLACEHOLDER,
+        italics: false,
+        underline: false,
+    };
+    // Full coverage of 0..len first.
+    let mut base = Vec::with_capacity(spans.len() + 2);
+    let mut pos = 0;
+    for s in spans {
+        let (a, b) = (s.range.start.min(len), s.range.end.min(len));
+        if a < pos || a >= b {
+            continue;
+        }
+        if a > pos {
+            base.push(plain(pos..a));
+        }
+        base.push(Span { range: a..b, ..s.clone() });
+        pos = b;
+    }
+    if pos < len {
+        base.push(plain(pos..len));
+    }
+    let mut out = Vec::with_capacity(base.len() + over.len() * 2);
+    let mut o = over.iter().peekable();
+    for s in base {
+        let mut start = s.range.start;
+        while start < s.range.end {
+            while o.next_if(|(r, _)| r.end <= start).is_some() {}
+            match o.peek() {
+                Some((r, color)) if r.start < s.range.end => {
+                    if r.start > start {
+                        out.push(Span {
+                            range: start..r.start,
+                            ..s.clone()
+                        });
+                        start = r.start;
+                    }
+                    let end = r.end.min(s.range.end);
+                    out.push(Span {
+                        range: start..end,
+                        color: *color,
+                        ..s.clone()
+                    });
+                    start = end;
+                }
+                _ => {
+                    out.push(Span {
+                        range: start..s.range.end,
+                        ..s.clone()
+                    });
+                    start = s.range.end;
+                }
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod semantic_tests {
+    use super::*;
+
+    fn span(range: Range<usize>, color: Color32) -> Span {
+        Span {
+            range,
+            color,
+            italics: false,
+            underline: false,
+        }
+    }
+
+    #[test]
+    fn overlays_semantic_colors_on_syntax_spans() {
+        let (a, b, x) = (Color32::RED, Color32::GREEN, Color32::BLUE);
+        // "int foo(bar)": syntax spans with a gap at 3..4.
+        let spans = [span(0..3, a), span(4..12, b)];
+        let out = overlay(&spans, &[(4..7, x), (8..11, x)], 12);
+        let got: Vec<(Range<usize>, Color32)> = out.iter().map(|s| (s.range.clone(), s.color)).collect();
+        assert_eq!(
+            got,
+            vec![
+                (0..3, a),
+                (3..4, Color32::PLACEHOLDER),
+                (4..7, x),
+                (7..8, b),
+                (8..11, x),
+                (11..12, b)
+            ]
+        );
+        // A token across span boundaries and into a gap.
+        let out = overlay(&spans, &[(2..6, x)], 12);
+        let got: Vec<(Range<usize>, Color32)> = out.iter().map(|s| (s.range.clone(), s.color)).collect();
+        assert_eq!(got, vec![(0..2, a), (2..3, x), (3..4, x), (4..6, x), (6..12, b)]);
+        assert_eq!(overlay(&[], &[], 0).len(), 0);
+    }
+
+    #[test]
+    fn semantic_colors_for_macros_constants_and_types() {
+        for dark in [false, true] {
+            assert_eq!(semantic_color("macro", &[], dark), Some(constant_color(dark)));
+            assert_eq!(semantic_color("enumMember", &[], dark), Some(constant_color(dark)));
+            let mods = ["readonly".to_string(), "fileScope".to_string()];
+            assert_eq!(semantic_color("variable", &mods, dark), Some(constant_color(dark)));
+            assert_eq!(semantic_color("variable", &[], dark), None);
+            assert_eq!(semantic_color("keyword", &[], dark), None);
+            assert!(semantic_color("function", &[], dark).is_some());
+            assert!(semantic_color("comment", &[], dark).is_some());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
