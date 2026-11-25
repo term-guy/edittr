@@ -272,4 +272,65 @@ mod tests {
         assert_eq!(sides.left.size, 0);
         assert_eq!(sides.right.read(0..2).unwrap(), [0, 255]);
     }
+
+    /// Needs `svn` and `svnadmin` on PATH: `cargo test -- --ignored svn_path_history`.
+    #[test]
+    #[ignore]
+    fn svn_path_history_against_a_real_repository() {
+        let base = TestDir::new();
+        let svn = |dir: &Path, args: &[&str]| {
+            let out = std::process::Command::new("svn").current_dir(dir).args(args).output().unwrap();
+            assert!(out.status.success(), "svn {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        let repo = base.0.join("repo");
+        let out = std::process::Command::new("svnadmin").arg("create").arg(&repo).output().unwrap();
+        assert!(out.status.success());
+        let url = format!("file://{}", repo.display());
+        svn(&base.0, &["checkout", "-q", &url, "wc"]);
+        let wc = base.0.join("wc");
+        std::fs::create_dir(wc.join("dir")).unwrap();
+        std::fs::write(wc.join("dir/a.txt"), "first\nold\nlast\n").unwrap();
+        std::fs::write(wc.join("outside.txt"), "excluded\n").unwrap();
+        svn(&wc, &["add", "-q", "dir", "outside.txt"]);
+        svn(&wc, &["commit", "-q", "-m", "Original"]);
+        std::fs::write(wc.join("dir/a.txt"), "first\nnew\nlast\n").unwrap();
+        std::fs::write(wc.join("outside.txt"), "changed\n").unwrap();
+        svn(&wc, &["commit", "-q", "-m", "Edit"]);
+        std::fs::write(wc.join("dir/bin"), [0u8, 255]).unwrap();
+        svn(&wc, &["add", "-q", "dir/bin"]);
+        svn(&wc, &["propset", "-q", "svn:mime-type", "application/octet-stream", "dir/bin"]);
+        svn(&wc, &["commit", "-q", "-m", "Add binary"]);
+        svn(&wc, &["update", "-q"]);
+
+        let (root, vcs) = vcs::detect(&wc).unwrap();
+        assert!(vcs == Vcs::Svn);
+        let log = vcs.path_history(&root, "dir/a.txt", false, None).unwrap();
+        assert_eq!(log.iter().map(|e| e.subject.as_str()).collect::<Vec<_>>(), ["Edit", "Original"]);
+        let patch = vcs.path_history_patch(&root, "dir/a.txt", &log[0]).unwrap();
+        assert!(patch.contains("-old") && patch.contains("+new"), "{patch}");
+        assert!(!patch.contains("outside.txt"));
+
+        let folder = vcs.path_history(&root, "dir", true, None).unwrap();
+        assert_eq!(
+            folder.iter().map(|e| e.subject.as_str()).collect::<Vec<_>>(),
+            ["Add binary", "Edit", "Original"]
+        );
+        let patch = vcs.path_history_patch(&root, "dir", &folder[1]).unwrap();
+        assert!(patch.contains("+new") && !patch.contains("outside.txt"), "{patch}");
+
+        // Line-range history is git-only (`git log -L`); svn says so instead of showing a wrong list.
+        assert!(
+            vcs.path_history(&root, "dir/a.txt", false, Some(2..=2))
+                .err()
+                .unwrap()
+                .contains("Git")
+        );
+
+        let log = vcs.path_history(&root, "dir/bin", false, None).unwrap();
+        let patch = vcs.path_history_patch(&root, "dir/bin", &log[0]).unwrap();
+        assert!(hex_view::binary_patch(&patch), "{patch}");
+        let sides = vcs.path_history_binary_sides(&root, "dir/bin", &log[0]).unwrap();
+        assert_eq!(sides.left.size, 0);
+        assert_eq!(sides.right.read(0..2).unwrap(), [0, 255]);
+    }
 }

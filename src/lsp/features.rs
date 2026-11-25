@@ -127,6 +127,13 @@ pub fn parse_workspace_edit(v: &Value) -> Vec<FileEdit> {
 }
 
 /// Code actions and bare commands from a `textDocument/codeAction` result.
+/// Kinds that belong in the quick fix menu. Servers also list "source" actions that browse
+/// documentation, show assembly or split packages (gopls offers seven of those on any line).
+fn quick_fix_menu_kind(kind: &str) -> bool {
+    let family = |prefix: &str| kind == prefix || kind.starts_with(&format!("{prefix}."));
+    kind.is_empty() || family("quickfix") || family("refactor") || family("source.organizeImports") || family("source.fixAll")
+}
+
 pub fn parse_code_actions(v: &Value) -> Vec<CodeAction> {
     let Some(items) = v.as_array() else { return Vec::new() };
     items
@@ -473,6 +480,7 @@ impl Client {
         });
         let v = self.about_document("textDocument/codeAction", path, text, revision, params, timeout)?;
         let mut actions = parse_code_actions(&v);
+        actions.retain(|a| quick_fix_menu_kind(&a.kind));
         // Preferred (usually the fix of the diagnostic) first, then quick fixes.
         actions.sort_by_key(|a| (!a.preferred, !a.kind.starts_with("quickfix")));
         Ok(actions)
@@ -642,6 +650,28 @@ mod tests {
     }
 
     #[test]
+    fn quick_fix_menu_skips_browsing_actions() {
+        for kind in [
+            "",
+            "quickfix",
+            "refactor.extract.function",
+            "source.organizeImports",
+            "source.fixAll.eslint",
+        ] {
+            assert!(quick_fix_menu_kind(kind), "{kind}");
+        }
+        for kind in [
+            "source.assembly",
+            "source.doc",
+            "gopls.doc.features",
+            "source.organizeImportsX",
+            "refactoring",
+        ] {
+            assert!(!quick_fix_menu_kind(kind), "{kind}");
+        }
+    }
+
+    #[test]
     fn parses_document_highlights() {
         let h = parse_document_highlights(&json!([
             {"range": {"start": {"line": 0, "character": 4}, "end": {"line": 0, "character": 7}}, "kind": 3},
@@ -716,5 +746,194 @@ mod tests {
         let edit = &fix.edit.as_ref().expect("fix edit")[0].edits[0];
         assert_eq!(edit.new_text, ";", "{fix:?}");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// What a project's files look like and where to probe, for one real server.
+    struct Probe {
+        ext: &'static str,
+        files: &'static [(&'static str, &'static str)],
+        main: &'static str,
+        /// A variable that is assigned again (document highlights).
+        variable: Pos16,
+        /// Inside `add(x, |1)`: the second argument (signature help).
+        second_argument: Pos16,
+        /// A use of `add` in `main` (rename across files).
+        add_use: Pos16,
+        /// Lines to ask code actions for.
+        action_line: usize,
+        /// `add`'s name in its own file (call hierarchy).
+        add_file: &'static str,
+        add_name: Pos16,
+        /// Function that calls `add`.
+        caller: &'static str,
+    }
+
+    /// Retries until the server has indexed the project (rust-analyzer answers empty meanwhile).
+    fn until<T>(what: &str, mut f: impl FnMut() -> Option<T>) -> T {
+        let start = std::time::Instant::now();
+        loop {
+            if let Some(v) = f() {
+                return v;
+            }
+            assert!(start.elapsed() < Duration::from_secs(120), "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+
+    fn editing_features_round_trip(probe: Probe) {
+        use super::super::call_hierarchy::Direction;
+        let spec = super::super::servers_for(probe.ext).into_iter().next().unwrap();
+        let launch = super::super::resolve(spec.command).unwrap_or_else(|| panic!("{} is not installed", spec.command));
+        let dir = std::env::temp_dir().join(format!("edittr-features-{}-{}", probe.ext, std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::workspace::canonical(&dir).unwrap();
+        for (name, text) in probe.files {
+            std::fs::write(dir.join(name), text).unwrap();
+        }
+        let text = probe.files.iter().find(|(n, _)| *n == probe.main).unwrap().1;
+        let path = dir.join(probe.main);
+        let client = Client::start(&spec, launch, &dir, &[], None).unwrap();
+        let t = Duration::from_secs(30);
+        let rev = (1, 1);
+
+        match client.semantic_tokens(&path, text, rev, t).unwrap() {
+            Some(tokens) => {
+                let kinds: std::collections::BTreeSet<_> = tokens.iter().map(|k| k.kind.as_str()).collect();
+                eprintln!("{}: semantic token kinds {kinds:?}", spec.name);
+                assert!(kinds.contains("function"), "{tokens:?}");
+            }
+            None => eprintln!("{}: no semantic tokens", spec.name),
+        }
+
+        let marks = until("document highlights", || {
+            let m = client
+                .document_highlights(&path, text, rev, probe.variable, t)
+                .unwrap()
+                .expect("highlights");
+            (m.len() >= 3).then_some(m)
+        });
+        assert!(marks.iter().any(|(_, k)| *k == HighlightKind::Write), "{marks:?}");
+
+        let help = until("signature help", || {
+            client.signature_help(&path, text, rev, probe.second_argument, t).unwrap()
+        });
+        let sig = &help.signatures[help.active];
+        assert!(sig.label.contains("add"), "{help:?}");
+        assert_eq!(sig.active_param, Some(1), "{help:?}");
+        eprintln!(
+            "{}: signature {:?}, second parameter {:?}",
+            spec.name,
+            sig.label,
+            &sig.label[sig.params[1].clone()]
+        );
+
+        let edits = until("rename", || {
+            let e = client.rename(&path, text, rev, probe.add_use, "plus", t).unwrap();
+            (!e.is_empty()).then_some(e)
+        });
+        let files: std::collections::BTreeSet<_> = edits
+            .iter()
+            .map(|e| e.path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        let count: usize = edits.iter().map(|e| e.edits.len()).sum();
+        eprintln!("{}: rename touches {files:?} with {count} edits", spec.name);
+        assert!(files.contains(probe.add_file) && files.contains(probe.main), "{edits:?}");
+        assert_eq!(count, 3, "{edits:?}");
+        assert!(edits.iter().flat_map(|e| &e.edits).all(|e| e.new_text == "plus"));
+        if let Some((range, _)) = client.prepare_rename(&path, text, rev, probe.add_use, t).unwrap() {
+            assert_eq!(range.0, (probe.add_use.0, range.0.1));
+            assert_eq!(range.1.1 - range.0.1, 3, "{range:?}");
+        }
+
+        let line_len = text.lines().nth(probe.action_line).unwrap().encode_utf16().count();
+        let actions = until("code actions", || {
+            let a = client
+                .code_actions(&path, text, rev, ((probe.action_line, 0), (probe.action_line, line_len)), t)
+                .unwrap();
+            (!a.is_empty()).then_some(a)
+        });
+        eprintln!(
+            "{}: code actions {:?}",
+            spec.name,
+            actions.iter().map(|a| (&a.title, &a.kind)).collect::<Vec<_>>()
+        );
+        let resolved: Vec<_> = actions.into_iter().map(|a| client.resolve_code_action(a, t)).collect();
+        let with_edit = resolved.iter().filter(|a| a.edit.as_ref().is_some_and(|e| !e.is_empty())).count();
+        let with_command = resolved.iter().filter(|a| a.command.is_some()).count();
+        eprintln!(
+            "{}: {with_edit} actions carry edits after resolve, {with_command} run a command",
+            spec.name
+        );
+        assert!(with_edit + with_command > 0);
+
+        let add_path = dir.join(probe.add_file);
+        let add_text = probe.files.iter().find(|(n, _)| *n == probe.add_file).unwrap().1;
+        let roots = until("call hierarchy", || {
+            let r = client.prepare_call_hierarchy(&add_path, add_text, rev, probe.add_name, t).unwrap();
+            (!r.is_empty()).then_some(r)
+        });
+        assert_eq!(roots[0].name, "add");
+        let callers = client.hierarchy_calls(roots[0].wire.clone(), Direction::Incoming, t).unwrap();
+        eprintln!(
+            "{}: callers of add {:?}",
+            spec.name,
+            callers.iter().map(|c| &c.name).collect::<Vec<_>>()
+        );
+        assert!(callers.iter().any(|c| c.name.contains(probe.caller) && c.location.path == path));
+        drop(client);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Real rust-analyzer (on PATH): `cargo test -- --ignored lsp_round_trip_rust_analyzer --nocapture`.
+    #[test]
+    #[ignore]
+    fn lsp_round_trip_rust_analyzer_editing_features() {
+        editing_features_round_trip(Probe {
+            ext: "rs",
+            files: &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\npath = \"lib.rs\"\n",
+                ),
+                (
+                    "lib.rs",
+                    "mod util;\npub const LIMIT: u32 = 10;\npub fn total(a: u32) -> u32 {\n    let mut sum = util::add(a, LIMIT);\n    sum += 1;\n    util::add(sum, 1)\n}\n",
+                ),
+                ("util.rs", "pub fn add(a: u32, b: u32) -> u32 {\n    a + b\n}\n"),
+            ],
+            main: "lib.rs",
+            variable: (3, 13),
+            second_argument: (5, 19),
+            add_use: (5, 11),
+            action_line: 3,
+            add_file: "util.rs",
+            add_name: (0, 8),
+            caller: "total",
+        });
+    }
+
+    /// Real gopls (on PATH): `cargo test -- --ignored lsp_round_trip_gopls --nocapture`.
+    #[test]
+    #[ignore]
+    fn lsp_round_trip_gopls_editing_features() {
+        editing_features_round_trip(Probe {
+            ext: "go",
+            files: &[
+                ("go.mod", "module probe\n\ngo 1.22\n"),
+                (
+                    "main.go",
+                    "package main\n\nconst Limit = 10\n\nfunc total(a int) int {\n\tsum := add(a, Limit)\n\tsum += 1\n\treturn add(sum, 1)\n}\n\nfunc main() { println(total(1)) }\n",
+                ),
+                ("util.go", "package main\n\nfunc add(a, b int) int { return a + b }\n"),
+            ],
+            main: "main.go",
+            variable: (5, 2),
+            second_argument: (7, 17),
+            add_use: (7, 9),
+            action_line: 5,
+            add_file: "util.go",
+            add_name: (2, 6),
+            caller: "total",
+        });
     }
 }

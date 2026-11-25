@@ -18,6 +18,10 @@ use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+/// LSP error codes: the document changed / the server gave up on the request; both mean "ask again".
+const CONTENT_MODIFIED: i64 = -32801;
+const SERVER_CANCELLED: i64 = -32802;
+
 pub struct ServerSpec {
     pub name: &'static str,
     pub command: &'static str,
@@ -33,11 +37,16 @@ impl ServerSpec {
                 "cachePriming": {"enable": true},
                 "cargo": {"targetDir": true},
             })),
-            "gopls" if !ignored.is_empty() => {
-                let filters: Vec<_> = std::iter::once("-**/node_modules".to_owned())
-                    .chain(ignored.iter().map(|dir| format!("-{dir}")))
-                    .collect();
-                Some(json!({"directoryFilters": filters}))
+            "gopls" => {
+                // gopls advertises semantic tokens but sends none unless asked to.
+                let mut options = json!({"semanticTokens": true});
+                if !ignored.is_empty() {
+                    let filters: Vec<_> = std::iter::once("-**/node_modules".to_owned())
+                        .chain(ignored.iter().map(|dir| format!("-{dir}")))
+                        .collect();
+                    options["directoryFilters"] = json!(filters);
+                }
+                Some(options)
             }
             _ => None,
         }
@@ -500,22 +509,39 @@ impl Client {
         self.send(&json!({"jsonrpc": "2.0", "method": method, "params": params}));
     }
 
+    /// A request; answers saying the document or index changed while the server worked
+    /// (rust-analyzer while it indexes) are retried until `timeout`, as the LSP spec suggests.
     fn request(&self, method: &str, params: Value, timeout: Duration) -> Result<Value, String> {
+        // Commands can change things on the server: never send one twice.
+        let retry = method != "workspace/executeCommand";
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            match self.request_once(method, params.clone(), left) {
+                Err((Some(CONTENT_MODIFIED | SERVER_CANCELLED), _)) if retry && left > Duration::from_millis(250) => {
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+                result => return result.map_err(|(_, message)| message),
+            }
+        }
+    }
+
+    fn request_once(&self, method: &str, params: Value, timeout: Duration) -> Result<Value, (Option<i64>, String)> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = channel();
         {
             let mut pending = self.pending.lock().unwrap();
             if self.retired.load(Ordering::Acquire) || !self.connected.load(Ordering::Acquire) {
-                return Err(format!("{} was stopped", self.name));
+                return Err((None, format!("{} was stopped", self.name)));
             }
             pending.insert(id, tx);
         }
         self.send(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}));
         let res = rx.recv_timeout(timeout);
         self.pending.lock().unwrap().remove(&id);
-        let msg = res.map_err(|_| format!("{} did not answer in time", self.name))?;
+        let msg = res.map_err(|_| (None, format!("{} did not answer in time", self.name)))?;
         if let Some(err) = msg.get("error") {
-            return Err(err["message"].as_str().unwrap_or("error").to_string());
+            return Err((err["code"].as_i64(), err["message"].as_str().unwrap_or("error").to_string()));
         }
         Ok(msg["result"].clone())
     }

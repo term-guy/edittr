@@ -528,11 +528,14 @@ pub fn semantic_role(kind: &str, modifiers: &[String], clangd: bool) -> Option<S
     let has = |m: &str| modifiers.iter().any(|x| x == m);
     let (part, legacy) = match kind {
         "macro" => (Macro, Both),
-        "enumMember" | "constant" => (Constant, Both),
+        // rust-analyzer has its own `const` type for constants.
+        "enumMember" | "constant" | "const" => (Constant, Both),
         "variable" if has("readonly") && (has("static") || has("globalScope") || has("fileScope")) => (Constant, Both),
         "variable" if has("constant") => (Constant, Both),
         "function" | "method" => (Function, Both),
-        "type" | "class" | "struct" | "enum" | "interface" | "typeParameter" | "concept" | "typeAlias" | "union" => (Type, Both),
+        "type" | "class" | "struct" | "enum" | "interface" | "typeParameter" | "concept" | "typeAlias" | "union" | "builtinType" => {
+            (Type, Both)
+        }
         "namespace" => (Type, Light),
         "parameter" => (Variable, Both),
         "variable" | "property" => (Variable, Neither),
