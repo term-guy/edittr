@@ -1086,13 +1086,18 @@ fn paint_whitespace(p: &egui::Painter, g: &egui::Galley, origin: Pos2, color: Co
             if gl.chr == ' ' {
                 p.circle_filled(Pos2::new((x0 + x1) / 2.0, y), 1.0, color);
             } else {
-                let (a, b) = (x0 + 2.0, (x1 - 2.0).max(x0 + 6.0));
-                p.line_segment([Pos2::new(a, y), Pos2::new(b, y)], stroke);
-                p.line_segment([Pos2::new(b - 3.0, y - 3.0), Pos2::new(b, y)], stroke);
-                p.line_segment([Pos2::new(b - 3.0, y + 3.0), Pos2::new(b, y)], stroke);
+                paint_tab_arrow(p, x0, x1, y, stroke);
             }
         }
     }
+}
+
+/// The "show whitespace" mark of a tab spanning `x0..x1`: an arrow on the row's middle `y`.
+pub(crate) fn paint_tab_arrow(p: &egui::Painter, x0: f32, x1: f32, y: f32, stroke: Stroke) {
+    let (a, b) = (x0 + 2.0, (x1 - 2.0).max(x0 + 6.0));
+    p.line_segment([Pos2::new(a, y), Pos2::new(b, y)], stroke);
+    p.line_segment([Pos2::new(b - 3.0, y - 3.0), Pos2::new(b, y)], stroke);
+    p.line_segment([Pos2::new(b - 3.0, y + 3.0), Pos2::new(b, y)], stroke);
 }
 
 // ------------------------------------------------------------------ mouse

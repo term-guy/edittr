@@ -164,11 +164,9 @@ impl Find {
         ui.horizontal_wrapped(|ui| {
             let caret = if self.replacing { ic::CARET_DOWN } else { ic::CARET_RIGHT };
             toggle(ui, &mut self.replacing, caret, "Toggle replace");
-            let mut query = egui::TextEdit::singleline(&mut self.opts.query)
-                .id(query_id)
-                .desired_width(190.0)
-                .hint_text("Find")
-                .show(ui);
+            let mut query = super::tab_field::show(ui, query_id, &mut self.opts.query, |field| {
+                field.desired_width(190.0).hint_text("Find")
+            });
             if std::mem::take(&mut self.focus_query) {
                 use egui::text::{CCursor, CCursorRange};
                 query.state.cursor.set_char_range(Some(CCursorRange::two(
@@ -220,12 +218,9 @@ impl Find {
 
         if self.replacing {
             ui.horizontal_wrapped(|ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.replacement)
-                        .id(replace_id)
-                        .desired_width(190.0)
-                        .hint_text("Replace"),
-                );
+                super::tab_field::show(ui, replace_id, &mut self.replacement, |field| {
+                    field.desired_width(190.0).hint_text("Replace")
+                });
                 let ready = self.matches(doc).is_some_and(|matches| !matches.is_empty()) && self.edit_rx.is_none();
                 let one = ui.add_enabled(ready, egui::Button::new("Replace")).clicked();
                 let all = ui.add_enabled(ready, egui::Button::new("Replace all")).clicked();

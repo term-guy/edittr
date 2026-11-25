@@ -24,6 +24,7 @@ mod search_replace;
 mod semantic;
 mod session;
 mod settings_page;
+mod tab_field;
 #[cfg(feature = "tour")]
 mod tour;
 
@@ -107,7 +108,8 @@ impl Doc {
             return None;
         }
         let sel: String = self.text.chars().skip(a).take(b - a).collect();
-        (!sel.contains('\n') && !sel.trim().is_empty()).then_some(sel)
+        // Whitespace counts too: a selected tab or run of spaces is a useful search.
+        (!sel.contains('\n')).then_some(sel)
     }
 
     fn ext(&self) -> String {
@@ -1729,21 +1731,21 @@ impl App {
         ui.label(RichText::new("SEARCH").small().strong());
         ui.separator();
         let st = &mut self.search;
-        let r = ui.add(
-            egui::TextEdit::singleline(&mut st.opts.query)
-                .hint_text("Search in files")
-                .desired_width(f32::INFINITY),
-        );
+        let query_id = ui.make_persistent_id("search-in-files-query");
+        let r = tab_field::show(ui, query_id, &mut st.opts.query, |field| {
+            field.hint_text("Search in files").desired_width(f32::INFINITY)
+        })
+        .response
+        .response;
         if std::mem::take(&mut st.focus) {
             r.request_focus();
         }
         let enter = r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
         if self.search_replace.shown {
-            ui.add(
-                egui::TextEdit::singleline(&mut self.search_replace.text)
-                    .hint_text("Replace in files")
-                    .desired_width(f32::INFINITY),
-            );
+            let replace_id = ui.make_persistent_id("search-in-files-replacement");
+            tab_field::show(ui, replace_id, &mut self.search_replace.text, |field| {
+                field.hint_text("Replace in files").desired_width(f32::INFINITY)
+            });
         }
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 2.0;

@@ -86,9 +86,33 @@ pub fn project_edit(text: &str, re: &Regex, opts: &Options, replacement: &str) -
     edit.finish(None)
 }
 
+/// Regex replacements understand `\t`, `\n` and `\\` (a tab, a line break, a backslash);
+/// other backslashes stay as typed.
+fn unescape(replacement: &str) -> String {
+    let mut out = String::with_capacity(replacement.len());
+    let mut chars = replacement.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('t') => out.push('\t'),
+            Some('n') => out.push('\n'),
+            Some('\\') => out.push('\\'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
 struct Builder<'a> {
     original: &'a str,
-    replacement: &'a str,
+    replacement: std::borrow::Cow<'a, str>,
     expand: bool,
     output: String,
     copied: usize,
@@ -99,7 +123,7 @@ impl<'a> Builder<'a> {
     fn new(original: &'a str, replacement: &'a str, expand: bool) -> Self {
         Self {
             original,
-            replacement,
+            replacement: if expand { unescape(replacement).into() } else { replacement.into() },
             expand,
             output: String::new(),
             copied: 0,
@@ -114,9 +138,9 @@ impl<'a> Builder<'a> {
         }
         self.output.push_str(&self.original[self.copied..offset + m.start()]);
         if self.expand {
-            caps.expand(self.replacement, &mut self.output);
+            caps.expand(&self.replacement, &mut self.output);
         } else {
-            self.output.push_str(self.replacement);
+            self.output.push_str(&self.replacement);
         }
         self.copied = offset + m.end();
         self.count += 1;
@@ -145,6 +169,25 @@ mod tests {
             query: query.into(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn tabs_find_and_replace() {
+        // A literal tab in the query and the replacement (typed with Ctrl+Tab).
+        let edit = document_edit("a\tb\tc", &opts("\t"), "  ", None).unwrap().unwrap();
+        assert_eq!(edit.text, "a  b  c");
+        let edit = document_edit("a    b", &opts("    "), "\t", None).unwrap().unwrap();
+        assert_eq!(edit.text, "a\tb");
+        // Regex: \t finds tabs, and \t / \n / \\ in the replacement are a tab, a line break, a backslash.
+        let mut o = opts(r"^( +)(\w)");
+        o.regex = true;
+        let edit = document_edit("    x\n  y", &o, r"\t$2", None).unwrap().unwrap();
+        assert_eq!(edit.text, "\tx\n\ty");
+        let mut o = opts(r"\t");
+        o.regex = true;
+        assert_eq!(document_edit("a\tb", &o, r"\n\\\q", None).unwrap().unwrap().text, "a\n\\\\qb");
+        // Without regex the replacement is literal.
+        assert_eq!(document_edit("a\tb", &opts("\t"), r"\t", None).unwrap().unwrap().text, r"a\tb");
     }
 
     #[test]
