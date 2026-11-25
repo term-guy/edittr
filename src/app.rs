@@ -2736,14 +2736,14 @@ impl App {
                             .on_hover_text(format!("Show {} in the Explorer", dir.display()))
                             .clicked()
                     };
-                    if crumb(ui, dir_name(root), root) {
-                        reveal = Some(root.to_path_buf());
-                    }
+                    // Relative to the project folder, without its name: `models > cosa.c`.
                     let mut dir = root.to_path_buf();
                     let rel = path.strip_prefix(root).unwrap_or(&path);
                     let parts: Vec<_> = rel.iter().collect();
                     for (i, part) in parts.iter().enumerate() {
-                        sep(ui);
+                        if i > 0 {
+                            sep(ui);
+                        }
                         dir.push(part);
                         let name = part.to_string_lossy().into_owned();
                         if i + 1 == parts.len() {
