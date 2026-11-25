@@ -26,7 +26,6 @@ mod settings_page;
 mod tour;
 
 use crate::commands::{self, Command, Setting};
-use crate::editor;
 use crate::graph::{Graph, secondary_text_color};
 use crate::icons as ic;
 use crate::search::{self, FileHits};
@@ -35,6 +34,7 @@ use crate::settings::{Settings, SettingsWriter};
 use crate::vcs::{self, FileChange, Status, Vcs};
 use crate::watch::{Changes, IGNORED_DIRS, Watcher};
 use crate::{blame, highlight};
+use crate::{editor, fonts};
 use crate::{goto, installer, lsp, symbols, workspace};
 use eframe::egui::{self, Color32, Key, Modifiers, RichText};
 use egui_extras::syntax_highlighting::{self, CodeTheme};
@@ -451,6 +451,7 @@ pub struct App {
     install_prompt: Option<&'static str>,
     install_declined: HashSet<&'static str>,
     settings: Settings,
+    fonts: fonts::Fonts,
     document_save: document_save::DocumentSave,
     settings_writer: SettingsWriter,
     sessions: session::Sessions,
@@ -474,7 +475,8 @@ impl App {
         settings_writer: SettingsWriter,
         session_writer: Option<Writer>,
     ) -> Self {
-        ic::install(&cc.egui_ctx, settings.tab_size);
+        let mut fonts = fonts::Fonts::default();
+        fonts.start(&settings, &cc.egui_ctx);
         highlight::warm_up(cc.egui_ctx.clone());
         cc.egui_ctx.set_theme(settings.themes.preference);
         cc.egui_ctx.global_style_mut(|s| {
@@ -555,6 +557,7 @@ impl App {
             install_prompt: None,
             install_declined: HashSet::new(),
             settings,
+            fonts,
             settings_writer,
             sessions: session::Sessions::new(session_writer, startup.window.clone()),
             changes_collapsed: session::FolderSet::default(),
@@ -894,6 +897,9 @@ impl App {
     }
 
     fn poll_background(&mut self, ctx: &egui::Context) {
+        if self.fonts.poll(&mut self.settings, ctx) {
+            self.save_settings(ctx);
+        }
         self.poll_open_files();
         self.poll_file_history();
         self.poll_hex_tabs(ctx);
@@ -1118,7 +1124,7 @@ impl App {
             return;
         }
         let diags = self.squiggles_for(si, ui.visuals());
-        let settings = self.settings;
+        let settings = &self.settings;
         let (mut close, mut goto, mut context_command) = (false, None, None);
         egui::Panel::right("split-pane")
             .resizable(true)
@@ -1372,7 +1378,7 @@ impl App {
             return;
         }
         self.settings.tab_size = n;
-        ic::install(&self.ctx, n);
+        self.fonts.install(&self.settings, &self.ctx);
         self.save_settings(&self.ctx.clone());
         self.message = format!("Tab size: {n}");
     }
@@ -1841,7 +1847,13 @@ impl App {
         let mut replace_file = None;
         let mut open = None;
         let mut ignore = None;
-        let row_h = 20.0;
+        let font = egui::TextStyle::Body.resolve(ui.style());
+        let mut mono = egui::TextStyle::Monospace.resolve(ui.style());
+        mono.size *= 12.0 / 13.0;
+        let row_h = ui
+            .fonts_mut(|f| f.row_height(&font).max(f.row_height(&mono)))
+            .max(ui.spacing().interact_size.y);
+        let count_font = egui::FontId::proportional(font.size * (11.0 / 13.0));
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show_rows(ui, row_h, rows.len(), |ui, range| {
@@ -1867,7 +1879,6 @@ impl App {
                         painter.rect_filled(rect, 2.0, vis.widgets.hovered.weak_bg_fill);
                     }
                     let y = rect.center().y;
-                    let font = egui::FontId::proportional(13.0);
                     match *row {
                         SearchRow::File(fi) => {
                             let f = &st.results[fi];
@@ -1889,7 +1900,7 @@ impl App {
                             let g = painter.layout_job(job);
                             painter.galley(egui::pos2(rect.left() + 2.0, y - g.size().y / 2.0), g, vis.text_color());
                             let count = f.hits.len().to_string();
-                            let cg = painter.layout_no_wrap(count, egui::FontId::proportional(11.0), vis.text_color());
+                            let cg = painter.layout_no_wrap(count, count_font.clone(), vis.text_color());
                             let pill = egui::Rect::from_center_size(
                                 egui::pos2(rect.right() - 6.0 - cg.size().x / 2.0 - 4.0, y),
                                 cg.size() + egui::vec2(10.0, 2.0),
@@ -1915,7 +1926,6 @@ impl App {
                         }
                         SearchRow::Hit(fi, hi) => {
                             let h = &st.results[fi].hits[hi];
-                            let mono = egui::FontId::monospace(12.0);
                             let mut job = egui::text::LayoutJob::default();
                             let fmt = |c: Color32, bg: Color32| egui::TextFormat {
                                 font_id: mono.clone(),
@@ -2042,7 +2052,7 @@ impl App {
     }
 
     fn save_settings(&mut self, ctx: &egui::Context) {
-        if let Err(err) = self.settings_writer.save(self.settings, ctx) {
+        if let Err(err) = self.settings_writer.save(self.settings.clone(), ctx) {
             self.message = format!("Could not save settings: {err}");
         }
     }
@@ -2808,7 +2818,7 @@ impl App {
                     {
                         doc.ed.set_sticky_outline(doc.version, scopes);
                     }
-                    let out = editor(ui, doc, self.settings, inline, &diags, &marks, 0, &[], &global_marks);
+                    let out = editor(ui, doc, &self.settings, inline, &diags, &marks, 0, &[], &global_marks);
                     if let Some(idx) = out.goto {
                         goto_at = Some(idx);
                     }
@@ -3505,7 +3515,7 @@ mod folder_picker {
 fn editor(
     ui: &mut egui::Ui,
     doc: &mut Doc,
-    settings: Settings,
+    settings: &Settings,
     inline: Option<String>,
     diags: &[(usize, usize, usize, usize, Color32, String)],
     find_marks: &[std::ops::Range<usize>],
@@ -3682,7 +3692,7 @@ fn large_view(ui: &mut egui::Ui, v: &mut crate::large::Viewer) {
         }
     });
     ui.separator();
-    let font = egui::TextStyle::Monospace.resolve(ui.style());
+    let font = fonts::editor_font(ui.style());
     let row_h = ui.fonts_mut(|f| f.row_height(&font));
     let digits = lines.to_string().len().max(4);
     let current = v.matches.get(v.current).copied();
@@ -3740,13 +3750,14 @@ fn diff_view(ui: &mut egui::Ui, lines: &[String], id: &str) {
             Color32::from_rgb(0x09, 0x69, 0xda),
         )
     };
-    let row_h = ui.text_style_height(&egui::TextStyle::Monospace);
+    let font = fonts::editor_font(ui.style());
+    let row_h = ui.fonts_mut(|f| f.row_height(&font));
     egui::ScrollArea::both()
         .id_salt(id)
         .auto_shrink([false, false])
         .show_rows(ui, row_h, lines.len(), |ui, range| {
             for line in &lines[range] {
-                let mut t = RichText::new(line).monospace();
+                let mut t = RichText::new(line).font(font.clone());
                 if line.starts_with("+++") || line.starts_with("---") || line.starts_with("diff ") || line.starts_with("commit ") {
                     t = t.strong();
                 } else if line.starts_with('+') {
@@ -3880,7 +3891,7 @@ fn side_by_side_view(ui: &mut egui::Ui, d: &mut DiffTab) {
     let empty_bg = ui.visuals().faint_bg_color;
     let weak = ui.visuals().weak_text_color();
     let theme = CodeTheme::from_style(ui.style());
-    let font = egui::FontId::monospace(13.0);
+    let font = fonts::editor_font(ui.style());
     let row_h = ui.fonts_mut(|f| f.row_height(&font)) + 2.0;
     let gutter = ui.fonts_mut(|f| f.glyph_width(&font, '0')) * 6.0;
 
@@ -3942,6 +3953,9 @@ fn side_by_side_view(ui: &mut egui::Ui, d: &mut DiffTab) {
                 );
                 let mut job = syntax_highlighting::highlight(ui.ctx(), ui.style(), &theme, &side.text, &d.lang);
                 job.wrap.max_width = f32::INFINITY;
+                for section in &mut job.sections {
+                    section.format.font_id = font.clone();
+                }
                 let galley = ui.fonts_mut(|f| f.layout_job(job));
                 widest = widest.max(galley.size().x);
                 let text_clip = egui::Rect::from_min_max(egui::pos2(half.left() + gutter, half.top()), half.max);

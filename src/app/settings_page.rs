@@ -2,12 +2,14 @@
 
 use super::*;
 use crate::commands::Setting;
+use crate::settings::{DEFAULT_FONT_SIZE, FONT_SIZE_RANGE, FontChoice};
 use crate::theme::{PRESETS, Palette, Part};
 
 enum Control {
     Toggle(Setting),
     TabSize,
     Theme,
+    Font(fonts::Target),
     Action(Command, &'static str),
 }
 
@@ -28,6 +30,11 @@ const SECTIONS: &[(&str, &[Item])] = &[
         "Appearance",
         &[
             item(Theme, "Theme", "Follow the system, or always use the dark or light theme."),
+            item(
+                Font(fonts::Target::Ui),
+                "UI font",
+                "Font family and size for menus, panels and dialogs.",
+            ),
             item(
                 Toggle(Setting::Minimap),
                 "Minimap",
@@ -62,6 +69,11 @@ const SECTIONS: &[(&str, &[Item])] = &[
                 TabSize,
                 "Tab size",
                 "Width of a tab character, and the spaces Tab inserts in files without an indentation style of their own.",
+            ),
+            item(
+                Font(fonts::Target::Editor),
+                "Editor font",
+                "Font family and size for code, line numbers and diffs.",
             ),
             item(
                 Toggle(Setting::FormatOnSave),
@@ -136,6 +148,7 @@ const SECTIONS: &[(&str, &[Item])] = &[
 pub(super) struct Page {
     pub(super) filter: String,
     focus: bool,
+    font_search: [String; 2],
 }
 
 impl Page {
@@ -227,12 +240,13 @@ impl App {
                             self.settings_page.filter.clear();
                         }
                         let filter = self.settings_page.filter.clone();
+                        let section_size = egui::TextStyle::Body.resolve(ui.style()).size * (15.0 / 13.0);
                         let mut shown = 0;
                         for (section, items) in SECTIONS {
                             let items: Vec<_> = items.iter().filter(|item| matches(&filter, section, item)).collect();
                             if !items.is_empty() {
                                 ui.add_space(18.0);
-                                ui.label(RichText::new(*section).strong().size(15.0));
+                                ui.label(RichText::new(*section).strong().size(section_size));
                                 ui.add_space(2.0);
                                 for item in items {
                                     shown += 1;
@@ -243,7 +257,7 @@ impl App {
                             if *section == "Appearance" && theme_matches(&filter) {
                                 shown += 1;
                                 ui.add_space(12.0);
-                                egui::CollapsingHeader::new(RichText::new("Theme editor").strong().size(15.0))
+                                egui::CollapsingHeader::new(RichText::new("Theme editor").strong().size(section_size))
                                     .open((!filter.trim().is_empty()).then_some(true))
                                     .show(ui, |ui| self.theme_editor(ui));
                             }
@@ -357,9 +371,20 @@ impl App {
     }
 
     fn settings_row(&mut self, ui: &mut egui::Ui, item: &Item, run: &mut Option<Command>, tab_size: &mut Option<usize>) {
-        let control_width = 150.0;
-        ui.horizontal(|ui| {
-            let text_width = (ui.available_width() - control_width - 12.0).max(120.0);
+        let font_control = matches!(item.control, Font(_));
+        let control_width = if font_control { 250.0 } else { 150.0 };
+        let controls_below = font_control && ui.available_width() < 390.0;
+        let layout = if controls_below {
+            egui::Layout::top_down(egui::Align::Min)
+        } else {
+            egui::Layout::left_to_right(egui::Align::Center)
+        };
+        ui.with_layout(layout, |ui| {
+            let text_width = if controls_below {
+                ui.available_width()
+            } else {
+                (ui.available_width() - control_width - 12.0).max(120.0)
+            };
             ui.vertical(|ui| {
                 ui.set_width(text_width);
                 ui.add_space(4.0);
@@ -381,6 +406,7 @@ impl App {
                         *tab_size = Some(n);
                     }
                 }
+                Font(target) => self.font_controls(ui, target),
                 Theme => {
                     let mut preference = self.settings.themes.preference;
                     let before = preference;
@@ -402,6 +428,107 @@ impl App {
                 }
             });
         });
+    }
+
+    fn font_controls(&mut self, ui: &mut egui::Ui, target: fonts::Target) {
+        let ctx = ui.ctx().clone();
+        let size = target.size(&mut self.settings);
+        let mut size_changed = ui
+            .add(egui::DragValue::new(size).range(FONT_SIZE_RANGE).suffix(" pt"))
+            .on_hover_text(format!("Default size is {DEFAULT_FONT_SIZE} pt"))
+            .changed();
+        let saved = target.choice(&mut self.settings);
+        let current = saved.as_ref().map_or("Default", |choice| choice.family.as_str());
+        let salt = ("font-picker", target);
+        let was_open = egui::ComboBox::is_open(ui.ctx(), ui.make_persistent_id(salt));
+        let search = &mut self.settings_page.font_search[target as usize];
+        let picker = egui::ComboBox::from_id_salt(salt)
+            .width(ui.available_width().clamp(60.0, 168.0))
+            .height(340.0)
+            .wrap_mode(egui::TextWrapMode::Truncate)
+            .selected_text(current)
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .show_ui(ui, |ui| {
+                self.fonts.request_list(&ctx);
+                if !was_open {
+                    search.clear();
+                }
+                let response = ui.add(
+                    egui::TextEdit::singleline(search)
+                        .hint_text("Search fonts")
+                        .desired_width(f32::INFINITY),
+                );
+                if !was_open {
+                    response.request_focus();
+                }
+                if ui
+                    .selectable_label(saved.is_none(), "Default")
+                    .on_hover_text("Restore the bundled font and size")
+                    .clicked()
+                {
+                    ui.close();
+                    return Some(None);
+                }
+                let Some(families) = &self.fonts.families else {
+                    ui.spinner();
+                    return None;
+                };
+                let query = search.to_lowercase();
+                let mut matches: Vec<_> = families.iter().filter(|family| family.search_name.contains(query.trim())).collect();
+                if matches!(target, fonts::Target::Editor) {
+                    matches.sort_by_key(|family| !family.monospace);
+                }
+                if matches.is_empty() {
+                    ui.weak("No matching fonts");
+                }
+                let row_height = (ui.text_style_height(&egui::TextStyle::Button) + 2.0 * ui.spacing().button_padding.y)
+                    .max(ui.spacing().interact_size.y);
+                let mut selected = None;
+                let mut scroll = egui::ScrollArea::vertical().id_salt("font-families").max_height(250.0);
+                if response.changed() {
+                    scroll = scroll.vertical_scroll_offset(0.0);
+                }
+                scroll.show_rows(ui, row_height, matches.len(), |ui, range| {
+                    for family in &matches[range] {
+                        if ui
+                            .add_sized(
+                                [ui.available_width(), row_height],
+                                egui::Button::selectable(saved.is_some() && current == family.name, &family.name).truncate(),
+                            )
+                            .on_hover_text(&family.name)
+                            .clicked()
+                        {
+                            ui.close();
+                            selected = Some(Some(FontChoice {
+                                family: family.name.clone(),
+                                file: family.file.clone(),
+                            }));
+                        }
+                    }
+                });
+                selected
+            });
+        let mut family_changed = false;
+        if let Some(choice) = picker.inner.flatten() {
+            let reset = choice.is_none();
+            if choice.as_ref().map(|font| &font.family) != saved.as_ref().map(|font| &font.family) {
+                saved.clone_from(&choice);
+                self.fonts.select(target, choice, &ctx);
+                if reset {
+                    self.fonts.install(&self.settings, &ctx);
+                }
+                family_changed = true;
+            }
+            if reset {
+                let size = target.size(&mut self.settings);
+                size_changed |= *size != DEFAULT_FONT_SIZE;
+                *size = DEFAULT_FONT_SIZE;
+            }
+        }
+        if size_changed || family_changed {
+            self.fonts.apply_sizes(&self.settings, &ctx);
+            self.save_settings(&ctx);
+        }
     }
 }
 
@@ -444,7 +571,7 @@ fn theme_preview(ui: &mut egui::Ui, palette: &Palette) {
         ],
         &[(Bracket1, "}")],
     ];
-    let font = egui::TextStyle::Monospace.resolve(ui.style());
+    let font = fonts::editor_font(ui.style());
     let row = ui.fonts_mut(|fonts| fonts.row_height(&font));
     let height = row * LINES.len() as f32 + 12.0;
     let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), height), egui::Sense::hover());

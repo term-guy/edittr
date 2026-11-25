@@ -417,7 +417,7 @@ impl App {
             return;
         }
         let mut open = None;
-        let row_height = 20.0;
+        let row_height = ui.spacing().interact_size.y.max(ui.text_style_height(&egui::TextStyle::Body));
         egui::ScrollArea::vertical()
             .id_salt("problems")
             .auto_shrink([false, false])

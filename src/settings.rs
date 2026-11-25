@@ -11,7 +11,22 @@ use eframe::egui;
 use crate::outline::{CollapsedGroups, Group};
 use crate::theme::{Palette, Themes};
 
-#[derive(Clone, Copy)]
+pub(crate) const DEFAULT_FONT_SIZE: u8 = 13;
+pub(crate) const FONT_SIZE_RANGE: std::ops::RangeInclusive<u8> = 8..=32;
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct FontChoice {
+    pub(crate) family: String,
+    pub(crate) file: Option<FontFile>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct FontFile {
+    pub(crate) path: String,
+    pub(crate) index: u32,
+}
+
+#[derive(Clone)]
 pub(crate) struct Settings {
     pub(crate) themes: Themes,
     pub(crate) changes_tree: bool,
@@ -39,6 +54,10 @@ pub(crate) struct Settings {
     /// Width of a tab character, and the spaces Tab inserts in files without an
     /// indentation style of their own.
     pub(crate) tab_size: usize,
+    pub(crate) editor_font: Option<FontChoice>,
+    pub(crate) editor_font_size: u8,
+    pub(crate) ui_font: Option<FontChoice>,
+    pub(crate) ui_font_size: u8,
 }
 
 impl Default for Settings {
@@ -62,6 +81,10 @@ impl Default for Settings {
             restore_previous_session: true,
             reopen_last_folder: false,
             tab_size: 4,
+            editor_font: None,
+            editor_font_size: DEFAULT_FONT_SIZE,
+            ui_font: None,
+            ui_font_size: DEFAULT_FONT_SIZE,
         }
     }
 }
@@ -112,6 +135,27 @@ impl Settings {
         let mut settings = Self::default();
         for (key, value) in text.lines().filter_map(entry) {
             match key {
+                "editor_font" | "ui_font" => {
+                    let font = serde_json::from_str(value).ok();
+                    if key == "editor_font" {
+                        settings.editor_font = font;
+                    } else {
+                        settings.ui_font = font;
+                    }
+                    continue;
+                }
+                "editor_font_size" | "ui_font_size" => {
+                    if let Ok(size) = value.parse()
+                        && FONT_SIZE_RANGE.contains(&size)
+                    {
+                        if key == "editor_font_size" {
+                            settings.editor_font_size = size;
+                        } else {
+                            settings.ui_font_size = size;
+                        }
+                    }
+                    continue;
+                }
                 "theme_preference" => {
                     settings.themes.preference = match value {
                         "dark" => egui::ThemePreference::Dark,
@@ -204,6 +248,10 @@ impl Settings {
                         | "restore_previous_session"
                         | "reopen_last_folder"
                         | "tab_size"
+                        | "editor_font"
+                        | "editor_font_size"
+                        | "ui_font"
+                        | "ui_font_size"
                         | "format_on_save"
                         | "show_outline"
                         | "outline_expanded"
@@ -233,6 +281,18 @@ impl Settings {
         text.push_str(&format!("restore_previous_session={}\n", self.restore_previous_session));
         text.push_str(&format!("reopen_last_folder={}\n", self.reopen_last_folder));
         text.push_str(&format!("tab_size={}\n", self.tab_size));
+        for (key, font, size) in [
+            ("editor_font", &self.editor_font, self.editor_font_size),
+            ("ui_font", &self.ui_font, self.ui_font_size),
+        ] {
+            if let Some(font) = font {
+                text.push_str(&format!(
+                    "{key}={}\n",
+                    serde_json::to_string(font).expect("font selection is serializable")
+                ));
+            }
+            text.push_str(&format!("{key}_size={size}\n"));
+        }
         text.push_str(&format!("format_on_save={}\n", self.format_on_save));
         text.push_str(&format!("show_outline={}\n", self.show_outline));
         text.push_str(&format!("outline_expanded={}\n", self.outline_expanded));
@@ -306,6 +366,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn font_settings_round_trip_with_collection_indices_and_unknown_keys() {
+        let previous = concat!(
+            " editor_font = {\"family\":\"Example Mono\",\"file\":{\"path\":\"C:\\\\Fonts\\\\Fonts=Mono.ttc\",\"index\":3}}\n",
+            "ui_font={\"family\":\"Example Sans\",\"file\":null}\n",
+            "editor_font_size=19\n",
+            "ui_font_size=16\n",
+            "future_option=true\n"
+        );
+        let settings = Settings::parse(previous);
+        let parsed = Settings::parse(&settings.format(previous));
+        let editor = parsed.editor_font.as_ref().unwrap();
+        assert_eq!(editor.family, "Example Mono");
+        assert_eq!(editor.file.as_ref().unwrap().path, r"C:\Fonts\Fonts=Mono.ttc");
+        assert_eq!(editor.file.as_ref().unwrap().index, 3);
+        assert_eq!(parsed.editor_font, settings.editor_font);
+        assert_eq!(parsed.ui_font, settings.ui_font);
+        assert_eq!((parsed.editor_font_size, parsed.ui_font_size), (19, 16));
+
+        let text = settings.format(previous);
+        assert_eq!(text.matches("editor_font=").count(), 1);
+        assert!(text.contains("future_option=true\n"));
+        let defaults = Settings::parse("editor_font_size=7\nui_font_size=33\n");
+        assert!(defaults.editor_font.is_none() && defaults.ui_font.is_none());
+        assert_eq!(
+            (defaults.editor_font_size, defaults.ui_font_size),
+            (DEFAULT_FONT_SIZE, DEFAULT_FONT_SIZE)
+        );
+        let text = defaults.format(&text);
+        assert!(!text.contains("editor_font=") && !text.contains("ui_font="));
+        assert!(text.contains("future_option=true\n"));
+    }
+
+    #[test]
     fn theme_presets_and_custom_colors_round_trip() {
         use crate::theme::{PRESETS, Part};
         for (i, preset) in PRESETS.iter().enumerate() {
@@ -354,7 +447,7 @@ mod tests {
                 let settings = Settings {
                     show_outline,
                     outline_expanded,
-                    ..defaults
+                    ..defaults.clone()
                 };
                 let text = settings.format(" show_outline = false\noutline_expanded=false\n");
                 assert_eq!(text.matches("show_outline=").count(), 1);
@@ -411,7 +504,7 @@ mod tests {
         let text = settings.format(previous);
         assert_eq!(
             text,
-            "future_key=one=two\nfuture_key = three\n# A comment\nchanges_tree=false\nhighlight_line=false\nshow_whitespace=false\ndiff_ignore_eol=true\ninline_blame=true\nminimap=true\nbracket_colors=true\nsemantic_highlighting=true\nsticky_scroll=true\nrestore_previous_session=true\nreopen_last_folder=false\ntab_size=4\nformat_on_save=false\nshow_outline=true\noutline_expanded=true\noutline_grouped=true\noutline_collapsed_groups=\ntheme_preference=system\ntheme_dark=edittr-dark\ntheme_light=edittr-light\n"
+            "future_key=one=two\nfuture_key = three\n# A comment\nchanges_tree=false\nhighlight_line=false\nshow_whitespace=false\ndiff_ignore_eol=true\ninline_blame=true\nminimap=true\nbracket_colors=true\nsemantic_highlighting=true\nsticky_scroll=true\nrestore_previous_session=true\nreopen_last_folder=false\ntab_size=4\neditor_font_size=13\nui_font_size=13\nformat_on_save=false\nshow_outline=true\noutline_expanded=true\noutline_grouped=true\noutline_collapsed_groups=\ntheme_preference=system\ntheme_dark=edittr-dark\ntheme_light=edittr-light\n"
         );
         assert!(!Settings::parse(&text).changes_tree);
     }
