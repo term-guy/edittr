@@ -38,7 +38,8 @@ pub struct State {
     /// Selections; the last one is the primary (it scrolls into view, gets the IME).
     pub sels: Vec<Sel>,
     pub history: History,
-    index: LineIndex,
+    /// Shared so a frame can hold it without copying ~16 bytes per line.
+    index: Arc<LineIndex>,
     index_version: Option<u64>,
     /// x the caret tries to keep while moving up/down.
     preferred_x: Option<f32>,
@@ -54,7 +55,7 @@ pub struct State {
     /// Folded regions, by header line.
     pub folded: BTreeSet<usize>,
     regions: Vec<Range<usize>>,
-    view: fold::View,
+    view: Arc<fold::View>,
     sticky: sticky::Cache,
     /// (version, folded) the regions/view were computed for.
     view_key: Option<(u64, Vec<usize>)>,
@@ -81,10 +82,16 @@ impl State {
         self.sels.last().copied().unwrap_or(Sel::caret(0))
     }
 
+    /// The line index as a shared handle, for holding it while `self` changes.
+    fn index_arc(&mut self, text: &str, version: u64) -> Arc<LineIndex> {
+        self.index(text, version);
+        self.index.clone()
+    }
+
     /// Line index for `text` at `version` (rebuilt after any change).
     pub fn index(&mut self, text: &str, version: u64) -> &LineIndex {
         if self.index_version != Some(version) {
-            self.index = LineIndex::new(text);
+            self.index = Arc::new(LineIndex::new(text));
             self.index_version = Some(version);
             // The text may have been changed elsewhere (reload, replace): keep selections valid.
             let fix = |mut b: usize| {
@@ -108,13 +115,13 @@ impl State {
         if self.view_key.as_ref().is_some_and(|(v, f)| *v == version && *f == folded) {
             return;
         }
-        let ix = self.index(text, version).clone();
+        let ix = self.index_arc(text, version);
         if self.view_key.as_ref().is_none_or(|(v, _)| *v != version) {
             self.regions = fold::regions(text, &ix);
             let starts: BTreeSet<usize> = self.regions.iter().map(|r| r.start).collect();
             self.folded.retain(|l| starts.contains(l));
         }
-        self.view = fold::View::new(ix.lines(), &self.regions, &self.folded);
+        self.view = Arc::new(fold::View::new(ix.lines(), &self.regions, &self.folded));
         let folded: Vec<usize> = self.folded.iter().copied().collect();
         self.view_key = Some((version, folded));
     }
@@ -466,7 +473,7 @@ pub fn show(
     st.update_view(text, *version);
     st.unfold_carets();
     st.update_view(text, *version);
-    let ix = st.index(text, *version).clone();
+    let ix = st.index_arc(text, *version);
     let view = st.view.clone();
     if opts.sticky_scroll {
         st.sticky.update(*version, text, &ix, &st.regions);
@@ -1188,7 +1195,7 @@ fn handle_event(ui: &egui::Ui, st: &mut State, text: &mut String, version: &mut 
             }
         }
         Event::Copy | Event::Cut => {
-            let ix = st.index(text, *version).clone();
+            let ix = st.index_arc(text, *version);
             let whole_lines = st.sels.iter().all(|s| s.is_empty());
             let ranges: Vec<Range<usize>> = if whole_lines {
                 st.sels.iter().map(|s| full_line(&ix, text, ix.line_of_byte(s.head))).collect()
@@ -1273,7 +1280,7 @@ fn insert(st: &mut State, text: &mut String, t: &str, kind: Kind) {
 }
 
 fn key_press(ui: &egui::Ui, st: &mut State, text: &mut String, version: &mut u64, k: &KeyCtx, key: Key, m: egui::Modifiers) -> bool {
-    let ix = st.index(text, *version).clone();
+    let ix = st.index_arc(text, *version);
     let word = if k.is_mac { m.alt } else { m.ctrl };
     let line_mod = k.is_mac && m.mac_cmd;
     let shift = m.shift;

@@ -165,14 +165,22 @@ fn syntax(lang: &str) -> Option<&'static SyntaxReference> {
         })
 }
 
-/// Lines above this are freed on a background thread: each keeps the parser state at
-/// its start, and freeing ~20k of them took ~60 ms on the UI thread (on a theme switch
-/// or when closing the tab).
+/// Lines above this are freed on a background thread, a batch at a time: each keeps the
+/// parser state at its start, and freeing ~20k of them took ~60 ms on the UI thread (on
+/// a theme switch or when closing the tab).
 const BACKGROUND_DROP_LINES: usize = 2000;
 
 fn drop_in_background(lines: Vec<Line>) {
     if lines.len() > BACKGROUND_DROP_LINES {
-        std::thread::spawn(move || drop(lines));
+        std::thread::spawn(move || {
+            // In small batches: freeing everything at once kept the allocator busy and
+            // stalled the UI thread's own allocations for ~12 ms.
+            let mut lines = lines;
+            while !lines.is_empty() {
+                lines.truncate(lines.len().saturating_sub(256));
+                std::thread::sleep(std::time::Duration::from_micros(500));
+            }
+        });
     }
 }
 
