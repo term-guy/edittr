@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::commands::Setting;
-use crate::settings::{DEFAULT_FONT_SIZE, FONT_SIZE_RANGE, FontChoice};
+use crate::settings::{DEFAULT_BREADCRUMB_FONT_SIZE, DEFAULT_FONT_SIZE, FONT_SIZE_RANGE, FontChoice};
 use crate::theme::{PRESETS, Palette, Part};
 
 enum Control {
@@ -10,6 +10,7 @@ enum Control {
     TabSize,
     Theme,
     Font(fonts::Target),
+    BreadcrumbSize,
     Action(Command, &'static str),
 }
 
@@ -34,6 +35,11 @@ const SECTIONS: &[(&str, &[Item])] = &[
                 Font(fonts::Target::Ui),
                 "UI font",
                 "Font family and size for menus, panels and dialogs.",
+            ),
+            item(
+                BreadcrumbSize,
+                "Breadcrumbs font size",
+                "Size of the file path shown above the editor.",
             ),
             item(
                 Toggle(Setting::Minimap),
@@ -149,6 +155,8 @@ pub(super) struct Page {
     pub(super) filter: String,
     focus: bool,
     font_search: [String; 2],
+    /// The search box of a just-opened font picker still needs focus (not possible during the popup's invisible sizing pass).
+    font_focus: [bool; 2],
 }
 
 impl Page {
@@ -407,6 +415,17 @@ impl App {
                     }
                 }
                 Font(target) => self.font_controls(ui, target),
+                BreadcrumbSize => {
+                    let size = &mut self.settings.breadcrumb_font_size;
+                    let response = ui
+                        .add(egui::DragValue::new(size).range(FONT_SIZE_RANGE).suffix(" pt"))
+                        .on_hover_text(format!("Default size is {DEFAULT_BREADCRUMB_FONT_SIZE} pt"));
+                    if response.changed() {
+                        let ctx = ui.ctx().clone();
+                        self.fonts.apply_sizes(&self.settings, &ctx);
+                        self.save_settings(&ctx);
+                    }
+                }
                 Theme => {
                     let mut preference = self.settings.themes.preference;
                     let before = preference;
@@ -441,7 +460,8 @@ impl App {
         let current = saved.as_ref().map_or("Default", |choice| choice.family.as_str());
         let salt = ("font-picker", target);
         let was_open = egui::ComboBox::is_open(ui.ctx(), ui.make_persistent_id(salt));
-        let search = &mut self.settings_page.font_search[target as usize];
+        let page = &mut self.settings_page;
+        let (search, focus) = (&mut page.font_search[target as usize], &mut page.font_focus[target as usize]);
         let picker = egui::ComboBox::from_id_salt(salt)
             .width(ui.available_width().clamp(60.0, 168.0))
             .height(340.0)
@@ -452,14 +472,16 @@ impl App {
                 self.fonts.request_list(&ctx);
                 if !was_open {
                     search.clear();
+                    *focus = true;
                 }
                 let response = ui.add(
                     egui::TextEdit::singleline(search)
                         .hint_text("Search fonts")
                         .desired_width(f32::INFINITY),
                 );
-                if !was_open {
+                if *focus && !ui.is_sizing_pass() {
                     response.request_focus();
+                    *focus = false;
                 }
                 if ui
                     .selectable_label(saved.is_none(), "Default")
@@ -469,8 +491,14 @@ impl App {
                     ui.close();
                     return Some(None);
                 }
+                // The list keeps one height while loading and filtering: the popup is sized when it opens and
+                // later frames can't grow it, so a short first frame (fonts still loading) left room for one row.
+                const LIST_HEIGHT: f32 = 250.0;
                 let Some(families) = &self.fonts.families else {
-                    ui.spinner();
+                    ui.allocate_ui(egui::vec2(ui.available_width(), LIST_HEIGHT), |ui| {
+                        ui.set_min_height(LIST_HEIGHT);
+                        ui.spinner();
+                    });
                     return None;
                 };
                 let query = search.to_lowercase();
@@ -478,15 +506,22 @@ impl App {
                 if matches!(target, fonts::Target::Editor) {
                     matches.sort_by_key(|family| !family.monospace);
                 }
-                if matches.is_empty() {
-                    ui.weak("No matching fonts");
-                }
                 let row_height = (ui.text_style_height(&egui::TextStyle::Button) + 2.0 * ui.spacing().button_padding.y)
                     .max(ui.spacing().interact_size.y);
                 let mut selected = None;
-                let mut scroll = egui::ScrollArea::vertical().id_salt("font-families").max_height(250.0);
+                let mut scroll = egui::ScrollArea::vertical()
+                    .id_salt("font-families")
+                    .max_height(LIST_HEIGHT)
+                    .auto_shrink([false, false]);
                 if response.changed() {
                     scroll = scroll.vertical_scroll_offset(0.0);
+                }
+                if matches.is_empty() {
+                    ui.allocate_ui(egui::vec2(ui.available_width(), LIST_HEIGHT), |ui| {
+                        ui.set_min_height(LIST_HEIGHT);
+                        ui.weak("No matching fonts");
+                    });
+                    return None;
                 }
                 scroll.show_rows(ui, row_height, matches.len(), |ui, range| {
                     for family in &matches[range] {

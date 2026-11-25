@@ -70,6 +70,8 @@ struct Doc {
     lang: String,
     /// Pending selection (char range) to reveal on the next frame, e.g. from a search hit.
     goto: Option<(usize, usize)>,
+    /// Reveal `goto` without focusing the editor (the find bar keeps it, or the editor would also type the query).
+    goto_keeps_focus: bool,
     /// Char index of the text cursor (last frame).
     cursor: usize,
     /// Other end of the selection (== cursor when nothing is selected).
@@ -1203,6 +1205,7 @@ impl App {
             text,
             lang,
             goto: None,
+            goto_keeps_focus: false,
             cursor: 0,
             anchor: 0,
             ed: Default::default(),
@@ -2713,18 +2716,19 @@ impl App {
             return;
         };
         let mut reveal = None;
+        let crumb_style = egui::TextStyle::Name(fonts::BREADCRUMB_STYLE.into());
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
             if self.can_preview(self.active) && icon_button(ui, ic::EYE).on_hover_text("Open Preview to the Side").clicked() {
                 self.open_markdown_preview(self.active);
             }
             let sep = |ui: &mut egui::Ui| {
-                ui.weak(ic::CARET_RIGHT);
+                ui.label(RichText::new(ic::CARET_RIGHT).text_style(crumb_style.clone()).weak());
             };
             match self.root.as_deref().filter(|root| path.starts_with(root)) {
                 Some(root) => {
                     let crumb = |ui: &mut egui::Ui, text: String, dir: &Path| {
-                        ui.add(egui::Button::new(RichText::new(text).small()).frame(false))
+                        ui.add(egui::Button::new(RichText::new(text).text_style(crumb_style.clone())).frame(false))
                             .on_hover_text(format!("Show {} in the Explorer", dir.display()))
                             .clicked()
                     };
@@ -2739,14 +2743,14 @@ impl App {
                         dir.push(part);
                         let name = part.to_string_lossy().into_owned();
                         if i + 1 == parts.len() {
-                            ui.label(RichText::new(name).small().strong());
+                            ui.label(RichText::new(name).text_style(crumb_style.clone()).strong());
                         } else if crumb(ui, name, &dir) {
                             reveal = Some(dir.clone());
                         }
                     }
                 }
                 None => {
-                    ui.label(RichText::new(path.display().to_string()).small());
+                    ui.label(RichText::new(path.display().to_string()).text_style(crumb_style.clone()));
                 }
             }
         });
@@ -3610,7 +3614,9 @@ fn editor(
         let ix = doc.ed.index(&doc.text, doc.version);
         let (a, b) = (ix.char_to_byte(&doc.text, a), ix.char_to_byte(&doc.text, b));
         doc.ed.select(a..b);
-        ui.memory_mut(|m| m.request_focus(id));
+        if !std::mem::take(&mut doc.goto_keeps_focus) {
+            ui.memory_mut(|m| m.request_focus(id));
+        }
     }
     let palette = settings.themes.active(ui.visuals().dark_mode);
     let opts = editor::Options {

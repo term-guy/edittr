@@ -307,6 +307,7 @@ impl Find {
         if from.is_some() || step.is_some() {
             let range = &matches[index];
             doc.goto = Some((range.start, range.end));
+            doc.goto_keeps_focus = true;
             self.current = index;
             self.reveal_from = None;
             self.pending_step = None;

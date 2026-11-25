@@ -10,6 +10,8 @@ use std::sync::{
 };
 
 pub(crate) const EDITOR_FAMILY: &str = "Editor";
+/// Text style of the breadcrumbs (file path) above the editor.
+pub(crate) const BREADCRUMB_STYLE: &str = "Breadcrumbs";
 
 #[derive(Clone, Copy, Debug, Hash)]
 pub(crate) enum Target {
@@ -96,6 +98,10 @@ impl Fonts {
         styles.insert(
             TextStyle::Name(EDITOR_FAMILY.into()),
             FontId::new(settings.editor_font_size.into(), family),
+        );
+        styles.insert(
+            TextStyle::Name(BREADCRUMB_STYLE.into()),
+            FontId::new(settings.breadcrumb_font_size.into(), FontFamily::Proportional),
         );
         let min_row_height = egui::style::Spacing::default().interact_size.y;
         ctx.all_styles_mut(|style| {

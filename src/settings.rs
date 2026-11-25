@@ -12,6 +12,8 @@ use crate::outline::{CollapsedGroups, Group};
 use crate::theme::{Palette, Themes};
 
 pub(crate) const DEFAULT_FONT_SIZE: u8 = 13;
+/// Size of the file path above the editor (it used egui's 9 pt `Small` style before).
+pub(crate) const DEFAULT_BREADCRUMB_FONT_SIZE: u8 = 11;
 pub(crate) const FONT_SIZE_RANGE: std::ops::RangeInclusive<u8> = 8..=32;
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -58,6 +60,7 @@ pub(crate) struct Settings {
     pub(crate) editor_font_size: u8,
     pub(crate) ui_font: Option<FontChoice>,
     pub(crate) ui_font_size: u8,
+    pub(crate) breadcrumb_font_size: u8,
 }
 
 impl Default for Settings {
@@ -85,6 +88,7 @@ impl Default for Settings {
             editor_font_size: DEFAULT_FONT_SIZE,
             ui_font: None,
             ui_font_size: DEFAULT_FONT_SIZE,
+            breadcrumb_font_size: DEFAULT_BREADCRUMB_FONT_SIZE,
         }
     }
 }
@@ -144,14 +148,14 @@ impl Settings {
                     }
                     continue;
                 }
-                "editor_font_size" | "ui_font_size" => {
+                "editor_font_size" | "ui_font_size" | "breadcrumb_font_size" => {
                     if let Ok(size) = value.parse()
                         && FONT_SIZE_RANGE.contains(&size)
                     {
-                        if key == "editor_font_size" {
-                            settings.editor_font_size = size;
-                        } else {
-                            settings.ui_font_size = size;
+                        match key {
+                            "editor_font_size" => settings.editor_font_size = size,
+                            "ui_font_size" => settings.ui_font_size = size,
+                            _ => settings.breadcrumb_font_size = size,
                         }
                     }
                     continue;
@@ -252,6 +256,7 @@ impl Settings {
                         | "editor_font_size"
                         | "ui_font"
                         | "ui_font_size"
+                        | "breadcrumb_font_size"
                         | "format_on_save"
                         | "show_outline"
                         | "outline_expanded"
@@ -293,6 +298,7 @@ impl Settings {
             }
             text.push_str(&format!("{key}_size={size}\n"));
         }
+        text.push_str(&format!("breadcrumb_font_size={}\n", self.breadcrumb_font_size));
         text.push_str(&format!("format_on_save={}\n", self.format_on_save));
         text.push_str(&format!("show_outline={}\n", self.show_outline));
         text.push_str(&format!("outline_expanded={}\n", self.outline_expanded));
@@ -504,7 +510,7 @@ mod tests {
         let text = settings.format(previous);
         assert_eq!(
             text,
-            "future_key=one=two\nfuture_key = three\n# A comment\nchanges_tree=false\nhighlight_line=false\nshow_whitespace=false\ndiff_ignore_eol=true\ninline_blame=true\nminimap=true\nbracket_colors=true\nsemantic_highlighting=true\nsticky_scroll=true\nrestore_previous_session=true\nreopen_last_folder=false\ntab_size=4\neditor_font_size=13\nui_font_size=13\nformat_on_save=false\nshow_outline=true\noutline_expanded=true\noutline_grouped=true\noutline_collapsed_groups=\ntheme_preference=system\ntheme_dark=edittr-dark\ntheme_light=edittr-light\n"
+            "future_key=one=two\nfuture_key = three\n# A comment\nchanges_tree=false\nhighlight_line=false\nshow_whitespace=false\ndiff_ignore_eol=true\ninline_blame=true\nminimap=true\nbracket_colors=true\nsemantic_highlighting=true\nsticky_scroll=true\nrestore_previous_session=true\nreopen_last_folder=false\ntab_size=4\neditor_font_size=13\nui_font_size=13\nbreadcrumb_font_size=11\nformat_on_save=false\nshow_outline=true\noutline_expanded=true\noutline_grouped=true\noutline_collapsed_groups=\ntheme_preference=system\ntheme_dark=edittr-dark\ntheme_light=edittr-light\n"
         );
         assert!(!Settings::parse(&text).changes_tree);
     }
