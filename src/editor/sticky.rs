@@ -11,7 +11,9 @@ use std::{
 
 const MAX_HEADERS: usize = 5;
 const NO_LINE: usize = usize::MAX;
-type Headers = [usize; MAX_HEADERS];
+/// Enclosing headers kept per line: more than are shown, so hidden ones can be skipped.
+const CACHED_HEADERS: usize = 16;
+type Headers = [usize; CACHED_HEADERS];
 /// (header line, last line, kind) of the language server's declarations.
 pub(crate) type Scopes = Arc<[(usize, usize, Kind)]>;
 
@@ -272,7 +274,7 @@ impl Cache {
 
     fn headers(&self, line: usize) -> Headers {
         let i = self.entries.partition_point(|&(start, _)| start <= line);
-        if i == 0 { [NO_LINE; MAX_HEADERS] } else { self.entries[i - 1].1 }
+        if i == 0 { [NO_LINE; CACHED_HEADERS] } else { self.entries[i - 1].1 }
     }
 }
 
@@ -296,7 +298,7 @@ fn index(scopes: BTreeMap<usize, usize>) -> Vec<(usize, Headers)> {
                     active.remove(&header);
                 }
             }
-            let mut headers = [NO_LINE; MAX_HEADERS];
+            let mut headers = [NO_LINE; CACHED_HEADERS];
             for (slot, &header) in headers.iter_mut().zip(&active) {
                 *slot = header;
             }
@@ -327,15 +329,34 @@ pub(crate) fn kinds_menu(ui: &mut egui::Ui, shown: Kinds, control_flow: bool) ->
     command
 }
 
+/// What the user did on the pinned lines this frame.
+#[derive(Default)]
+pub(super) struct Interaction {
+    /// Scroll offset to jump to (a pinned line was clicked).
+    pub(super) scroll: Option<f32>,
+    pub(super) command: Option<crate::commands::Command>,
+    /// Stop pinning this line.
+    pub(super) hide: Option<usize>,
+    pub(super) show_hidden: bool,
+}
+
 pub(super) struct Overlay {
     viewport: Rect,
-    headers: Headers,
+    headers: [usize; MAX_HEADERS],
     row_h: f32,
     available: usize,
 }
 
 impl Overlay {
-    pub(super) fn new(cache: &Cache, view: &fold::View, viewport: Rect, row_h: f32, top_row: usize) -> Self {
+    /// `hidden`: lines the user hid from the pinned ones (the next enclosing line takes their place).
+    pub(super) fn new(
+        cache: &Cache,
+        view: &fold::View,
+        viewport: Rect,
+        row_h: f32,
+        top_row: usize,
+        hidden: impl Fn(usize) -> bool,
+    ) -> Self {
         let mut headers = [NO_LINE; MAX_HEADERS];
         let available = ((viewport.height() / row_h).floor() as usize).saturating_sub(1).min(MAX_HEADERS);
         if top_row < view.count() {
@@ -343,7 +364,7 @@ impl Overlay {
             let visible = active
                 .into_iter()
                 .take_while(|&line| line != NO_LINE)
-                .filter(|&line| !view.is_hidden(line));
+                .filter(|&line| !view.is_hidden(line) && !hidden(line));
             for (slot, line) in headers[..available].iter_mut().zip(visible) {
                 *slot = line;
             }
@@ -388,27 +409,41 @@ impl Overlay {
         view: &fold::View,
         shown: Kinds,
         control_flow: bool,
-    ) -> (Option<f32>, Option<crate::commands::Command>) {
+        hidden_lines: usize,
+    ) -> Interaction {
         use crate::commands::{Command, Setting};
-        let (mut clicked, mut command) = (None, None);
+        let mut out = Interaction::default();
         for (line, rect) in self.rows() {
             let response = ui
                 .interact(rect, id.with(("sticky_header", line)), Sense::click())
                 .on_hover_cursor(egui::CursorIcon::PointingHand);
             if response.clicked() {
                 // Leave space for any enclosing headers that will still be pinned after the jump.
-                clicked = Some(view.row(line).saturating_sub(self.available) as f32 * self.row_h);
+                out.scroll = Some(view.row(line).saturating_sub(self.available) as f32 * self.row_h);
             }
             response.context_menu(|ui| {
-                command = command.or(kinds_menu(ui, shown, control_flow));
+                if ui
+                    .button("Hide this line")
+                    .on_hover_text("Stop pinning this line (and identical ones) in this file")
+                    .clicked()
+                {
+                    out.hide = Some(line);
+                    ui.close();
+                }
+                if hidden_lines > 0 && ui.button(format!("Show hidden lines ({hidden_lines})")).clicked() {
+                    out.show_hidden = true;
+                    ui.close();
+                }
+                ui.separator();
+                out.command = out.command.or(kinds_menu(ui, shown, control_flow));
                 ui.separator();
                 if ui.button("Turn off sticky scroll").clicked() {
-                    command = Some(Command::ToggleSetting(Setting::StickyScroll));
+                    out.command = Some(Command::ToggleSetting(Setting::StickyScroll));
                     ui.close();
                 }
             });
         }
-        (clicked, command)
+        out
     }
 
     pub(super) fn paint(&self, lines: &Lines<'_>, text_x: f32, gutter_w: f32, char_w: f32) {
@@ -466,11 +501,11 @@ mod tests {
         let ix = LineIndex::new(text);
         let mut cache = Cache::default();
         cache.update(1, text, &ix, &fold::regions(text, &ix), Kinds::pinned(Kinds::ALL, false));
-        assert_eq!(cache.headers(0), [NO_LINE; MAX_HEADERS]);
-        assert_eq!(cache.headers(1), [0, NO_LINE, NO_LINE, NO_LINE, NO_LINE]);
-        assert_eq!(cache.headers(3), [0, 1, NO_LINE, NO_LINE, NO_LINE]);
-        assert_eq!(cache.headers(6), [0, NO_LINE, NO_LINE, NO_LINE, NO_LINE]);
-        assert_eq!(cache.headers(7), [NO_LINE; MAX_HEADERS]);
+        assert_eq!(cache.headers(0), [NO_LINE; CACHED_HEADERS]);
+        assert_eq!(cache.headers(1)[..3], [0, NO_LINE, NO_LINE]);
+        assert_eq!(cache.headers(3)[..3], [0, 1, NO_LINE]);
+        assert_eq!(cache.headers(6)[..3], [0, NO_LINE, NO_LINE]);
+        assert_eq!(cache.headers(7), [NO_LINE; CACHED_HEADERS]);
     }
 
     #[test]
@@ -536,8 +571,11 @@ void something() {
         let region = 6..14;
         let view = fold::View::new(24, std::slice::from_ref(&region), &folded);
         let viewport = Rect::from_min_size(Pos2::ZERO, egui::vec2(600.0, 300.0));
-        let overlay = Overlay::new(&cache, &view, viewport, 15.0, 7);
+        let overlay = Overlay::new(&cache, &view, viewport, 15.0, 7, |_| false);
         assert_eq!(view.line(7), 14);
         assert_eq!(overlay.rows().map(|(line, _)| line).collect::<Vec<_>>(), [0, 1, 2, 3, 4]);
+        // A hidden line gives its slot to the next enclosing one.
+        let overlay = Overlay::new(&cache, &view, viewport, 15.0, 7, |line| line == 1);
+        assert_eq!(overlay.rows().map(|(line, _)| line).collect::<Vec<_>>(), [0, 2, 3, 4, 5]);
     }
 }

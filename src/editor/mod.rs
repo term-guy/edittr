@@ -64,6 +64,8 @@ pub struct State {
     /// Line (fractional) to put at the top next frame (`scroll_to_line`).
     scroll_line: Option<f32>,
     minimap_drag: bool,
+    /// Lines (trimmed text) the user hid from sticky scroll in this file.
+    sticky_hidden: BTreeSet<String>,
     /// A scroll bar arrow is held: when it scrolls another line.
     arrow_repeat: Option<f64>,
     /// Bracket nesting depth at the start of each line, for a version of the text.
@@ -582,16 +584,26 @@ pub fn show(
 
         let sticky = opts.sticky_scroll.then(|| {
             let viewport = vp.translate(rect.min.to_vec2()).intersect(ui.clip_rect());
-            sticky::Overlay::new(&st.sticky, &view, viewport, row_h, visible_rows.start)
+            let hidden = &st.sticky_hidden;
+            let is_hidden = |line: usize| !hidden.is_empty() && hidden.contains(text[ix.line_range(text, line)].trim());
+            sticky::Overlay::new(&st.sticky, &view, viewport, row_h, visible_rows.start, is_hidden)
         });
         if let Some(overlay) = &sticky {
-            let (offset, command) = overlay.interact(ui, id, &view, opts.sticky_shown, opts.sticky_control_flow);
-            if let Some(offset) = offset {
+            let action = overlay.interact(ui, id, &view, opts.sticky_shown, opts.sticky_control_flow, st.sticky_hidden.len());
+            if let Some(offset) = action.scroll {
                 st.scroll_to = Some(offset);
                 resp.request_focus();
                 ui.ctx().request_repaint();
             }
-            out.context_command = out.context_command.or(command);
+            if let Some(line) = action.hide {
+                st.sticky_hidden.insert(text[ix.line_range(text, line)].trim().to_string());
+                ui.ctx().request_repaint();
+            }
+            if action.show_hidden {
+                st.sticky_hidden.clear();
+                ui.ctx().request_repaint();
+            }
+            out.context_command = out.context_command.or(action.command);
         }
         let over_sticky = sticky.as_ref().is_some_and(|overlay| overlay.contains_pointer(ui));
         if opts.navigation_menu && (!over_sticky || resp.context_menu_opened()) {
