@@ -9,7 +9,9 @@
 # Trigger: push a version tag, e.g.  git tag v0.2.0 && git push origin v0.2.0
 # Manual runs (Actions tab -> release -> Run workflow) build everything and keep
 # the files as workflow artifacts without publishing a release; so does a push to
-# the release-check branch. `verify` must pass before anything is published.
+# the release-check branch. Packages are published only after their verify job
+# passes: Windows and Linux as soon as they're ready, macOS (the slowest build)
+# added to the same release when it is.
 
 name: release
 
@@ -167,7 +169,8 @@ jobs:
           chmod +x "pkg/$NAME/install.sh" "pkg/$NAME/edittr"
           tar -C pkg -czf "dist/$NAME.tar.gz" "$NAME"
           cargo install cargo-deb --locked
-          cargo deb --no-build --no-strip --output "dist/"
+          # Named like the other downloads (cargo-deb would use edittr_<version>-1_<debian arch>.deb).
+          cargo deb --no-build --no-strip --output "dist/$NAME.deb"
       - name: Bundle language servers
         run: ./.github/scripts/bundle-servers.sh linux-${{ matrix.arch }} servers
       - name: Package full (.tar.gz)
@@ -187,13 +190,14 @@ jobs:
   # ignores PATH, so the runner's own tools can't hide a broken bundle). Go and Rust
   # toolchains stay installed: gopls and rust-analyzer need them to load a project.
   verify:
-    needs: [windows, macos, linux]
+    # Windows and Linux only: macOS is verified (and published) on its own, so a slow
+    # macOS build doesn't hold back the other downloads.
+    needs: [windows, linux]
     strategy:
       fail-fast: false
       matrix:
         include:
           - { runner: windows-latest, artifact: windows }
-          - { runner: macos-latest, artifact: macos }
           - { runner: ubuntu-22.04, artifact: linux-x86_64 }
           # clangd publishes no arm64 Linux build, so that bundle has no C/C++ server.
           - { runner: ubuntu-22.04-arm, artifact: linux-aarch64, only: "rs,go,ts,py" }
@@ -201,7 +205,9 @@ jobs:
     defaults:
       run:
         shell: bash
-    steps:
+    steps: &verify-steps
+      - uses: actions/checkout@v4
+        with: { sparse-checkout: .github/scripts }
       - uses: actions/download-artifact@v4
         with:
           name: ${{ matrix.artifact }}
@@ -213,62 +219,43 @@ jobs:
       - name: Check the servers of every full package
         env:
           ONLY: ${{ matrix.only }}
-        run: |
-          ls -la dist
-          check() { # <label> <edittr executable>
-            echo "::group::$1"
-            args=(--check-servers --bundled); [ -n "$ONLY" ] && args+=(--only "$ONLY")
-            want=$(( ${#ONLY} ? $(tr ',' '\n' <<< "$ONLY" | wc -l) : 5 ))
-            set +e; "$2" "${args[@]}" > out.txt 2>&1; code=$?; set -e
-            cat out.txt
-            echo "::endgroup::"
-            # Annotations are readable without signing in to GitHub (logs are not).
-            while IFS= read -r l; do
-              case $l in PASS*) echo "::notice::$1: $l" ;; FAIL*) echo "::error::$1: $l" ;; esac
-            done < out.txt
-            passed=$(grep -c '^PASS' out.txt || true)
-            if [ "$code" != 0 ] || [ "$passed" != "$want" ]; then
-              echo "::error::$1: $passed of $want language servers passed (exit $code)"; failed=1
-            fi
-          }
-          failed=0
-          case "${{ runner.os }}" in
-            Windows)
-              7z x -y -oportable dist/*-windows-x64-full-portable.zip > /dev/null
-              check "portable zip" "$(ls portable/*/edittr.exe)"
-              setup=$(ls dist/*-windows-x64-full-setup.exe)
-              pwsh -c "Start-Process -Wait -FilePath '$setup' -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/CURRENTUSER','/DIR=C:\\edittr-test'"
-              check "installer" /c/edittr-test/edittr.exe ;;
-            macOS)
-              hdiutil attach -nobrowse -mountpoint /tmp/edittr-dmg dist/*-macos-universal-full.dmg > /dev/null
-              check "dmg" /tmp/edittr-dmg/edittr.app/Contents/MacOS/edittr
-              ditto -x -k dist/*-macos-universal-full.zip zip
-              check "zip" zip/edittr.app/Contents/MacOS/edittr ;;
-            Linux)
-              mkdir tgz && tar -C tgz -xzf dist/*-full.tar.gz
-              check "tar.gz" "$(ls tgz/*/edittr)" ;;
-          esac
-          exit $failed
+        run: ./.github/scripts/verify-packages.sh "${{ runner.os }}"
 
+  verify-macos:
+    needs: [macos]
+    strategy:
+      matrix:
+        include:
+          - { runner: macos-latest, artifact: macos, only: "" }
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    steps: *verify-steps
+
+  # Windows and Linux are published as soon as they pass; macOS is added to the same
+  # release when it does (whichever finishes first creates the release).
   publish:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [windows, macos, linux, verify]
+    needs: [windows, linux, verify]
     runs-on: ubuntu-latest
-    steps:
+    steps: &publish-steps
+      - uses: actions/checkout@v4
+        with: { sparse-checkout: .github/scripts }
       - uses: actions/download-artifact@v4
         with:
+          pattern: ${{ github.job == 'publish-macos' && 'macos' || '{windows,linux-*}' }}
           path: dist
           merge-multiple: true
-      - name: Checksums
-        run: cd dist && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
-      - name: Create or update the release
+      - name: Upload to the release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
-        run: |
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
-            gh release upload "$TAG" dist/* --clobber --repo "$GITHUB_REPOSITORY"
-          else
-            gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" \
-              --title "edittr $TAG" --generate-notes
-          fi
+          PART: ${{ github.job == 'publish-macos' && 'macos' || 'windows-linux' }}
+        run: ./.github/scripts/publish-release.sh
+
+  publish-macos:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [macos, verify-macos]
+    runs-on: ubuntu-latest
+    steps: *publish-steps
