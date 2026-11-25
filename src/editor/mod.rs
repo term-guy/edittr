@@ -64,6 +64,8 @@ pub struct State {
     /// Line (fractional) to put at the top next frame (`scroll_to_line`).
     scroll_line: Option<f32>,
     minimap_drag: bool,
+    /// A scroll bar arrow is held: when it scrolls another line.
+    arrow_repeat: Option<f64>,
     /// Bracket nesting depth at the start of each line, for a version of the text.
     depth: (Option<u64>, Arc<Vec<u32>>),
 }
@@ -537,6 +539,12 @@ pub fn show(
     if let Some(y) = st.scroll_to.take() {
         area = area.vertical_scroll_offset(y.max(0.0));
     }
+    // Arrows at both ends of the vertical scroll bar (when there is something to scroll); the bar runs between them.
+    let arrow = ui.spacing().scroll.bar_width.max(14.0);
+    let arrows = content.y > main_rect.height() && main_rect.height() > 4.0 * arrow;
+    if arrows {
+        area = area.scroll_bar_rect(main_rect.shrink2(Vec2::new(0.0, arrow)));
+    }
     let scroll = area.show_viewport(&mut main_ui, |ui, vp| {
         let (rect, _) = ui.allocate_exact_size(content, Sense::hover());
         let resp = ui.interact(rect, id, Sense::click_and_drag());
@@ -789,6 +797,11 @@ pub fn show(
         ptr
     });
     ui.allocate_rect(full, Sense::hover());
+    if arrows {
+        scroll_arrows(ui, id, st, &scroll, main_rect, arrow, row_h, palette);
+    } else {
+        st.arrow_repeat = None;
+    }
     {
         let rows = scroll.state.clamped_offset().y / row_h;
         let row = (rows.floor() as usize).min(view.count().saturating_sub(1));
@@ -832,6 +845,64 @@ pub fn show(
         st.rest = None;
     }
     out
+}
+
+/// Up / down buttons at the ends of the vertical scroll bar: a press scrolls one line, holding repeats.
+#[allow(clippy::too_many_arguments)]
+fn scroll_arrows(
+    ui: &egui::Ui,
+    id: egui::Id,
+    st: &mut State,
+    scroll: &egui::scroll_area::ScrollAreaOutput<Option<(usize, Pos2)>>,
+    rect: Rect,
+    size: f32,
+    row_h: f32,
+    palette: &Palette,
+) {
+    let x = rect.max.x - size..=rect.max.x;
+    let now = ui.input(|i| i.time);
+    let mut held = false;
+    for (up, y) in [(true, rect.min.y..=rect.min.y + size), (false, rect.max.y - size..=rect.max.y)] {
+        let r = Rect::from_x_y_ranges(x.clone(), y);
+        let resp = ui.interact(r, id.with(("scroll-arrow", up)), Sense::click());
+        let fg = palette.color(Part::Foreground);
+        if resp.hovered() || resp.is_pointer_button_down_on() {
+            ui.painter().rect_filled(r, 2.0, fg.gamma_multiply(0.12));
+        }
+        let (c, w) = (r.center(), size * 0.3);
+        let h = if up { -w * 0.6 } else { w * 0.6 };
+        let tri = vec![Pos2::new(c.x - w, c.y - h), Pos2::new(c.x + w, c.y - h), Pos2::new(c.x, c.y + h)];
+        let color = fg.gamma_multiply(if resp.hovered() { 0.85 } else { 0.5 });
+        ui.painter().add(egui::Shape::convex_polygon(tri, color, Stroke::NONE));
+        if !resp.is_pointer_button_down_on() {
+            continue;
+        }
+        held = true;
+        let fire = match st.arrow_repeat {
+            None => {
+                st.arrow_repeat = Some(now + 0.4);
+                true
+            }
+            Some(at) if now >= at => {
+                st.arrow_repeat = Some(now + 0.05);
+                true
+            }
+            Some(_) => false,
+        };
+        if fire {
+            let max = (scroll.content_size.y - scroll.inner_rect.height()).max(0.0);
+            let offset = scroll.state.clamped_offset().y + if up { -row_h } else { row_h };
+            st.scroll_to = Some(offset.clamp(0.0, max));
+            ui.ctx().request_repaint();
+        }
+        if let Some(at) = st.arrow_repeat {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_secs_f64((at - now).max(0.0)));
+        }
+    }
+    if !held {
+        st.arrow_repeat = None;
+    }
 }
 
 /// Overview of the file on the right: 2 px per row, colored by syntax; drag to scroll.
@@ -1803,6 +1874,34 @@ mod tests {
     }
 
     const NONE: egui::Modifiers = egui::Modifiers::NONE;
+
+    #[test]
+    fn scroll_bar_arrows_scroll_one_line() {
+        let mut h = Harness::new(&"line\n".repeat(200));
+        h.st.scroll_to_line(20.0);
+        assert!((h.frame(vec![]).top_line - 20.0).abs() < 0.1);
+        let click = |h: &mut Harness, up: bool| {
+            let pos = h
+                .ctx
+                .read_response(h.id.with(("scroll-arrow", up)))
+                .expect("arrow shown")
+                .rect
+                .center();
+            h.frame(vec![Event::PointerMoved(pos)]);
+            for pressed in [true, false] {
+                h.frame(vec![Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: NONE,
+                }]);
+            }
+            h.frame(vec![]).top_line
+        };
+        assert!((click(&mut h, false) - 21.0).abs() < 0.1);
+        assert!((click(&mut h, true) - 20.0).abs() < 0.1);
+        assert!((click(&mut h, true) - 19.0).abs() < 0.1);
+    }
 
     #[test]
     fn clicking_a_sticky_header_scrolls_without_relocating_the_caret() {
