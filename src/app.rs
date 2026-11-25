@@ -3,6 +3,7 @@ mod c_flags;
 mod call_hierarchy;
 mod code_navigation;
 mod commit_view;
+mod delete;
 mod diff_edit;
 mod document_save;
 mod file_history;
@@ -398,6 +399,8 @@ pub struct App {
     explorer_scroll_to: Option<PathBuf>,
     /// A folder shown from the path bar, highlighted until the next click in the tree.
     explorer_marked: Option<PathBuf>,
+    explorer_selection: Option<delete::ExplorerSelection>,
+    deletion: Option<delete::Deletion>,
     outline: outline::Outline,
 
     status: Status,
@@ -515,6 +518,8 @@ impl App {
             explorer_revealed: None,
             explorer_scroll_to: None,
             explorer_marked: None,
+            explorer_selection: None,
+            deletion: None,
             outline: Default::default(),
             status: Status::default(),
             status_rx: None,
@@ -612,6 +617,8 @@ impl App {
         self.explorer_revealed = None;
         self.explorer_scroll_to = None;
         self.explorer_marked = None;
+        self.explorer_selection = None;
+        self.deletion = None;
         self.code_navigation = code_navigation::CodeNavigation::default();
         self.root = None;
         self.search.opts.include.clear();
@@ -686,6 +693,7 @@ impl App {
             || self.quick_open.is_some()
             || self.picker.is_some()
             || self.confirm.is_some()
+            || self.deletion.is_some()
             || self.install_prompt.is_some()
             || self.open_folder.is_some()
             || self.search_replace.confirming()
@@ -925,6 +933,7 @@ impl App {
         self.poll_project_changes(ctx);
         self.poll_code_navigation();
         self.poll_document_saves();
+        self.poll_deletion();
         self.poll_vcs(ctx);
         self.poll_blame(ctx);
         self.poll_markers();
@@ -2271,7 +2280,15 @@ impl App {
         let active_path = self.active_path().map(Path::to_owned);
         for (path, is_dir) in entries {
             let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            ui.horizontal(|ui| {
+            let selected = self.explorer_selection.as_ref().is_some_and(|s| s.path == path);
+            let id = ui.make_persistent_id(("explorer_row", &path));
+            let mut rect = ui.available_rect_before_wrap();
+            rect.max.y = rect.min.y + ui.spacing().interact_size.y;
+            let row_scope = egui::UiBuilder::new()
+                .scope_id(id)
+                .max_rect(rect)
+                .layout(egui::Layout::left_to_right(egui::Align::Center));
+            ui.scope_builder(row_scope, |ui| {
                 ui.add_space(depth as f32 * 12.0);
                 if is_dir {
                     let expanded = self.expanded.contains(&path);
@@ -2280,13 +2297,12 @@ impl App {
                     } else {
                         (ic::CARET_RIGHT, ic::FOLDER)
                     };
-                    let row = ui.selectable_label(self.explorer_marked.as_ref() == Some(&path), format!("{caret} {folder} {name}"));
-                    if self.explorer_scroll_to.as_ref() == Some(&path) {
-                        row.scroll_to_me(Some(egui::Align::Center));
-                        self.explorer_scroll_to = None;
-                    }
+                    let row = ui.selectable_label(
+                        selected || self.explorer_marked.as_ref() == Some(&path),
+                        format!("{caret} {folder} {name}"),
+                    );
+                    self.explorer_row(&row, &path, is_dir);
                     if row.clicked() {
-                        self.explorer_marked = None;
                         if expanded {
                             self.expanded.remove(&path);
                         } else {
@@ -2311,21 +2327,26 @@ impl App {
                                 ui.close();
                             }
                         }
+                        self.explorer_delete_menu(ui, &path, is_dir);
                     });
                 } else {
                     let mut text = RichText::new(format!("     {} {name}", ic::FILE));
                     if let Some(&code) = deco.get(&path) {
                         text = text.color(status_color(code));
                     }
-                    let row = ui.selectable_label(active_path.as_deref() == Some(&path), text);
-                    if self.explorer_scroll_to.as_ref() == Some(&path) {
-                        row.scroll_to_me(Some(egui::Align::Center));
-                        self.explorer_scroll_to = None;
+                    let active = active_path.as_deref() == Some(&path);
+                    if active && self.explorer_selection.is_some() && !selected {
+                        text = text.strong();
                     }
+                    let row = ui.selectable_label(selected || (active && self.explorer_selection.is_none()), text);
+                    self.explorer_row(&row, &path, is_dir);
                     if row.clicked() {
                         *open = Some(path.clone());
                     }
-                    row.context_menu(|ui| self.file_history_menu(ui, &path, true));
+                    row.context_menu(|ui| {
+                        self.file_history_menu(ui, &path, true);
+                        self.explorer_delete_menu(ui, &path, is_dir);
+                    });
                 }
             });
             if is_dir && self.expanded.contains(&path) {
@@ -2737,6 +2758,7 @@ impl App {
         if dir != root {
             self.explorer_scroll_to = Some(dir.clone());
             self.explorer_marked = Some(dir);
+            self.explorer_selection = None;
         }
     }
 
@@ -3225,7 +3247,7 @@ impl App {
                 Some(true) => {
                     let p = expand_home(path.trim());
                     if p.is_dir() {
-                        let p = std::fs::canonicalize(&p).unwrap_or(p);
+                        let p = workspace::canonical(&p).unwrap_or(p);
                         self.open_folder = None;
                         self.set_root(p);
                     } else {
@@ -3378,8 +3400,10 @@ impl eframe::App for App {
             return;
         }
         self.poll_background(&ctx);
+        self.begin_explorer_input(&ctx);
         self.shortcuts(&ctx);
         self.picker_dialog(&ctx);
+        self.delete_dialog(&ctx);
 
         let title = match &self.root {
             Some(r) => format!("{} — edittr", dir_name(r)),
@@ -3405,6 +3429,7 @@ impl eframe::App for App {
         self.refresh_outline();
         self.project_replace_modal(&ctx);
         self.assist_ui(&ctx);
+        self.explorer_delete_shortcut(&ctx);
         self.record_session(false);
         #[cfg(feature = "tour")]
         if let Some(mut t) = self.tour.take() {

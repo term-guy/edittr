@@ -19,9 +19,10 @@ pub(super) struct History {
     diff_rx: Option<Receiver<Result<Tab, String>>>,
 }
 
-impl App {
-    pub(super) fn active_path(&self) -> Option<&Path> {
-        match self.tabs.get(self.active)? {
+impl Tab {
+    /// The file this tab shows; None for an Untitled tab (its name is not a path on disk).
+    pub(super) fn path(&self) -> Option<&Path> {
+        match self {
             Tab::File(doc) => (!doc.untitled).then_some(doc.path.as_path()),
             Tab::Large(view) => Some(&view.path),
             Tab::Diff(diff) => Some(&diff.path),
@@ -29,6 +30,12 @@ impl App {
             Tab::Hex(view) => Some(&view.path),
             Tab::Graph | Tab::Settings => None,
         }
+    }
+}
+
+impl App {
+    pub(super) fn active_path(&self) -> Option<&Path> {
+        self.tabs.get(self.active)?.path()
     }
 
     pub(super) fn file_history_menu(&mut self, ui: &mut egui::Ui, path: &Path, file: bool) {

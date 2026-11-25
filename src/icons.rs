@@ -35,6 +35,7 @@ pub const MINUS: &str = "\u{10032A}";
 pub const MOON: &str = "\u{100330}";
 pub const PLUS: &str = "\u{1003D4}";
 pub const SUN: &str = "\u{100472}";
+pub const TRASH: &str = "\u{1004A6}";
 pub const TREE_STRUCTURE: &str = "\u{10067C}";
 pub const TREE_VIEW: &str = "\u{100E48}";
 pub const LIST: &str = "\u{1002F0}";
@@ -125,7 +126,7 @@ mod tests {
         ctx.set_fonts(fonts);
         let mut full = ctx.run_ui(Default::default(), |ui| {
             ui.fonts_mut(|fonts| {
-                for icon in [INFO, LIGHTBULB, WARNING, X_CIRCLE, PENCIL_SIMPLE, WRENCH] {
+                for icon in [INFO, LIGHTBULB, WARNING, X_CIRCLE, PENCIL_SIMPLE, WRENCH, TRASH] {
                     assert!(fonts.has_glyphs(&FontId::proportional(14.0), icon), "missing glyph {icon:?}");
                 }
             });
