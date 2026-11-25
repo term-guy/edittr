@@ -29,7 +29,7 @@ enum Opened {
 }
 
 pub(super) struct OpenJob {
-    path: PathBuf,
+    pub(super) path: PathBuf,
     target: Target,
     focus: bool,
     rx: Option<Receiver<Result<Opened, String>>>,

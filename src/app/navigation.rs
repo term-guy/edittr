@@ -211,7 +211,7 @@ impl Picker {
 
 impl App {
     pub(super) fn shortcuts(&mut self, ctx: &egui::Context) {
-        if self.search_replace.confirming() {
+        if self.search_replace.confirming() || self.deletion.is_some() {
             return;
         }
         // Mouse back / forward buttons.
@@ -247,6 +247,7 @@ impl App {
             Command::NewWindow => self.new_window(None),
             Command::NewFile => self.request_new_entry(None, false),
             Command::NewFolder => self.request_new_entry(None, true),
+            Command::Delete => self.delete_active_file(),
             Command::CloseFolder => self.close_folder(false),
             Command::QuickOpen => self.start_quick_open(),
             Command::GoToLine => self.open_goto_line(),

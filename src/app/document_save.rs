@@ -47,6 +47,10 @@ struct Prepared {
 }
 
 impl App {
+    pub(super) fn document_action_pending(&self, matches: impl Fn(&Path) -> bool) -> bool {
+        self.document_save.jobs.keys().any(|path| matches(path))
+    }
+
     pub(super) fn save_active(&mut self) {
         // In an editable diff, save the file being edited there.
         let index = self.live_diff_doc(self.active).unwrap_or(self.active);

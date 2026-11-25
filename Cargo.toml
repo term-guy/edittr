@@ -30,6 +30,7 @@ url = "2.5.9"
 yaml-rust = "0.4.5"
 zip = { version = "9.8.2", default-features = false, features = ["deflate"] }
 pulldown-cmark = { version = "0.13", default-features = false }
+trash = "5.4.0"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 log = "0.4"
@@ -39,7 +40,7 @@ log = "0.4"
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Time"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Time"] }
 
 [features]
 # Screenshot tour for docs/testing: see src/app/tour.rs.
