@@ -27,6 +27,7 @@ A small, fast code editor with built-in git. It's a single native binary written
 - **Files changed outside edittr**: nothing is reloaded behind your back. A bar offers **Reload**, **Compare** (the disk version against the editor text) or **Keep mine**
 - **Start page**: edittr opens on a start page with your recent folders; the ✕ in the Explorer header (or **Close folder**) goes back to it
 - **Session restore**: reopens each folder's tabs, cursor positions and layout
+- **Multiple windows**: **New window** (`Ctrl/Cmd+Shift+N`, the start page, or right-click the folder icon in the activity bar) opens another edittr window, so several projects can be open at once; **Open folder in new window…** and right-clicking a recent folder open a project directly in a new window
 
 ### Navigation
 
@@ -69,7 +70,7 @@ Shows the language of the current file, the cursor position, problem counts, and
 
 ### Settings
 
-Toggle these from the command palette; they are saved in your user settings.
+The gear in the activity bar (or `Ctrl/Cmd+,`) opens the **Settings** page: every option grouped by area, with a search box, switches, the tab size, the theme and the C/C++ build settings. Changes apply and save immediately. Each option is also in the command palette.
 
 | Setting | Default |
 | --- | --- |
@@ -78,6 +79,8 @@ Toggle these from the command palette; they are saved in your user settings.
 | Inline blame | on |
 | Show minimap | on |
 | Color nested brackets | on |
+| Semantic highlighting (colors from the language server) | on |
+| Sticky scroll | on |
 | Show outline | on |
 | Restore previous session (each folder's tabs) | on |
 | Reopen last folder at startup (instead of the start page) | off |
@@ -161,6 +164,8 @@ On Linux you need the usual windowing dev packages (see `.github/workflows/build
 | Key | Action |
 | --- | --- |
 | `Ctrl/Cmd+Shift+P`, `F1` | Command palette |
+| `Ctrl/Cmd+,` | Settings |
+| `Ctrl/Cmd+Shift+N` | New window |
 | `Ctrl/Cmd+P` | Go to file (`name:line`, `name:line-line`) |
 | `Ctrl+G` | Go to line (`line` or `line:column`) |
 | `Ctrl/Cmd+Shift+O` | Go to symbol in file |
