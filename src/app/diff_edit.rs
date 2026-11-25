@@ -261,6 +261,7 @@ impl App {
                 bracket_colors: settings.bracket_colors,
                 sticky_scroll: false,
                 sticky_control_flow: false,
+                sticky_shown: crate::editor::sticky::Kinds::ALL,
                 navigation_menu: false,
                 read_only: true,
             };

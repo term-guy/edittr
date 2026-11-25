@@ -214,6 +214,8 @@ pub struct Options<'a> {
     pub sticky_scroll: bool,
     /// Sticky scroll also pins control flow blocks (if / else / loops / switch / case).
     pub sticky_control_flow: bool,
+    /// Kinds of lines sticky scroll may pin (control flow ones only with `sticky_control_flow`).
+    pub sticky_shown: sticky::Kinds,
     pub navigation_menu: bool,
     /// Selecting, copying, finding and scrolling only (e.g. the base side of a diff).
     pub read_only: bool,
@@ -488,7 +490,8 @@ pub fn show(
     let ix = st.index_arc(text, *version);
     let view = st.view.clone();
     if opts.sticky_scroll {
-        st.sticky.update(*version, text, &ix, &st.regions, opts.sticky_control_flow);
+        let kinds = sticky::Kinds::pinned(opts.sticky_shown, opts.sticky_control_flow);
+        st.sticky.update(*version, text, &ix, &st.regions, kinds);
     }
     let spans = if opts.highlight {
         hl.spans(ui.ctx(), *version, text, opts.lang, opts.palette.preset().base == egui::Theme::Dark)
@@ -582,7 +585,7 @@ pub fn show(
             sticky::Overlay::new(&st.sticky, &view, viewport, row_h, visible_rows.start)
         });
         if let Some(overlay) = &sticky {
-            let (offset, command) = overlay.interact(ui, id, &view, opts.sticky_control_flow);
+            let (offset, command) = overlay.interact(ui, id, &view, opts.sticky_shown, opts.sticky_control_flow);
             if let Some(offset) = offset {
                 st.scroll_to = Some(offset);
                 resp.request_focus();
@@ -592,7 +595,10 @@ pub fn show(
         }
         let over_sticky = sticky.as_ref().is_some_and(|overlay| overlay.contains_pointer(ui));
         if opts.navigation_menu && (!over_sticky || resp.context_menu_opened()) {
-            out.context_command = navigation_menu::show(&resp, st, &lines, &lay, *version);
+            // Don't drop a command the pinned lines' menu gave this frame (its menu can open below them).
+            if let Some(command) = navigation_menu::show(&resp, st, &lines, &lay, *version) {
+                out.context_command = Some(command);
+            }
         }
 
         // A drag started in the text can still finish over a pinned header.
@@ -1862,6 +1868,7 @@ mod tests {
                     bracket_colors: true,
                     sticky_scroll: true,
                     sticky_control_flow: true,
+                    sticky_shown: sticky::Kinds::ALL,
                     navigation_menu: false,
                     read_only,
                 };

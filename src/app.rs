@@ -3635,6 +3635,7 @@ fn editor(
         bracket_colors: settings.bracket_colors,
         sticky_scroll: settings.sticky_scroll && pane != 3,
         sticky_control_flow: settings.sticky_control_flow,
+        sticky_shown: settings.sticky_shown,
         navigation_menu: pane != 3,
         read_only: false,
     };

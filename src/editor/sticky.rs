@@ -12,7 +12,110 @@ use std::{
 const MAX_HEADERS: usize = 5;
 const NO_LINE: usize = usize::MAX;
 type Headers = [usize; MAX_HEADERS];
-pub(crate) type Scopes = Arc<[(usize, usize)]>;
+/// (header line, last line, kind) of the language server's declarations.
+pub(crate) type Scopes = Arc<[(usize, usize, Kind)]>;
+
+/// What a pinned line opens; each can be shown or hidden.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Kind {
+    Function,
+    Type,
+    Conditional,
+    Loop,
+    Switch,
+    Case,
+    Exception,
+}
+
+impl Kind {
+    pub(crate) const ALL: [Kind; 7] = [
+        Kind::Function,
+        Kind::Type,
+        Kind::Conditional,
+        Kind::Loop,
+        Kind::Switch,
+        Kind::Case,
+        Kind::Exception,
+    ];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Kind::Function => "Functions and methods",
+            Kind::Type => "Types (class, struct, impl, namespace)",
+            Kind::Conditional => "if / else",
+            Kind::Loop => "Loops (for, while, do)",
+            Kind::Switch => "switch / match",
+            Kind::Case => "case / default",
+            Kind::Exception => "try / catch, with",
+        }
+    }
+
+    /// Name in the settings file.
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            Kind::Function => "function",
+            Kind::Type => "type",
+            Kind::Conditional => "if",
+            Kind::Loop => "loop",
+            Kind::Switch => "switch",
+            Kind::Case => "case",
+            Kind::Exception => "try",
+        }
+    }
+
+    pub(crate) fn from_key(key: &str) -> Option<Kind> {
+        Kind::ALL.into_iter().find(|kind| kind.key() == key)
+    }
+
+    /// Hidden as a group by the "control flow" switch.
+    pub(crate) fn is_control_flow(self) -> bool {
+        !matches!(self, Kind::Function | Kind::Type)
+    }
+
+    fn of_declaration(kind: &str) -> Kind {
+        if matches!(kind, "Function" | "Method" | "Constructor") {
+            Kind::Function
+        } else {
+            Kind::Type
+        }
+    }
+}
+
+/// A set of kinds.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(crate) struct Kinds(u8);
+
+impl Kinds {
+    pub(crate) const ALL: Kinds = Kinds((1 << Kind::ALL.len()) - 1);
+
+    pub(crate) fn contains(self, kind: Kind) -> bool {
+        self.0 & (1 << kind as u8) != 0
+    }
+
+    pub(crate) fn toggle(&mut self, kind: Kind) {
+        self.0 ^= 1 << kind as u8;
+    }
+
+    pub(crate) fn iter(self) -> impl Iterator<Item = Kind> {
+        Kind::ALL.into_iter().filter(move |&kind| self.contains(kind))
+    }
+
+    /// The kinds pinned: `shown`, without control flow when that switch is off.
+    pub(crate) fn pinned(shown: Kinds, control_flow: bool) -> Kinds {
+        Kinds(
+            shown
+                .iter()
+                .filter(|kind| control_flow || !kind.is_control_flow())
+                .fold(0, |bits, kind| bits | 1 << kind as u8),
+        )
+    }
+}
+
+impl FromIterator<Kind> for Kinds {
+    fn from_iter<I: IntoIterator<Item = Kind>>(kinds: I) -> Self {
+        Kinds(kinds.into_iter().fold(0, |bits, kind| bits | 1 << kind as u8))
+    }
+}
 
 fn declaration(kind: &str) -> bool {
     matches!(
@@ -24,12 +127,19 @@ fn declaration(kind: &str) -> bool {
 pub(crate) fn outline_scopes<'a>(symbols: impl Iterator<Item = &'a Symbol>, text: &str) -> Scopes {
     let starts: BTreeMap<_, _> = symbols
         .filter(|symbol| declaration(&symbol.kind) && symbol.lines.end() > symbol.lines.start())
-        .map(|symbol| (*symbol.lines.start(), (symbol.line, *symbol.lines.end())))
+        .map(|symbol| {
+            (
+                *symbol.lines.start(),
+                (symbol.line, *symbol.lines.end(), Kind::of_declaration(&symbol.kind)),
+            )
+        })
         .collect();
     let mut starts = starts.into_iter().peekable();
     let mut scopes = Vec::new();
     for (line, source) in text.lines().enumerate() {
-        let Some(&(start, (name_line, end))) = starts.peek() else { break };
+        let Some(&(start, (name_line, end, kind))) = starts.peek() else {
+            break;
+        };
         if line < start {
             continue;
         }
@@ -40,7 +150,7 @@ pub(crate) fn outline_scopes<'a>(symbols: impl Iterator<Item = &'a Symbol>, text
         }
         starts.next();
         if line < end {
-            scopes.push((line, end));
+            scopes.push((line, end, kind));
         }
     }
     scopes.into()
@@ -48,58 +158,41 @@ pub(crate) fn outline_scopes<'a>(symbols: impl Iterator<Item = &'a Symbol>, text
 
 /// A block header of control flow: `if`, `} else {`, loops, `switch`, `case X:` (indented case bodies are
 /// fold regions too), `try` / `catch`...
-fn control_flow(line: &str) -> bool {
+fn control_flow(line: &str) -> Option<Kind> {
     let first = line
         .trim_start_matches(|c: char| c == '}' || c.is_whitespace())
         .split(|c: char| !c.is_alphanumeric() && c != '_')
         .next()
         .unwrap_or_default();
-    matches!(
-        first,
-        "if" | "else"
-            | "elif"
-            | "elsif"
-            | "unless"
-            | "for"
-            | "foreach"
-            | "while"
-            | "until"
-            | "do"
-            | "loop"
-            | "match"
-            | "switch"
-            | "select"
-            | "case"
-            | "default"
-            | "when"
-            | "try"
-            | "catch"
-            | "except"
-            | "finally"
-            | "with"
-    )
+    Some(match first {
+        "if" | "else" | "elif" | "elsif" | "unless" => Kind::Conditional,
+        "for" | "foreach" | "while" | "until" | "do" | "loop" => Kind::Loop,
+        "match" | "switch" | "select" | "when" => Kind::Switch,
+        "case" | "default" => Kind::Case,
+        "try" | "catch" | "except" | "finally" | "with" => Kind::Exception,
+        _ => return None,
+    })
 }
 
-fn fold_scopes(text: &str, ix: &LineIndex, regions: &[Range<usize>], control: bool) -> BTreeMap<usize, usize> {
+/// Every kind's scopes: header line -> (last line, kind).
+fn fold_scopes(text: &str, ix: &LineIndex, regions: &[Range<usize>]) -> BTreeMap<usize, (usize, Kind)> {
     let mut scopes = BTreeMap::new();
     let mut continuations = BTreeMap::new();
     for region in regions {
         let line = text[ix.line_range(text, region.start)].trim();
         let continued = line.starts_with(')').then(|| continuations.remove(&region.start)).flatten();
         let first = line.split(|c: char| !c.is_alphanumeric() && c != '_').next().unwrap_or_default();
-        let flow = control_flow(line);
-        if flow && !control {
-            continue;
-        }
-        let header = if let Some(header) = continued {
-            header
-        } else if flow
-            || first == "impl"
-            || goto::definitions(line)
-                .next()
-                .is_some_and(|def| declaration(def.kind) || (def.kind == "Type" && line.ends_with('{')))
+        let (header, kind) = if let Some(continued) = continued {
+            continued
+        } else if let Some(kind) = control_flow(line) {
+            (region.start, kind)
+        } else if first == "impl" {
+            (region.start, Kind::Type)
+        } else if let Some(def) = goto::definitions(line)
+            .next()
+            .filter(|def| declaration(def.kind) || (def.kind == "Type" && line.ends_with('{')))
         {
-            region.start
+            (region.start, Kind::of_declaration(def.kind))
         } else {
             continue;
         };
@@ -112,12 +205,12 @@ fn fold_scopes(text: &str, ix: &LineIndex, regions: &[Range<usize>], control: bo
             let token = source.split_whitespace().next().unwrap_or_default();
             matches!(token, "}" | "};" | "end")
         });
-        scopes.insert(header, close.map_or(end - 1, |(line, _)| line));
+        scopes.insert(header, (close.map_or(end - 1, |(line, _)| line), kind));
         if line.ends_with('(')
             && let Some((line, source)) = next
             && source.starts_with(')')
         {
-            continuations.insert(line, header);
+            continuations.insert(line, (header, kind));
         }
     }
     scopes
@@ -125,10 +218,11 @@ fn fold_scopes(text: &str, ix: &LineIndex, regions: &[Range<usize>], control: bo
 
 #[derive(Default)]
 pub(super) struct Cache {
-    /// (version, control flow included) the fold scopes were computed for.
-    version: Option<(u64, bool)>,
-    folds: BTreeMap<usize, usize>,
+    version: Option<u64>,
+    folds: BTreeMap<usize, (usize, Kind)>,
     outline: Option<(u64, Scopes)>,
+    /// Kinds pinned (the others are filtered out of `entries`).
+    kinds: Kinds,
     entries: Vec<(usize, Headers)>,
 }
 
@@ -142,15 +236,19 @@ impl Cache {
             return;
         }
         self.outline = Some((version, scopes.clone()));
-        if self.version.is_some_and(|(v, _)| v == version) {
+        if self.version == Some(version) {
             self.rebuild(version);
         }
     }
 
-    pub(super) fn update(&mut self, version: u64, text: &str, ix: &LineIndex, regions: &[Range<usize>], control: bool) {
-        if self.version != Some((version, control)) {
-            self.version = Some((version, control));
-            self.folds = fold_scopes(text, ix, regions, control);
+    pub(super) fn update(&mut self, version: u64, text: &str, ix: &LineIndex, regions: &[Range<usize>], kinds: Kinds) {
+        if self.version != Some(version) {
+            self.version = Some(version);
+            self.kinds = kinds;
+            self.folds = fold_scopes(text, ix, regions);
+            self.rebuild(version);
+        } else if self.kinds != kinds {
+            self.kinds = kinds;
             self.rebuild(version);
         }
     }
@@ -160,9 +258,16 @@ impl Cache {
         if let Some((v, outline)) = &self.outline
             && *v == version
         {
-            scopes.extend(outline.iter().copied());
+            scopes.extend(outline.iter().map(|&(start, end, kind)| (start, (end, kind))));
         }
-        self.entries = index(scopes);
+        let kinds = self.kinds;
+        self.entries = index(
+            scopes
+                .into_iter()
+                .filter(|(_, (_, kind))| kinds.contains(*kind))
+                .map(|(start, (end, _))| (start, end))
+                .collect(),
+        );
     }
 
     fn headers(&self, line: usize) -> Headers {
@@ -198,6 +303,28 @@ fn index(scopes: BTreeMap<usize, usize>) -> Vec<(usize, Headers)> {
             (events[0].0, headers)
         })
         .collect()
+}
+
+/// Checkboxes for what sticky scroll pins; returns the command of the one clicked. The menu stays open,
+/// so several can be changed in a row.
+pub(crate) fn kinds_menu(ui: &mut egui::Ui, shown: Kinds, control_flow: bool) -> Option<crate::commands::Command> {
+    use crate::commands::{Command, Setting};
+    let mut command = None;
+    let mut on = control_flow;
+    if ui.checkbox(&mut on, "Pin control flow").clicked() {
+        command = Some(Command::ToggleSetting(Setting::StickyControlFlow));
+    }
+    for kind in Kind::ALL {
+        if kind == Kind::Conditional {
+            ui.separator();
+        }
+        let mut on = shown.contains(kind);
+        let enabled = control_flow || !kind.is_control_flow();
+        if ui.add_enabled(enabled, egui::Checkbox::new(&mut on, kind.label())).clicked() {
+            command = Some(Command::ToggleStickyKind(kind));
+        }
+    }
+    command
 }
 
 pub(super) struct Overlay {
@@ -259,6 +386,7 @@ impl Overlay {
         ui: &egui::Ui,
         id: egui::Id,
         view: &fold::View,
+        shown: Kinds,
         control_flow: bool,
     ) -> (Option<f32>, Option<crate::commands::Command>) {
         use crate::commands::{Command, Setting};
@@ -272,11 +400,8 @@ impl Overlay {
                 clicked = Some(view.row(line).saturating_sub(self.available) as f32 * self.row_h);
             }
             response.context_menu(|ui| {
-                let mut on = control_flow;
-                if ui.checkbox(&mut on, "Pin control flow (if, else, loops, switch, case)").clicked() {
-                    command = Some(Command::ToggleSetting(Setting::StickyControlFlow));
-                    ui.close();
-                }
+                command = command.or(kinds_menu(ui, shown, control_flow));
+                ui.separator();
                 if ui.button("Turn off sticky scroll").clicked() {
                     command = Some(Command::ToggleSetting(Setting::StickyScroll));
                     ui.close();
@@ -322,8 +447,12 @@ impl Overlay {
 #[cfg(feature = "tour")]
 pub(crate) fn tour_line(text: &str) -> Option<usize> {
     let ix = LineIndex::new(text);
-    let scopes = fold_scopes(text, &ix, &fold::regions(text, &ix), false);
-    let (start, end) = scopes.into_iter().max_by_key(|&(start, end)| end - start)?;
+    let scopes = fold_scopes(text, &ix, &fold::regions(text, &ix));
+    let (start, end) = scopes
+        .into_iter()
+        .filter(|(_, (_, kind))| !kind.is_control_flow())
+        .map(|(start, (end, _))| (start, end))
+        .max_by_key(|&(start, end)| end - start)?;
     (end > start).then_some((start + 3).min(end))
 }
 
@@ -336,7 +465,7 @@ mod tests {
         let text = "impl Example {\n    fn f() {\n        if condition {\n            work();\n        }\n    }\n}\nfn outside() {}\n";
         let ix = LineIndex::new(text);
         let mut cache = Cache::default();
-        cache.update(1, text, &ix, &fold::regions(text, &ix), false);
+        cache.update(1, text, &ix, &fold::regions(text, &ix), Kinds::pinned(Kinds::ALL, false));
         assert_eq!(cache.headers(0), [NO_LINE; MAX_HEADERS]);
         assert_eq!(cache.headers(1), [0, NO_LINE, NO_LINE, NO_LINE, NO_LINE]);
         assert_eq!(cache.headers(3), [0, 1, NO_LINE, NO_LINE, NO_LINE]);
@@ -364,14 +493,23 @@ void something() {
         let ix = LineIndex::new(text);
         let regions = fold::regions(text, &ix);
         let mut cache = Cache::default();
-        cache.update(1, text, &ix, &regions, true);
+        cache.update(1, text, &ix, &regions, Kinds::ALL);
         let pinned = |cache: &Cache, line| cache.headers(line).into_iter().take_while(|&l| l != NO_LINE).collect::<Vec<_>>();
         assert_eq!(pinned(&cache, 2), [0, 1]);
         assert_eq!(pinned(&cache, 7), [0, 3, 4, 5], "function, else, switch, case");
         assert_eq!(pinned(&cache, 9), [0, 3, 4, 8], "the next case replaces the previous one");
-        cache.update(1, text, &ix, &regions, false);
+        cache.update(1, text, &ix, &regions, Kinds::pinned(Kinds::ALL, false));
         assert_eq!(pinned(&cache, 7), [0], "declarations only");
-        assert!(control_flow("} else if (x) {") && control_flow("for x in y:") && !control_flow("format(x);"));
+        let mut shown = Kinds::ALL;
+        shown.toggle(Kind::Switch);
+        cache.update(1, text, &ix, &regions, Kinds::pinned(shown, true));
+        assert_eq!(pinned(&cache, 7), [0, 3, 5], "switch hidden, its case still pinned");
+        shown.toggle(Kind::Function);
+        cache.update(1, text, &ix, &regions, Kinds::pinned(shown, true));
+        assert_eq!(pinned(&cache, 7), [3, 5]);
+        assert_eq!(control_flow("} else if (x) {"), Some(Kind::Conditional));
+        assert_eq!(control_flow("for x in y:"), Some(Kind::Loop));
+        assert_eq!(control_flow("format(x);"), None);
     }
 
     #[test]
@@ -380,11 +518,11 @@ void something() {
         let ix = LineIndex::new(text);
         let regions = fold::regions(text, &ix);
         let mut cache = Cache::default();
-        cache.update(1, text, &ix, &regions, false);
+        cache.update(1, text, &ix, &regions, Kinds::ALL);
         assert_eq!(cache.headers(3)[0], 0);
-        cache.set_outline(1, &Arc::from([(0, 2)]));
+        cache.set_outline(1, &Arc::from([(0, 2, Kind::Function)]));
         assert_eq!(cache.headers(3)[0], NO_LINE);
-        cache.update(2, text, &ix, &regions, false);
+        cache.update(2, text, &ix, &regions, Kinds::ALL);
         assert_eq!(cache.headers(3)[0], 0);
     }
 

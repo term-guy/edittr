@@ -350,6 +350,10 @@ impl App {
             }
 
             Command::TabSize(n) => self.set_tab_size(n),
+            Command::ToggleStickyKind(kind) => {
+                self.settings.sticky_shown.toggle(kind);
+                self.save_settings(&self.ctx.clone());
+            }
             Command::ToggleSetting(setting) => {
                 let value = setting.value(&mut self.settings);
                 *value = !*value;

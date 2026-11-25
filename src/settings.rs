@@ -48,6 +48,8 @@ pub(crate) struct Settings {
     pub(crate) sticky_scroll: bool,
     /// Sticky scroll also pins if / else / loops / switch / case blocks, not only declarations.
     pub(crate) sticky_control_flow: bool,
+    /// Kinds of lines sticky scroll pins (saved as the hidden ones).
+    pub(crate) sticky_shown: crate::editor::sticky::Kinds,
     pub(crate) show_outline: bool,
     pub(crate) outline_expanded: bool,
     pub(crate) outline_grouped: bool,
@@ -80,6 +82,7 @@ impl Default for Settings {
             semantic_highlighting: true,
             sticky_scroll: true,
             sticky_control_flow: true,
+            sticky_shown: crate::editor::sticky::Kinds::ALL,
             show_outline: true,
             outline_expanded: true,
             outline_grouped: true,
@@ -195,6 +198,12 @@ impl Settings {
                 }
                 _ => {}
             }
+            if key == "sticky_hidden" {
+                use crate::editor::sticky::{Kind, Kinds};
+                let hidden: Vec<_> = value.split(',').filter_map(|key| Kind::from_key(key.trim())).collect();
+                settings.sticky_shown = Kinds::ALL.iter().filter(|kind| !hidden.contains(kind)).collect();
+                continue;
+            }
             if key == "tab_size" {
                 if let Ok(n) = value.parse::<usize>()
                     && (1..=16).contains(&n)
@@ -254,6 +263,7 @@ impl Settings {
                         | "semantic_highlighting"
                         | "sticky_scroll"
                         | "sticky_control_flow"
+                        | "sticky_hidden"
                         | "restore_previous_session"
                         | "reopen_last_folder"
                         | "tab_size"
@@ -289,6 +299,12 @@ impl Settings {
         text.push_str(&format!("semantic_highlighting={}\n", self.semantic_highlighting));
         text.push_str(&format!("sticky_scroll={}\n", self.sticky_scroll));
         text.push_str(&format!("sticky_control_flow={}\n", self.sticky_control_flow));
+        let hidden: Vec<_> = crate::editor::sticky::Kind::ALL
+            .into_iter()
+            .filter(|kind| !self.sticky_shown.contains(*kind))
+            .map(|kind| kind.key())
+            .collect();
+        text.push_str(&format!("sticky_hidden={}\n", hidden.join(",")));
         text.push_str(&format!("restore_previous_session={}\n", self.restore_previous_session));
         text.push_str(&format!("reopen_last_folder={}\n", self.reopen_last_folder));
         text.push_str(&format!("tab_size={}\n", self.tab_size));
@@ -516,7 +532,7 @@ mod tests {
         let text = settings.format(previous);
         assert_eq!(
             text,
-            "future_key=one=two\nfuture_key = three\n# A comment\nchanges_tree=false\nhighlight_line=false\nshow_whitespace=false\ndiff_ignore_eol=true\ninline_blame=true\nminimap=true\nbracket_colors=true\nsemantic_highlighting=true\nsticky_scroll=true\nsticky_control_flow=true\nrestore_previous_session=true\nreopen_last_folder=false\ntab_size=4\neditor_font_size=13\nui_font_size=13\nbreadcrumb_font_size=11\nformat_on_save=false\nshow_outline=true\noutline_expanded=true\noutline_grouped=true\noutline_collapsed_groups=\ntheme_preference=system\ntheme_dark=edittr-dark\ntheme_light=edittr-light\n"
+            "future_key=one=two\nfuture_key = three\n# A comment\nchanges_tree=false\nhighlight_line=false\nshow_whitespace=false\ndiff_ignore_eol=true\ninline_blame=true\nminimap=true\nbracket_colors=true\nsemantic_highlighting=true\nsticky_scroll=true\nsticky_control_flow=true\nsticky_hidden=\nrestore_previous_session=true\nreopen_last_folder=false\ntab_size=4\neditor_font_size=13\nui_font_size=13\nbreadcrumb_font_size=11\nformat_on_save=false\nshow_outline=true\noutline_expanded=true\noutline_grouped=true\noutline_collapsed_groups=\ntheme_preference=system\ntheme_dark=edittr-dark\ntheme_light=edittr-light\n"
         );
         assert!(!Settings::parse(&text).changes_tree);
     }
@@ -532,6 +548,18 @@ mod tests {
         let s = Settings::default();
         let once = s.format("");
         assert_eq!(s.format(&once), once);
+    }
+
+    #[test]
+    fn sticky_hidden_kinds_round_trip() {
+        use crate::editor::sticky::{Kind, Kinds};
+        assert_eq!(Settings::parse("").sticky_shown, Kinds::ALL);
+        let settings = Settings::parse("sticky_hidden=loop, case,unknown\n");
+        assert!(!settings.sticky_shown.contains(Kind::Loop) && !settings.sticky_shown.contains(Kind::Case));
+        assert!(settings.sticky_shown.contains(Kind::Conditional));
+        let text = settings.format("");
+        assert!(text.contains("sticky_hidden=loop,case\n"));
+        assert_eq!(Settings::parse(&text).sticky_shown, settings.sticky_shown);
     }
 
     #[test]

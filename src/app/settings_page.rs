@@ -12,6 +12,7 @@ enum Control {
     Font(fonts::Target),
     BreadcrumbSize,
     ExplorerMenu,
+    StickyKinds,
     Action(Command, &'static str),
 }
 
@@ -99,6 +100,12 @@ const SECTIONS: &[(&str, &[Item])] = &[
                 Toggle(Setting::StickyControlFlow),
                 "Sticky scroll: control flow",
                 "Also pin the if, else, loop, switch and case lines around the visible code, not only functions and types.",
+            ),
+            item(
+                StickyKinds,
+                "Sticky scroll: pinned lines",
+                "Choose which kinds of lines are pinned: functions, types, if / else, loops, switch, case, try / catch. \
+                 Also from the right-click menu of a pinned line.",
             ),
             item(
                 Toggle(Setting::InlineBlame),
@@ -439,6 +446,19 @@ impl App {
                 }
                 Font(target) => self.font_controls(ui, target),
                 ExplorerMenu => self.explorer_menu_switch(ui),
+                StickyKinds => {
+                    let shown = self.settings.sticky_shown;
+                    let count = shown
+                        .iter()
+                        .filter(|kind| self.settings.sticky_control_flow || !kind.is_control_flow())
+                        .count();
+                    let label = format!("{count} of {} kinds", crate::editor::sticky::Kind::ALL.len());
+                    ui.menu_button(label, |ui| {
+                        if let Some(command) = crate::editor::sticky::kinds_menu(ui, shown, self.settings.sticky_control_flow) {
+                            *run = Some(command);
+                        }
+                    });
+                }
                 BreadcrumbSize => {
                     let size = &mut self.settings.breadcrumb_font_size;
                     let response = ui

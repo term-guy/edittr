@@ -4,6 +4,8 @@ use eframe::egui::{self, Key, KeyboardShortcut, ModifierNames, Modifiers};
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Command {
     Palette,
+    /// Show / hide one kind of sticky scroll line.
+    ToggleStickyKind(crate::editor::sticky::Kind),
     OpenFolder,
     CloseFolder,
     QuickOpen,
