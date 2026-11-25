@@ -1,5 +1,6 @@
 mod assist;
 mod c_flags;
+mod call_hierarchy;
 mod code_navigation;
 mod commit_view;
 mod diff_edit;
@@ -401,6 +402,7 @@ pub struct App {
     split: Option<usize>,
     /// Hover info, completion, references.
     assist: assist::Assist,
+    call_hierarchy: Option<call_hierarchy::CallHierarchy>,
     /// Screen rect of the active editor's caret (last frame).
     last_caret: Option<egui::Rect>,
     confirm: Option<Confirm>,
@@ -500,6 +502,7 @@ impl App {
             picker: None,
             split: None,
             assist: Default::default(),
+            call_hierarchy: None,
             last_caret: None,
             confirm: None,
             open_folder_requested: false,
@@ -556,6 +559,7 @@ impl App {
     }
 
     fn clear_project(&mut self) {
+        self.call_hierarchy = None;
         self.ignored_off.clear();
         self.explorer_revealed = None;
         self.explorer_scroll_to = None;
@@ -828,6 +832,7 @@ impl App {
         self.poll_c_flags();
         self.poll_picker();
         self.poll_outline();
+        self.poll_call_hierarchy();
         self.poll_search(ctx);
         self.poll_project_replace(ctx);
         self.poll_find_edit();
@@ -1065,7 +1070,7 @@ impl App {
         }
         let diags = self.squiggles_for(si, ui.visuals());
         let settings = self.settings;
-        let (mut close, mut goto) = (false, None);
+        let (mut close, mut goto, mut context_command) = (false, None, None);
         egui::Panel::right("split-pane")
             .resizable(true)
             .default_size(ui.available_width() / 2.0)
@@ -1081,7 +1086,14 @@ impl App {
                     });
                 });
                 ui.separator();
-                goto = editor(ui, doc, settings, None, &diags, &[], 1, &[], &[]).goto;
+                if settings.sticky_scroll
+                    && let Some(scopes) = self.outline.sticky_scopes((doc.id, doc.version))
+                {
+                    doc.ed.set_sticky_outline(doc.version, scopes);
+                }
+                let out = editor(ui, doc, settings, None, &diags, &[], 1, &[], &[]);
+                goto = out.goto;
+                context_command = out.context_command;
             });
         if close {
             self.split = None;
@@ -1090,6 +1102,10 @@ impl App {
             // Go to definition from the side editor: make it the active one first.
             self.active = si;
             self.go_to_definition(idx, &self.ctx.clone());
+        }
+        if let Some(command) = context_command {
+            self.active = si;
+            self.run_command(command);
         }
     }
 
@@ -2697,6 +2713,11 @@ impl App {
                     } else {
                         None
                     };
+                    if self.settings.sticky_scroll
+                        && let Some(scopes) = self.outline.sticky_scopes((doc.id, doc.version))
+                    {
+                        doc.ed.set_sticky_outline(doc.version, scopes);
+                    }
                     let out = editor(ui, doc, self.settings, inline, &diags, &marks, 0, &[], &global_marks);
                     if let Some(idx) = out.goto {
                         goto_at = Some(idx);
@@ -2792,6 +2813,9 @@ impl App {
         if let Some(out) = &editor_out {
             self.last_caret = out.caret;
             self.after_editor(out);
+            if let Some(command) = out.context_command {
+                self.run_command(command);
+            }
         }
         if let Some(idx) = goto_at {
             self.go_to_definition(idx, ui.ctx());
@@ -3258,6 +3282,7 @@ impl eframe::App for App {
             .exact_size(44.0)
             .show(ui, |ui| self.activity_bar(ui));
         self.show_session_sidebar(ui);
+        self.call_hierarchy_panel(ui);
         egui::CentralPanel::default().show(ui, |ui| self.central(ui));
         self.open_requested_folder(frame);
         self.dialogs(&ctx);
@@ -3408,6 +3433,8 @@ fn editor(
         comment: doc.comment,
         minimap: settings.minimap,
         bracket_colors: settings.bracket_colors,
+        sticky_scroll: settings.sticky_scroll && pane != 3,
+        navigation_menu: pane != 3,
         read_only: false,
     };
     // Diagnostics: (line, char col) pairs to byte ranges.
@@ -3481,6 +3508,7 @@ fn editor(
     });
     EditorOut {
         goto: out.goto.map(|b| ix.byte_to_char(&doc.text, b)),
+        context_command: out.context_command,
         hover,
         caret: out.caret_rect,
         changed: out.changed,
@@ -3585,6 +3613,7 @@ fn large_view(ui: &mut egui::Ui, v: &mut crate::large::Viewer) {
 pub(super) struct EditorOut {
     /// Cmd/Ctrl+click: go to the definition at this char index.
     goto: Option<usize>,
+    context_command: Option<Command>,
     /// Pointer resting at (byte, screen pos), with any diagnostic messages there.
     hover: Option<(usize, egui::Pos2, Option<String>)>,
     caret: Option<egui::Rect>,

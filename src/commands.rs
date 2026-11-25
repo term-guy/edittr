@@ -19,6 +19,7 @@ pub(crate) enum Command {
     RenameSymbol,
     CodeActions,
     SignatureHelp,
+    ShowCallHierarchy,
     GoBack,
     GoForward,
     Explorer,
@@ -52,6 +53,7 @@ pub(crate) enum Setting {
     Minimap,
     BracketColors,
     SemanticHighlighting,
+    StickyScroll,
     ShowOutline,
 }
 
@@ -69,6 +71,7 @@ impl Setting {
             Self::Minimap => "Show minimap",
             Self::BracketColors => "Color nested brackets",
             Self::SemanticHighlighting => "Semantic highlighting (colors from the language server)",
+            Self::StickyScroll => "Sticky scroll",
             Self::ShowOutline => "Show outline",
         }
     }
@@ -86,6 +89,7 @@ impl Setting {
             Self::Minimap => &mut settings.minimap,
             Self::BracketColors => &mut settings.bracket_colors,
             Self::SemanticHighlighting => &mut settings.semantic_highlighting,
+            Self::StickyScroll => &mut settings.sticky_scroll,
             Self::ShowOutline => &mut settings.show_outline,
         }
     }
@@ -111,16 +115,21 @@ impl Entry {
     }
 
     pub(crate) fn consume(&self, input: &mut egui::InputState) -> bool {
-        if self.id == Command::SwitchSourceHeader {
-            // egui-winit emits a Text event immediately after an Alt+O key
-            // press (for example, Option+O types ø on a US Mac keyboard).
+        if matches!(self.id, Command::SwitchSourceHeader | Command::ShowCallHierarchy) {
+            // Option-letter shortcuts can also produce a Text event on macOS.
             let mut consumed = false;
             let mut paired_text = false;
             input.events.retain(|event| {
                 let text = std::mem::take(&mut paired_text) && matches!(event, egui::Event::Text(_));
                 paired_text = matches!(
                     event,
-                    egui::Event::Key { key: Key::O, pressed: true, modifiers, .. } if *modifiers == Modifiers::ALT
+                    egui::Event::Key { key, pressed: true, modifiers, .. }
+                        if self.shortcuts.iter().any(|shortcut| shortcut.logical_key == *key
+                            && if self.id == Command::SwitchSourceHeader {
+                                *modifiers == shortcut.modifiers
+                            } else {
+                                modifiers.matches_logically(shortcut.modifiers)
+                            })
                 );
                 consumed |= paired_text;
                 !paired_text && !text
@@ -170,6 +179,11 @@ pub(crate) const COMMANDS: &[Entry] = &[
     Entry::new(FindInFiles, "Search in files", &[KeyboardShortcut::new(CMD_SHIFT, Key::F)]),
     Entry::new(DocumentSymbols, "Go to symbol in file", &[KeyboardShortcut::new(CMD_SHIFT, Key::O)]),
     Entry::new(WorkspaceSymbols, "Go to symbol in workspace", &[KeyboardShortcut::new(CMD, Key::T)]),
+    Entry::new(
+        ShowCallHierarchy,
+        "Show Call Hierarchy",
+        &[KeyboardShortcut::new(Modifiers::SHIFT.plus(Modifiers::ALT), Key::H)],
+    ),
     // Before Go to definition: egui also matches F12 when Shift is held.
     Entry::new(
         FindReferences,
@@ -225,6 +239,7 @@ pub(crate) const COMMANDS: &[Entry] = &[
     Entry::new(ToggleSetting(Setting::Minimap), "Toggle minimap", &[]),
     Entry::new(ToggleSetting(Setting::BracketColors), "Toggle bracket pair colors", &[]),
     Entry::new(ToggleSetting(Setting::SemanticHighlighting), "Toggle semantic highlighting", &[]),
+    Entry::new(ToggleSetting(Setting::StickyScroll), "Toggle sticky scroll", &[]),
     Entry::new(ToggleSetting(Setting::ShowOutline), "Show outline", &[]),
     Entry::new(TabSize(2), "Tab size: 2", &[]),
     Entry::new(TabSize(4), "Tab size: 4", &[]),
@@ -278,6 +293,7 @@ mod tests {
         assert!(first(CMD, Key::P) == Some(QuickOpen));
         assert!(first(CMD_SHIFT, Key::O) == Some(DocumentSymbols));
         assert!(first(Modifiers::SHIFT, Key::F12) == Some(FindReferences));
+        assert!(first(Modifiers::SHIFT.plus(Modifiers::ALT), Key::H) == Some(ShowCallHierarchy));
         assert!(first(Modifiers::NONE, Key::F12) == Some(GoToDefinition));
         assert!(first(Modifiers::SHIFT.plus(Modifiers::ALT), Key::F) == Some(FormatDocument));
         #[cfg(target_os = "macos")]
@@ -293,20 +309,25 @@ mod tests {
     }
 
     #[test]
-    fn switch_source_header_consumes_text_generated_by_the_shortcut() {
-        let mut input = egui::InputState::default();
-        input.events = vec![
-            egui::Event::Key {
-                key: Key::O,
-                physical_key: Some(Key::O),
-                pressed: true,
-                repeat: false,
-                modifiers: Modifiers::ALT,
-            },
-            egui::Event::Text("ø".into()),
-            egui::Event::Text("other input".into()),
-        ];
-        assert!(entry(Command::SwitchSourceHeader).consume(&mut input));
-        assert_eq!(input.events, [egui::Event::Text("other input".into())]);
+    fn option_shortcuts_consume_paired_text() {
+        for (command, key, modifiers, generated) in [
+            (SwitchSourceHeader, Key::O, Modifiers::ALT, "ø"),
+            (ShowCallHierarchy, Key::H, Modifiers::ALT | Modifiers::SHIFT, "Ó"),
+        ] {
+            let mut input = egui::InputState::default();
+            input.events = vec![
+                egui::Event::Key {
+                    key,
+                    physical_key: Some(key),
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                },
+                egui::Event::Text(generated.into()),
+                egui::Event::Text("other input".into()),
+            ];
+            assert!(entry(command).consume(&mut input));
+            assert_eq!(input.events, [egui::Event::Text("other input".into())]);
+        }
     }
 }

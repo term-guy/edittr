@@ -28,8 +28,10 @@ const STEPS: &[&str] = &[
     "go-to-file",
     "search-in-files",
     "folding",
+    "sticky-scroll",
     "lsp-hover",
     "lsp-completion",
+    "call-hierarchy",
     "find-replace",
     "command-palette",
     "source-control",
@@ -217,6 +219,7 @@ impl Tour {
             && app.diff_rx.is_none()
             && app.graph_rx.is_none()
             && !app.graph_detail.loading()
+            && app.call_hierarchy.as_ref().is_none_or(|panel| !panel.loading())
             && app.quick_open.as_ref().is_none_or(|q| q.files_rx.is_none());
         let elapsed = self.started.elapsed();
         let min_frames = match name {
@@ -290,6 +293,16 @@ impl Tour {
                     d.ed.folded.insert(18);
                 }
             }
+            "sticky-scroll" => {
+                app.settings.sticky_scroll = true;
+                if let Some(Tab::File(doc)) = app.tabs.get_mut(app.active) {
+                    doc.ed.folded.clear();
+                    if let Some(line) = editor::sticky::tour_line(&doc.text) {
+                        doc.ed.scroll_to_line(line as f32);
+                    }
+                }
+            }
+            "call-hierarchy" => app.call_hierarchy_tour_start(),
             "lsp-hover" | "lsp-completion" => {
                 // Put the caret on a call of `add` (C demo) or `lane_color` (Rust demo).
                 if let Some(Tab::File(d)) = app.tabs.get_mut(app.active) {
@@ -301,6 +314,7 @@ impl Tour {
                 }
             }
             "find-replace" => {
+                app.call_hierarchy = None;
                 if let Some(Tab::File(d)) = app.tabs.iter_mut().find(|t| matches!(t, Tab::File(_))) {
                     d.ed.folded.clear();
                 }

@@ -270,6 +270,7 @@ impl App {
             Command::RenameSymbol => self.start_rename(),
             Command::CodeActions => self.request_code_actions(),
             Command::SignatureHelp => self.request_signature_help(true),
+            Command::ShowCallHierarchy => self.show_call_hierarchy(),
             Command::Explorer => {
                 self.side = Side::Explorer;
                 self.side_open = true;

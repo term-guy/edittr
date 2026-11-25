@@ -1,5 +1,6 @@
 use super::{App, Doc, Side, Tab, background, icon_button, receive};
 use crate::{
+    editor::sticky::{Scopes, outline_scopes},
     icons as ic, lsp,
     outline::{Tree, VisibleRow},
     symbols,
@@ -21,6 +22,14 @@ struct Snapshot {
     revision: lsp::Revision,
     client: Option<Weak<lsp::Client>>,
     tree: Tree,
+    sticky_scopes: Scopes,
+}
+
+impl Outline {
+    pub(super) fn sticky_scopes(&self, revision: lsp::Revision) -> Option<&Scopes> {
+        let snapshot = self.snapshot.as_ref().filter(|snapshot| snapshot.revision == revision)?;
+        Some(&snapshot.sticky_scopes)
+    }
 }
 
 impl Snapshot {
@@ -100,10 +109,12 @@ impl App {
             let source = client.as_ref().map(Arc::downgrade);
             let project = root.as_deref().map(|root| (root, ignored.as_slice()));
             let tree = Tree::new(symbols::document(&path, &text, revision, client, project, None));
+            let sticky_scopes = outline_scopes(tree.rows.iter().map(|row| &row.symbol), &text);
             Snapshot {
                 revision,
                 client: source,
                 tree,
+                sticky_scopes,
             }
         }));
     }
@@ -292,6 +303,7 @@ mod tests {
         app.outline.snapshot = Some(Snapshot {
             revision,
             client: None,
+            sticky_scopes: Default::default(),
             tree: Tree::new(symbols::document(path, source, revision, None, None, None)),
         });
         let mut render = |events| {
