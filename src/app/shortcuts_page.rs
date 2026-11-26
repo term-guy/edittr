@@ -1,5 +1,6 @@
 //! Settings > Keyboard shortcuts: change, remove or reset the shortcut of any command.
-//! A shortcut already in use is only moved after the user confirms.
+//! A shortcut already in use is only moved after the user confirms; the editor's own keys
+//! (Undo, Copy, Tab, ...) can't be assigned.
 
 use super::App;
 use crate::commands::{self, COMMANDS};
@@ -9,8 +10,10 @@ use eframe::egui::{self, Event, Key, KeyboardShortcut, ModifierNames, Modifiers,
 pub(super) struct Shortcuts {
     /// The command (index in `COMMANDS`) whose new shortcut is being typed.
     recording: Option<usize>,
-    /// A change that takes shortcuts from other commands or editor keys, waiting for confirmation.
+    /// A change that takes shortcuts from other commands, waiting for confirmation.
     pending: Option<Pending>,
+    /// Why the last keys pressed while recording weren't taken (an editor key), for that command.
+    rejected: Option<(usize, String)>,
 }
 
 struct Pending {
@@ -19,8 +22,6 @@ struct Pending {
     shortcuts: Vec<KeyboardShortcut>,
     /// Other commands that lose one of them.
     taken_from: Vec<(usize, KeyboardShortcut)>,
-    /// Editor keys (Undo, Copy, ...) a command would take over.
-    editor_keys: Vec<(KeyboardShortcut, &'static str)>,
 }
 
 fn text(shortcut: &KeyboardShortcut, ctx: &egui::Context) -> String {
@@ -84,9 +85,20 @@ impl App {
             pressed
         });
         if let Some((key, m)) = pressed {
-            self.shortcut_page.recording = None;
-            if !(key == Key::Escape && m.is_none()) {
-                self.change_shortcuts(entry, vec![normalized(key, m)]);
+            let shortcut = normalized(key, m);
+            if key == Key::Escape && m.is_none() {
+                self.shortcut_page.recording = None;
+                self.shortcut_page.rejected = None;
+            } else if let Some((_, what)) = commands::editor_keys().into_iter().find(|(k, _)| *k == shortcut) {
+                // Keep waiting for other keys.
+                self.shortcut_page.rejected = Some((
+                    entry,
+                    format!("{} is the editor's {what} and can't be assigned.", text(&shortcut, ctx)),
+                ));
+            } else {
+                self.shortcut_page.recording = None;
+                self.shortcut_page.rejected = None;
+                self.change_shortcuts(entry, vec![shortcut]);
             }
         }
         true
@@ -104,17 +116,12 @@ impl App {
             .filter(|&(i, _)| i != entry)
             .flat_map(|(i, list)| list.iter().filter(|s| shortcuts.contains(s)).map(move |s| (i, *s)))
             .collect();
-        let editor_keys: Vec<_> = commands::editor_keys()
-            .into_iter()
-            .filter(|(key, _)| shortcuts.contains(key))
-            .collect();
         let pending = Pending {
             entry,
             shortcuts,
             taken_from,
-            editor_keys,
         };
-        if pending.taken_from.is_empty() && pending.editor_keys.is_empty() {
+        if pending.taken_from.is_empty() {
             self.apply_shortcuts(pending);
         } else {
             self.shortcut_page.pending = Some(pending);
@@ -217,11 +224,20 @@ impl App {
                             }
                         });
                     });
+                    if let Some((_, why)) = self.shortcut_page.rejected.as_ref().filter(|(entry, _)| entry == i) {
+                        ui.colored_label(ui.visuals().warn_fg_color, format!("{why} Press other keys, or Esc to cancel."));
+                    }
                 }
             });
         match action {
-            Some((i, RowAction::Record)) => self.shortcut_page.recording = Some(i),
-            Some((_, RowAction::Cancel)) => self.shortcut_page.recording = None,
+            Some((i, RowAction::Record)) => {
+                self.shortcut_page.recording = Some(i);
+                self.shortcut_page.rejected = None;
+            }
+            Some((_, RowAction::Cancel)) => {
+                self.shortcut_page.recording = None;
+                self.shortcut_page.rejected = None;
+            }
             Some((i, RowAction::Remove)) => self.change_shortcuts(i, Vec::new()),
             Some((i, RowAction::Reset)) => self.change_shortcuts(i, COMMANDS[i].default_shortcuts().to_vec()),
             Some((_, RowAction::ResetAll)) => {
@@ -249,12 +265,6 @@ impl App {
                     "{} is used by \"{}\". It will be removed from there and assigned to \"{title}\".",
                     text(shortcut, ctx),
                     COMMANDS[*i].title
-                ));
-            }
-            for (shortcut, what) in &pending.editor_keys {
-                ui.label(format!(
-                    "{} is the editor's {what}. \"{title}\" will take it over while it's assigned.",
-                    text(shortcut, ctx)
                 ));
             }
             ui.add_space(8.0);
@@ -350,6 +360,13 @@ mod tests {
             Some(crate::editor::Action::JoinLines)
         );
         assert_eq!(app.settings.shortcuts.len(), 2);
+        // The editor's own keys are refused; recording goes on.
+        app.shortcut_page.recording = Some(duplicate);
+        frame(&mut app, vec![key(Key::Z, Modifiers::COMMAND)]);
+        assert_eq!(app.shortcut_page.recording, Some(duplicate));
+        assert!(app.shortcut_page.pending.is_none());
+        assert!(app.shortcut_page.rejected.as_ref().is_some_and(|(_, why)| why.contains("Undo")));
+        assert!(commands::all_shortcuts()[duplicate].is_empty());
         // An unused shortcut is taken at once; Esc while recording cancels.
         app.shortcut_page.recording = Some(duplicate);
         frame(&mut app, vec![key(Key::F7, Modifiers::ALT)]);

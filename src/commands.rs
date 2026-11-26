@@ -283,9 +283,14 @@ fn store_keymap(keymap: std::sync::Arc<Keymap>) {
 
 impl Keymap {
     fn new(overrides: &Overrides) -> Self {
+        let reserved = editor_keys();
         let shortcuts: Vec<Vec<KeyboardShortcut>> = COMMANDS
             .iter()
-            .map(|entry| overrides.get(entry.title).cloned().unwrap_or_else(|| entry.shortcuts.to_vec()))
+            .map(|entry| match overrides.get(entry.title) {
+                // The editor's own keys can't be assigned (also when the settings file says so).
+                Some(list) => list.iter().filter(|s| !reserved.iter().any(|(k, _)| k == *s)).copied().collect(),
+                None => entry.shortcuts.to_vec(),
+            })
             .collect();
         // Most modifiers first: egui also matches a shortcut when Shift or Alt is held in addition,
         // so Ctrl+F would otherwise take Ctrl+Shift+F (Search in files) and Ctrl+Alt+F (Replace).
@@ -382,7 +387,7 @@ pub(crate) fn parse_shortcut(spec: &str) -> Option<KeyboardShortcut> {
     Some(KeyboardShortcut::new(modifiers, key?))
 }
 
-/// Keys the editor handles itself (not commands): assigning one to a command takes it over.
+/// Keys the editor handles itself (not commands): they can't be assigned to commands.
 pub(crate) fn editor_keys() -> Vec<(KeyboardShortcut, &'static str)> {
     let k = KeyboardShortcut::new;
     let mut keys = vec![
@@ -674,8 +679,18 @@ mod tests {
             assert_eq!(entry.index(), i);
             for shortcut in entry.default_shortcuts() {
                 assert_eq!(parse_shortcut(&shortcut_spec(shortcut)).as_ref(), Some(shortcut), "{}", entry.title);
+                assert!(
+                    !editor_keys().iter().any(|(k, _)| k == shortcut),
+                    "{} uses an editor key",
+                    entry.title
+                );
             }
         }
+        // An editor key in the settings file is ignored.
+        let save = entry(Save);
+        let cmd_z = KeyboardShortcut::new(CMD, Key::Z);
+        let keymap = Keymap::new(&Overrides::from([(save.title.to_string(), vec![cmd_z])]));
+        assert!(keymap.shortcuts[save.index()].is_empty());
     }
 
     #[test]
