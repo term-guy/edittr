@@ -63,10 +63,13 @@ pub(crate) struct Fonts {
     list_requested: bool,
     pub(crate) families: Option<Vec<Family>>,
     faces: [Option<FontData>; 2],
+    /// The platform's UI font, used while no UI font is chosen (None: the bundled one).
+    default_ui: Option<(&'static str, FontData)>,
 }
 
 impl Fonts {
     pub(crate) fn start(&mut self, settings: &Settings, ctx: &egui::Context) {
+        self.default_ui = platform_ui_font();
         self.install(settings, ctx);
         self.apply_sizes(settings, ctx);
         for (target, choice) in [(Target::Editor, &settings.editor_font), (Target::Ui, &settings.ui_font)] {
@@ -77,11 +80,13 @@ impl Fonts {
     }
 
     pub(crate) fn install(&self, settings: &Settings, ctx: &egui::Context) {
-        ctx.set_fonts(crate::icons::definitions(
-            settings.tab_size,
-            self.faces[0].as_ref(),
-            self.faces[1].as_ref(),
-        ));
+        let ui = self.faces[1].as_ref().or(self.default_ui.as_ref().map(|(_, data)| data));
+        ctx.set_fonts(crate::icons::definitions(settings.tab_size, self.faces[0].as_ref(), ui));
+    }
+
+    /// Name of the font "Default" stands for in the UI font picker.
+    pub(crate) fn default_ui_name(&self) -> Option<&'static str> {
+        self.default_ui.as_ref().map(|(name, _)| *name)
     }
 
     pub(crate) fn apply_sizes(&self, settings: &Settings, ctx: &egui::Context) {
@@ -186,6 +191,53 @@ impl Fonts {
     }
 }
 
+/// Where the platform's UI font usually is, best first: (name, file, face index).
+fn platform_ui_candidates() -> Vec<(&'static str, std::path::PathBuf, u32)> {
+    use std::path::PathBuf;
+    if cfg!(windows) {
+        let windows = std::env::var_os("WINDIR").map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
+        vec![("Segoe UI", windows.join(r"Fonts\segoeui.ttf"), 0)]
+    } else if cfg!(target_os = "macos") {
+        vec![
+            ("San Francisco", PathBuf::from("/System/Library/Fonts/SFNS.ttf"), 0),
+            ("Helvetica Neue", PathBuf::from("/System/Library/Fonts/HelveticaNeue.ttc"), 0),
+        ]
+    } else {
+        // The default sans-serif fonts of the common desktops (Ubuntu, GNOME, Fedora, KDE, others),
+        // at their usual paths on Debian / Ubuntu, Fedora and Arch.
+        [
+            ("Ubuntu", "truetype/ubuntu/Ubuntu-R.ttf"),
+            ("Ubuntu", "truetype/ubuntu/Ubuntu[wdth,wght].ttf"),
+            ("Adwaita Sans", "adwaita-sans-fonts/AdwaitaSans-Regular.ttf"),
+            ("Adwaita Sans", "Adwaita/AdwaitaSans-Regular.ttf"),
+            ("Cantarell", "cantarell/Cantarell-VF.otf"),
+            ("Cantarell", "abattis-cantarell-vf-fonts/Cantarell-VF.otf"),
+            ("Cantarell", "opentype/cantarell/Cantarell-VF.otf"),
+            ("Noto Sans", "truetype/noto/NotoSans-Regular.ttf"),
+            ("Noto Sans", "google-noto/NotoSans-Regular.ttf"),
+            ("Noto Sans", "noto/NotoSans-Regular.ttf"),
+            ("DejaVu Sans", "truetype/dejavu/DejaVuSans.ttf"),
+            ("DejaVu Sans", "dejavu-sans-fonts/DejaVuSans.ttf"),
+            ("DejaVu Sans", "TTF/DejaVuSans.ttf"),
+            ("Liberation Sans", "truetype/liberation/LiberationSans-Regular.ttf"),
+            ("Liberation Sans", "liberation-sans/LiberationSans-Regular.ttf"),
+        ]
+        .into_iter()
+        .map(|(name, path)| (name, PathBuf::from("/usr/share/fonts").join(path), 0))
+        .collect()
+    }
+}
+
+/// The platform's UI font: Segoe UI on Windows, San Francisco on macOS, the desktop's usual
+/// sans-serif on Linux. Read from known paths: no font catalog scan at startup.
+fn platform_ui_font() -> Option<(&'static str, FontData)> {
+    platform_ui_candidates().into_iter().find_map(|(name, path, index)| {
+        let data = FontData::from_blob(Arc::new(std::fs::read(&path).ok()?), index);
+        valid_face(&data)?;
+        Some((name, data))
+    })
+}
+
 fn system_fonts() -> Collection {
     Collection::new(CollectionOptions {
         shared: false,
@@ -271,6 +323,32 @@ pub(crate) fn editor_font(style: &Style) -> FontId {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_platform_ui_font_is_the_default_ui_font() {
+        let started = std::time::Instant::now();
+        let found = platform_ui_font();
+        eprintln!(
+            "platform UI font: {:?} in {:?}",
+            found.as_ref().map(|(name, _)| *name),
+            started.elapsed()
+        );
+        if cfg!(any(windows, target_os = "macos")) {
+            assert!(found.is_some(), "Segoe UI / San Francisco ship with the OS");
+        }
+        let ctx = egui::Context::default();
+        let mut fonts = Fonts::default();
+        fonts.start(&Settings::default(), &ctx);
+        assert_eq!(fonts.default_ui_name(), found.as_ref().map(|(name, _)| *name));
+        let mut out = ctx.run_ui(Default::default(), |ui| {
+            ui.label("Text in the UI font");
+        });
+        out.textures_delta.clear();
+        if found.is_some() {
+            let families = ctx.fonts(|f| f.definitions().families[&FontFamily::Proportional].clone());
+            assert_eq!(families[0], "ui-font");
+        }
+    }
 
     #[test]
     fn defaults_do_not_start_the_font_worker_and_sizes_are_independent() {

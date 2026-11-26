@@ -592,8 +592,13 @@ impl App {
             .add(egui::DragValue::new(size).range(FONT_SIZE_RANGE).suffix(" pt"))
             .on_hover_text(format!("Default size is {DEFAULT_FONT_SIZE} pt"))
             .changed();
+        // "Default" is the platform's UI font (Segoe UI, San Francisco, ...) or the bundled one.
+        let default_label = match (target, self.fonts.default_ui_name()) {
+            (fonts::Target::Ui, Some(name)) => format!("Default ({name})"),
+            _ => "Default".to_string(),
+        };
         let saved = target.choice(&mut self.settings);
-        let current = saved.as_ref().map_or("Default", |choice| choice.family.as_str());
+        let current = saved.as_ref().map_or(default_label.as_str(), |choice| choice.family.as_str());
         let salt = ("font-picker", target);
         // Not `ComboBox::is_open(make_persistent_id(salt))`: `from_id_salt` wraps the salt, so that id never matched
         // and the search text was cleared every frame.
@@ -625,8 +630,8 @@ impl App {
                     *focus = false;
                 }
                 if ui
-                    .selectable_label(saved.is_none(), "Default")
-                    .on_hover_text("Restore the bundled font and size")
+                    .selectable_label(saved.is_none(), default_label.as_str())
+                    .on_hover_text("Restore the default font and size")
                     .clicked()
                 {
                     ui.close();
@@ -872,7 +877,7 @@ mod tests {
         let pos = frame(&mut app, Vec::new())
             .iter()
             .find_map(|shape| match &shape.shape {
-                egui::Shape::Text(text) if text.galley.text() == "Default" => Some(text.pos + egui::vec2(3.0, 3.0)),
+                egui::Shape::Text(text) if text.galley.text().starts_with("Default") => Some(text.pos + egui::vec2(3.0, 3.0)),
                 _ => None,
             })
             .unwrap();
