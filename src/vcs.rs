@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 pub use git::{Commit, FileChange, Stash, StashAction, Status};
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Vcs {
     Git,
     Svn,
@@ -48,6 +48,76 @@ fn nearest(git: Option<PathBuf>, svn: Option<PathBuf>) -> Option<(PathBuf, Vcs)>
         (None, Some(svn)) => Some((svn, Vcs::Svn)),
         (None, None) => None,
     }
+}
+
+/// Folders searched below the project for nested repositories (submodules, independent clones).
+const DISCOVER_DEPTH: usize = 8;
+const DISCOVER_DIRS: usize = 20_000;
+/// Repositories shown at most (status runs for each on every refresh).
+pub const MAX_REPOSITORIES: usize = 64;
+
+/// The repositories of a project folder: the one containing `root` (if any) first, then
+/// those nested inside it, by path. `ignored` holds root-relative folders to skip.
+pub fn discover(root: &Path, ignored: &[String]) -> Vec<(PathBuf, Vcs)> {
+    let mut found: Vec<(PathBuf, Vcs)> = detect(root).into_iter().collect();
+    let mut nested = nested_repositories(root, ignored);
+    nested.sort_by(|a, b| a.0.cmp(&b.0));
+    for repo in nested {
+        if found.len() >= MAX_REPOSITORIES {
+            break;
+        }
+        if !found.iter().any(|(path, _)| *path == repo.0) {
+            found.push(repo);
+        }
+    }
+    found
+}
+
+/// Folders below `root` (not `root` itself) holding a `.git` (folder, or file for submodules
+/// and worktrees) or the top `.svn` of a working copy.
+fn nested_repositories(root: &Path, ignored: &[String]) -> Vec<(PathBuf, Vcs)> {
+    let mut out = Vec::new();
+    // (folder, depth, inside a Subversion working copy: pre-1.7 copies have `.svn` in every folder)
+    let mut stack = vec![(root.to_path_buf(), 0, false)];
+    let mut visited = 0;
+    while let Some((dir, depth, in_svn)) = stack.pop() {
+        visited += 1;
+        if visited > DISCOVER_DIRS {
+            break;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        let (mut git, mut svn) = (false, false);
+        let mut subdirs = Vec::new();
+        for entry in entries.flatten() {
+            // Symbolic links are not followed: they can loop or leave the project.
+            let Ok(kind) = entry.file_type() else { continue };
+            let name = entry.file_name();
+            if name == ".git" {
+                git |= kind.is_dir() || kind.is_file();
+            } else if name == ".svn" {
+                svn |= kind.is_dir();
+            } else if kind.is_dir() && depth < DISCOVER_DEPTH {
+                let skip = name.to_str().is_none_or(|name| crate::watch::IGNORED_DIRS.contains(&name));
+                let path = entry.path();
+                if !skip && crate::workspace::relative_path(root, &path).is_none_or(|rel| !crate::workspace::is_ignored(&rel, ignored)) {
+                    subdirs.push(path);
+                }
+            }
+        }
+        if dir != root {
+            let vcs = if git {
+                Some(Vcs::Git)
+            } else {
+                (svn && !in_svn).then_some(Vcs::Svn)
+            };
+            if let Some(vcs) = vcs {
+                out.push((crate::workspace::canonical(&dir).unwrap_or(dir.clone()), vcs));
+            }
+        }
+        let in_svn = svn && !git;
+        stack.extend(subdirs.into_iter().map(|path| (path, depth + 1, in_svn)));
+    }
+    out
 }
 
 pub fn init_git(dir: &Path) -> Result<String, String> {
@@ -309,5 +379,45 @@ mod tests {
         assert!(nearest(None, Some(outer.clone())) == svn(&outer));
         assert!(nearest(Some(outer.clone()), None) == git(&outer));
         assert!(nearest(None, None).is_none());
+    }
+
+    #[test]
+    fn discover_finds_nested_repositories_and_skips_ignored_folders() {
+        let root = std::env::temp_dir().join(format!("edittr-discover-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for dir in [
+            "app/.git",
+            "libs/core/.git",
+            "libs/core/vendor/x/.git",
+            "node_modules/dep/.git",
+            "skipped/inner/.git",
+        ] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        // A submodule's `.git` is a file.
+        std::fs::create_dir_all(root.join("libs/sub")).unwrap();
+        std::fs::write(root.join("libs/sub/.git"), "gitdir: ../../.git/modules/sub\n").unwrap();
+        std::fs::create_dir_all(root.join("docs/.svn")).unwrap();
+        let mut found = nested_repositories(&root, &["skipped".to_string()]);
+        found.sort_by(|a, b| a.0.cmp(&b.0));
+        let root = crate::workspace::canonical(&root).unwrap();
+        let rel: Vec<_> = found
+            .iter()
+            .map(|(path, vcs)| {
+                (
+                    path.strip_prefix(&root).unwrap().to_string_lossy().replace('\\', "/"),
+                    *vcs == Vcs::Git,
+                )
+            })
+            .collect();
+        let expected = [
+            ("app", true),
+            ("docs", false),
+            ("libs/core", true),
+            ("libs/core/vendor/x", true),
+            ("libs/sub", true),
+        ];
+        assert_eq!(rel, expected.map(|(p, git)| (p.to_string(), git)));
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

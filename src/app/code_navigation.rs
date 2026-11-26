@@ -36,7 +36,7 @@ impl App {
         }
         let (revision, path, text) = ((doc.id, doc.version), doc.path.clone(), doc.text.clone());
         let root = self.root.clone();
-        let vcs = self.vcs;
+        let vcs = self.project_vcs();
         let ignored = self.ignored.clone();
         let launch = (!self.path_is_ignored(&path)).then(|| self.launch_server(&ext, false)).flatten();
         self.code_navigation.counterpart = Some(background(&self.ctx, move || {
@@ -97,6 +97,7 @@ impl App {
             }
         }
 
+        let project_vcs = self.project_vcs();
         let nav = &mut self.code_navigation;
         let mut updated = false;
         if let Some(snapshot) = receive(&mut nav.symbols_rx) {
@@ -111,7 +112,7 @@ impl App {
             let changed = std::mem::take(&mut nav.changed);
             let previous = nav.symbols.clone();
             let cancel = nav.cancel.clone();
-            let vcs = self.vcs;
+            let vcs = project_vcs;
             let ignored = self.ignored.clone();
             nav.symbols_rx = Some(background(&self.ctx, move || {
                 let vcs = vcs.or_else(|| previous.is_none().then(|| vcs::detect(&root)).flatten().map(|(_, vcs)| vcs));

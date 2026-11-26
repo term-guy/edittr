@@ -237,7 +237,8 @@ fn classify(
         while let Some(part) = parts.next() {
             if part == ".git" {
                 let rest = parts.as_path();
-                if relative == Path::new(".git") {
+                if relative == Path::new(".git") || (rest.as_os_str().is_empty() && structural) {
+                    // The project's own repository, or a nested one cloned or removed.
                     changes.rediscover = true;
                     relevant = true;
                 } else if rest.as_os_str().is_empty() || git_metadata(rest) {

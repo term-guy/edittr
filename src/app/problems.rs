@@ -161,7 +161,7 @@ impl App {
             }
         }
         let failed = self.lsp.failed.clone();
-        let vcs = self.vcs;
+        let vcs = self.project_vcs();
         let launch = Arc::new(lsp::Launch::default());
         let shared = launch.clone();
         let ctx = self.ctx.clone();

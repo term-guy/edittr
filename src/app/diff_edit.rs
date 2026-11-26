@@ -254,8 +254,10 @@ impl App {
         match action {
             gutter::Action::Stage if self.bg_task.is_none() => {
                 let Some((change, false)) = d.source.git_hunks() else { return };
+                let DiffSource::Vcs { repo, vcs, .. } = &d.source else { return };
+                let repository = (repo.clone(), *vcs);
                 let (path, base, text, crlf) = (change.path.clone(), live.base.clone(), doc.text.clone(), doc.crlf);
-                self.stage_buffer_hunk(path, BufferBase::Index(base), text, crlf, hunk);
+                self.stage_buffer_hunk(repository, path, BufferBase::Index(base), text, crlf, hunk);
             }
             gutter::Action::Revert => {
                 let base = without_cr_at_eol(&live.base, true);

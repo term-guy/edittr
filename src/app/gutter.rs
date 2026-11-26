@@ -189,13 +189,17 @@ fn preview_ui(ui: &mut egui::Ui, old: &str, new: &str, can_stage: bool, busy: bo
 impl App {
     pub(super) fn poll_markers(&mut self) {
         const SETTLE: Duration = Duration::from_millis(300);
-        let (Some(root), Some(vcs)) = (&self.repo, self.vcs) else { return };
+        let fallback = self.repository();
         let active = self.active;
         for (i, tab) in self.tabs.iter_mut().enumerate() {
             if i != active && Some(i) != self.split {
                 continue;
             }
             let Tab::File(doc) = tab else { continue };
+            let Some((root, vcs)) = super::repositories::owner(&self.repos.list, &doc.path).or_else(|| fallback.clone()) else {
+                continue;
+            };
+            let root = &root;
             let m = &mut doc.markers;
             if let Some(base) = receive(&mut m.base_rx) {
                 m.base = Some(base.map(Arc::new));
@@ -240,6 +244,8 @@ impl App {
     }
 
     pub(super) fn gutter_popup(&mut self, ui: &egui::Ui, tab: usize, pane: u8, click: Option<Click>) {
+        let Some(Tab::File(doc)) = self.tabs.get(tab) else { return };
+        let git = self.repo_of(&doc.path).is_some_and(|(_, vcs)| vcs == Vcs::Git);
         let Some(Tab::File(doc)) = self.tabs.get_mut(tab) else { return };
         let Some(Diffed { hunks, .. }) = doc.markers.current(doc.version) else {
             doc.markers.preview = None;
@@ -284,7 +290,7 @@ impl App {
         } else {
             egui::PopupCloseBehavior::CloseOnClickOutside
         })
-        .show(|ui| preview_ui(ui, old, &doc.text[new], self.vcs == Some(Vcs::Git), self.bg_task.is_some()));
+        .show(|ui| preview_ui(ui, old, &doc.text[new], git, self.bg_task.is_some()));
         let picked = preview.hunk;
         let editor = preview.editor;
         if !open {
@@ -299,7 +305,10 @@ impl App {
     }
 
     pub(super) fn gutter_action(&mut self, tab: usize, action: Action, selected: bool, picked: Option<usize>) {
-        let (Some(root), Some(vcs)) = (&self.repo, self.vcs) else { return };
+        let Some(Tab::File(doc)) = self.tabs.get(tab) else { return };
+        let Some(repository) = self.repo_of(&doc.path) else { return };
+        let (root, vcs) = (repository.0.clone(), repository.1);
+        let root = root.as_path();
         let Some(Tab::File(doc)) = self.tabs.get_mut(tab) else { return };
         let Some(diff) = doc.markers.current(doc.version) else {
             self.message = "No current gutter changes".into();
@@ -352,7 +361,7 @@ impl App {
                     full_new: full.new.clone(),
                 };
                 doc.markers.preview = None;
-                self.stage_buffer_hunk(path, base, text, crlf, hunk);
+                self.stage_buffer_hunk(repository, path, base, text, crlf, hunk);
             }
             Action::Stage | Action::Next | Action::Previous => {}
         }

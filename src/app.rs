@@ -21,6 +21,7 @@ mod new_file;
 mod outline;
 mod problems;
 mod rename_file;
+mod repositories;
 mod search_replace;
 mod semantic;
 mod session;
@@ -149,6 +150,10 @@ struct VcsRefresh {
     stashes: Result<Vec<vcs::Stash>, String>,
     refresh_git_history: bool,
     files: Vec<(u64, u64, DiskText)>,
+    /// Every repository of the project (empty without a project folder).
+    repos: Vec<repositories::Summary>,
+    /// `Repositories::choice` when the refresh started.
+    choice: u64,
 }
 
 impl Doc {
@@ -503,6 +508,7 @@ pub struct App {
     repo: Option<PathBuf>,
     vcs: Option<Vcs>,
     repo_rx: Option<Receiver<Result<DetectedRepo, String>>>,
+    repos: repositories::Repositories,
     side: Side,
     side_open: bool,
     tabs: Vec<Tab>,
@@ -634,6 +640,7 @@ impl App {
             repo: None,
             vcs: None,
             repo_rx: None,
+            repos: Default::default(),
             root: None,
             watcher: None,
             ignored: Vec::new(),
@@ -774,6 +781,7 @@ impl App {
         self.watcher = None;
         self.update_repository(None);
         self.repo_rx = None;
+        self.repos = Default::default();
         self.ignored.clear();
         self.reset_sidebar_ui();
         self.tree.clear();
@@ -919,15 +927,28 @@ impl App {
         if root.is_none() && repository.is_none() && files.is_empty() {
             return;
         }
+        let (ignored, previous, choice) = (self.ignored.clone(), self.repos.list.clone(), self.repos.choice);
+        let known = self.repos.known();
         self.status_rx = Some(background(&self.ctx, move || {
-            let repository = match root {
-                Some(root) => vcs::detect(&root),
-                None => repository,
+            // Rediscovery keeps the active repository while it still exists, else takes the
+            // one containing the project, else the first nested one.
+            let (repos, repository) = match root {
+                Some(root) => {
+                    let repos = vcs::discover(&root, &ignored);
+                    let active = repository.filter(|r| repos.contains(r)).or_else(|| repos.first().cloned());
+                    (repos, active)
+                }
+                None => (known, repository),
             };
             let (status, branches) = repository
                 .as_ref()
                 .map_or_else(|| (None, Vec::new()), |(repo, vcs)| (Some(vcs.status(repo)), vcs.branches(repo)));
             let stashes = repository.as_ref().map_or_else(|| Ok(Vec::new()), |(repo, vcs)| vcs.stashes(repo));
+            let active = repository
+                .as_ref()
+                .zip(status.as_ref())
+                .map(|((repo, _), status)| (repo.as_path(), status));
+            let repos = repositories::summarize(&repos, active, &previous, &changes);
             let files = files
                 .into_iter()
                 .filter_map(|(path, id, version, encoding)| {
@@ -944,6 +965,8 @@ impl App {
                 stashes,
                 refresh_git_history: changes.vcs || changes.rediscover,
                 files,
+                repos,
+                choice,
             }
         }));
     }
@@ -1006,7 +1029,17 @@ impl App {
     }
 
     fn spawn_vcs(&mut self, operation: VcsOperation, work: impl FnOnce(Vcs, &Path) -> Result<String, String> + Send + 'static) {
-        let Some((repo, vcs)) = self.repository() else { return };
+        let Some(repository) = self.repository() else { return };
+        self.spawn_vcs_in(repository, operation, work);
+    }
+
+    /// Like `spawn_vcs`, in a given repository (a file's own, which may not be the active one).
+    fn spawn_vcs_in(
+        &mut self,
+        (repo, vcs): (PathBuf, Vcs),
+        operation: VcsOperation,
+        work: impl FnOnce(Vcs, &Path) -> Result<String, String> + Send + 'static,
+    ) {
         if self.bg_task.is_some() {
             return;
         }
@@ -1022,9 +1055,17 @@ impl App {
         });
     }
 
-    fn stage_buffer_hunk(&mut self, path: String, base: git::BufferBase, text: String, crlf: bool, hunk: crate::diff::Hunk) {
-        let Some(repo) = &self.repo else { return };
-        self.spawn_vcs(VcsOperation::Hunk("Stage hunk", repo.join(&path)), move |vcs, repo| {
+    fn stage_buffer_hunk(
+        &mut self,
+        repository: (PathBuf, Vcs),
+        path: String,
+        base: git::BufferBase,
+        text: String,
+        crlf: bool,
+        hunk: crate::diff::Hunk,
+    ) {
+        let file = repository.0.join(&path);
+        self.spawn_vcs_in(repository, VcsOperation::Hunk("Stage hunk", file), move |vcs, repo| {
             vcs.stage_buffer_hunk(repo, &path, base, &text, crlf, hunk)
         });
     }
@@ -1052,7 +1093,10 @@ impl App {
         if !self.settings.inline_blame {
             return;
         }
-        let (Some(repo), Some(vcs)) = (self.repo.clone(), self.vcs) else {
+        let Some(Tab::File(doc)) = self.tabs.get(self.active) else {
+            return;
+        };
+        let Some((repo, vcs)) = self.repo_of(&doc.path) else {
             return;
         };
         let Some(Tab::File(doc)) = self.tabs.get_mut(self.active) else {
@@ -1147,6 +1191,7 @@ impl App {
 
     fn poll_vcs(&mut self, _ctx: &egui::Context) {
         if let Some(detected) = receive(&mut self.repo_rx) {
+            self.pending_changes.rediscover = true;
             match detected {
                 Ok(repository) => {
                     if self.update_repository(repository) {
@@ -1159,7 +1204,11 @@ impl App {
             }
         }
         if let Some(refresh) = receive(&mut self.status_rx) {
-            if self.bg_task.is_none() && self.repo_rx.is_none() {
+            self.repos.list = refresh.repos;
+            if refresh.choice != self.repos.choice {
+                // The user picked another repository meanwhile: this status is not its.
+                self.refresh_pending = true;
+            } else if self.bg_task.is_none() && self.repo_rx.is_none() {
                 let repo_changed = self.update_repository(refresh.repository);
                 if repo_changed {
                     self.refresh_symbol_cache();
@@ -1666,7 +1715,7 @@ impl App {
             self.message = "Open a folder to use Go to file".into();
             return;
         };
-        let vcs = self.vcs;
+        let vcs = self.project_vcs();
         let ignored = self.ignored.clone();
         let mut recent = self.sessions.recent_files.clone();
         let (recent_tx, recent_rx) = channel();
@@ -1715,7 +1764,7 @@ impl App {
         let project = self.root.clone();
         let ignored = self.ignored.clone();
         let ignored_for_goto = ignored.clone();
-        let vcs = self.vcs;
+        let vcs = self.project_vcs();
         let root = project.clone().unwrap_or_else(|| self.work_dir());
         let req = goto::Request {
             root,
@@ -1902,6 +1951,7 @@ impl App {
     }
 
     fn start_search(&mut self, ctx: &egui::Context) {
+        let project_vcs = self.project_vcs();
         let st = &mut self.search;
         st.cancel.store(true, Ordering::Relaxed);
         st.results.clear();
@@ -1921,7 +1971,7 @@ impl App {
             return;
         };
         st.cancel = Arc::new(AtomicBool::new(false));
-        let vcs = self.vcs;
+        let vcs = project_vcs;
         let ignored = self.ignored.clone();
         let list_root = root.clone();
         // Open files are searched first, from their (possibly unsaved) text; active tab first.
@@ -2685,6 +2735,7 @@ impl App {
             }
             return;
         };
+        self.repositories_panel(ui);
         let busy = self.bg_task.is_some();
         let has_index = vcs.has_index();
 
@@ -3107,6 +3158,10 @@ impl App {
             _ => None,
         };
         let rename_open = self.rename_open();
+        let active_vcs = match self.tabs.get(active) {
+            Some(Tab::File(doc)) => self.repo_of(&doc.path).map(|(_, vcs)| vcs),
+            _ => None,
+        };
         if self.is_live_diff(active) {
             open_path = self.live_diff_ui(ui, active);
             self.refresh_diff();
@@ -3128,7 +3183,7 @@ impl App {
                         || rename_open;
                     self.find.bar(ui, doc, dialog_open);
                     disk_action = disk_changed_bar(ui, doc);
-                    let fresh = match self.vcs {
+                    let fresh = match active_vcs {
                         Some(Vcs::Svn) => doc.blame_version.is_some() && !doc.dirty(),
                         _ => doc.blame_version == Some(doc.version),
                     };

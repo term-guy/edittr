@@ -101,7 +101,7 @@ impl App {
             replacement: self.search_replace.text.clone(),
             file,
         };
-        let vcs = self.vcs;
+        let vcs = self.project_vcs();
         let open = self
             .tabs
             .iter()

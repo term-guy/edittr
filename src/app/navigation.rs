@@ -583,6 +583,7 @@ impl App {
 
     pub(super) fn poll_picker(&mut self) {
         let cache = self.symbol_snapshot();
+        let project_vcs = self.project_vcs();
         let Some(picker) = &mut self.picker else { return };
         if let Some(rows) = receive(&mut picker.rx) {
             picker.set_rows(rows);
@@ -599,7 +600,7 @@ impl App {
         let (query, cancel, vcs, ignored) = (
             picker.query.trim().to_owned(),
             picker.cancel.clone(),
-            self.vcs,
+            project_vcs,
             self.ignored.clone(),
         );
         picker.rx = Some(background(&self.ctx, move || {
