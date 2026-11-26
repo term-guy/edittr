@@ -89,7 +89,7 @@ const fn legacy(mut preset: Preset, foreground: u8, selection: [u8; 4], current_
     preset
 }
 
-pub(crate) static PRESETS: [Preset; 8] = [
+pub(crate) static PRESETS: [Preset; 18] = [
     // Background, foreground, selection, current line, line numbers, then the syntax and bracket colors.
     legacy(
         preset(
@@ -157,6 +157,66 @@ pub(crate) static PRESETS: [Preset; 8] = [
             0xc6bcff, 0xdde2ef, 0xb8c2d2, 0x868f9e, 0xffce70, 0xd7a6ff, 0x80cfff,
         ],
     ),
+    preset(
+        "harbor-night",
+        "Harbor Night",
+        Theme::Dark,
+        false,
+        [
+            0x0f1724, 0xd6e2f0, 0x1f4470, 0x172338, 0x6f84a0, 0x6f8aa8, 0x6fb3ff, 0x9ad6a6, 0xf0b77a, 0xe7a3d0, 0xc9a6ff, 0x7fd8e6,
+            0x8fc4ff, 0xd6e2f0, 0x9fb6cf, 0x5d6f86, 0x5aa9ff, 0xc39bff, 0x6fe0d0,
+        ],
+    ),
+    preset(
+        "cobalt-deep",
+        "Cobalt Deep",
+        Theme::Dark,
+        false,
+        [
+            0x101a3a, 0xe2e8ff, 0x2a4598, 0x18234a, 0x7d8bbd, 0x7f8fc4, 0x5fc2ff, 0xb5e08f, 0xffc078, 0xff9ec7, 0xffd479, 0x7ee2f2,
+            0x9fb8ff, 0xe2e8ff, 0xa9b6e8, 0x5c6a9c, 0xffd479, 0x5fc2ff, 0xff9ec7,
+        ],
+    ),
+    preset(
+        "steel-blue",
+        "Steel Blue",
+        Theme::Dark,
+        false,
+        [
+            0x1a1c20, 0xdfe3ea, 0x264f78, 0x23262c, 0x7d8590, 0x7b8594, 0x5aa2ff, 0x9cc98a, 0xd9a46f, 0x7fb8ff, 0xb59cff, 0x56c8d8,
+            0x8ab8ff, 0xdfe3ea, 0xa8b0bd, 0x646b76, 0x5aa2ff, 0xd9a46f, 0x56c8d8,
+        ],
+    ),
+    preset(
+        "glacier-night",
+        "Glacier Night",
+        Theme::Dark,
+        false,
+        [
+            0x0d1e26, 0xd3e8ee, 0x1d4a5e, 0x142a34, 0x6c8e99, 0x6f929d, 0x4fb8e8, 0xa3d9b1, 0xf2c38b, 0xb7c7ff, 0xe7a8c9, 0x6ee0d6,
+            0x7cc4f5, 0xd3e8ee, 0x9bbcc6, 0x587680, 0x4fb8e8, 0xf2c38b, 0xb7c7ff,
+        ],
+    ),
+    preset(
+        "crimson-slate",
+        "Crimson Slate",
+        Theme::Dark,
+        false,
+        [
+            0x1c1719, 0xece0e2, 0x5c2a35, 0x2a2124, 0x9a858a, 0x968187, 0xff7a8a, 0xc9d98f, 0xffb27a, 0xf5a3c7, 0xffc46b, 0x8fd3c9,
+            0xf7b2a8, 0xece0e2, 0xc4aeb3, 0x7a676c, 0xffc46b, 0xff7a8a, 0x8fd3c9,
+        ],
+    ),
+    preset(
+        "ink-mono",
+        "Ink Mono",
+        Theme::Dark,
+        false,
+        [
+            0x141414, 0xdedede, 0x3d3d3d, 0x1e1e1e, 0x7a7a7a, 0x7c7c7c, 0xf5f5f5, 0xb8c7a8, 0xd4c3a3, 0xd4c3a3, 0xc9b8d6, 0xc6d4e0,
+            0xe8e8e8, 0xcfcfcf, 0x9e9e9e, 0x5e5e5e, 0xd8d8d8, 0xa8b8c8, 0xc8b8a8,
+        ],
+    ),
     legacy(
         preset(
             "edittr-light",
@@ -181,6 +241,46 @@ pub(crate) static PRESETS: [Preset; 8] = [
         [
             0xf8f3e9, 0x302923, 0xd8e2f2, 0xeee6d8, 0x746960, 0x706c60, 0x743d83, 0x306746, 0x874a23, 0x913c62, 0x993e29, 0x266672,
             0x354e92, 0x523c34, 0x564f4c, 0x756a62, 0x725200, 0x8a4587, 0x235b87,
+        ],
+    ),
+    preset(
+        "harbor-day",
+        "Harbor Day",
+        Theme::Light,
+        false,
+        [
+            0xf6f9fc, 0x1f2a37, 0xc8dcf5, 0xe9f0f8, 0x6b7a8c, 0x6a7a8a, 0x0b5cc4, 0x2a7a3b, 0xa4501a, 0x8a3fa0, 0x8a5a00, 0x00728a,
+            0x1d4fb8, 0x1f2a37, 0x4a5868, 0x8a96a3, 0x0b5cc4, 0x8a3fa0, 0x2a7a3b,
+        ],
+    ),
+    preset(
+        "mint-sheet",
+        "Mint Sheet",
+        Theme::Light,
+        false,
+        [
+            0xf3f8f4, 0x1f2b24, 0xcfe6d6, 0xe6f0e8, 0x67786c, 0x66786b, 0x1f6b52, 0x8a4d14, 0x9c3a4a, 0x7a3e9d, 0x8a5a00, 0x1d5f8a,
+            0x2f6b2f, 0x1f2b24, 0x4c5c52, 0x8a978e, 0x1f6b52, 0x7a3e9d, 0x8a4d14,
+        ],
+    ),
+    preset(
+        "rose-paper",
+        "Rose Paper",
+        Theme::Light,
+        false,
+        [
+            0xfcf5f5, 0x33262a, 0xf2d3da, 0xf6e8ea, 0x7d6a70, 0x7d6a70, 0xa3264b, 0x3d7040, 0x9a4f16, 0x6b46a8, 0x8a5a00, 0x1f6a7a,
+            0x8a2f6b, 0x33262a, 0x5c4a50, 0x9a8a8f, 0xa3264b, 0x6b46a8, 0x1f6a7a,
+        ],
+    ),
+    preset(
+        "clear-white",
+        "Clear White",
+        Theme::Light,
+        false,
+        [
+            0xffffff, 0x1a1a1a, 0xcce0ff, 0xf2f5f9, 0x6e6e6e, 0x6a737d, 0x0033b3, 0x067d17, 0xa33a00, 0x871094, 0x7a5c00, 0x00627a,
+            0x00438a, 0x1a1a1a, 0x444444, 0x8c8c8c, 0x0033b3, 0x871094, 0x067d17,
         ],
     ),
 ];
@@ -232,7 +332,8 @@ impl Palette {
     }
 
     pub(crate) fn defaults(dark: bool) -> Self {
-        Self::new(if dark { 0 } else { 6 })
+        let id = if dark { "edittr-dark" } else { "edittr-light" };
+        Self::new(PRESETS.iter().position(|preset| preset.id == id).unwrap_or(0))
     }
 
     pub(crate) fn parse(value: &str, base: Theme) -> Option<Self> {
@@ -302,6 +403,54 @@ impl Themes {
         match palette.preset().base {
             Theme::Dark => self.dark = palette,
             Theme::Light => self.light = palette,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn contrast(a: Color32, b: Color32) -> f32 {
+        let luminance = |c: Color32| {
+            let linear = |v: u8| {
+                let v = f32::from(v) / 255.0;
+                if v <= 0.039_28 {
+                    v / 12.92
+                } else {
+                    ((v + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * linear(c.r()) + 0.7152 * linear(c.g()) + 0.0722 * linear(c.b())
+        };
+        let (a, b) = (luminance(a), luminance(b));
+        (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    }
+
+    #[test]
+    fn presets_have_unique_ids_and_readable_colors() {
+        for (i, preset) in PRESETS.iter().enumerate() {
+            assert!(PRESETS[..i].iter().all(|other| other.id != preset.id), "duplicate id {}", preset.id);
+        }
+        assert_eq!(Palette::defaults(true).preset().id, "edittr-dark");
+        assert_eq!(Palette::defaults(false).preset().id, "edittr-light");
+        for preset in PRESETS.iter().filter(|preset| !preset.legacy) {
+            let palette = Palette::new(PRESETS.iter().position(|p| p.id == preset.id).unwrap());
+            for (part, _, label) in Part::ALL {
+                let minimum = match part {
+                    Background | Selection | CurrentLine => continue,
+                    Foreground => 7.0,
+                    Comment | LineNumber => 3.0,
+                    Disabled => 2.5,
+                    _ => 4.5,
+                };
+                for behind in [Background, CurrentLine] {
+                    let ratio = contrast(palette.color(part), palette.color(behind));
+                    assert!(ratio >= minimum, "{}: {label} on {behind:?} is {ratio:.2}:1", preset.name);
+                }
+            }
+            let ratio = contrast(palette.color(Foreground), palette.color(Selection));
+            assert!(ratio >= 4.5, "{}: text on the selection is {ratio:.2}:1", preset.name);
         }
     }
 }
