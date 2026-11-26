@@ -292,7 +292,11 @@ impl App {
         egui::Panel::bottom("call_hierarchy")
             .resizable(true)
             .default_size(220.0)
-            .show(ui, |ui| action = panel.ui(ui, self.root.as_deref()));
+            .show(ui, |ui| {
+                // Keep the panel's size while its content is short ("Loading…"): egui persists it from the content.
+                ui.set_min_height(ui.available_height());
+                action = panel.ui(ui, self.root.as_deref())
+            });
         let (close, open) = action;
         if close {
             self.call_hierarchy = None;

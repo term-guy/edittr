@@ -3009,6 +3009,9 @@ impl App {
                         .resizable(true)
                         .default_size(260.0)
                         .show(ui, |ui| {
+                            // egui persists a panel's size from its content: a short "Loading…" or
+                            // "Select a commit" would shrink it for good (slow svn loads hit this).
+                            ui.set_min_height(ui.available_height());
                             // The selection can outlive a shorter, reloaded history: never index blindly.
                             let commit = self.graph_sel.and_then(|row| graph.commits.get(row));
                             if let (Some(commit), Some(repo), Some(vcs)) = (commit, &self.repo, self.vcs) {
