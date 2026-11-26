@@ -217,6 +217,10 @@ impl Picker {
 
 impl App {
     pub(super) fn shortcuts(&mut self, ctx: &egui::Context) {
+        // Settings > Keyboard shortcuts is waiting for keys: they are the new shortcut.
+        if self.record_shortcut(ctx) {
+            return;
+        }
         if self.search_replace.confirming() || self.deletion.is_some() || self.renaming.is_some() || self.stash_dialog_open() {
             return;
         }

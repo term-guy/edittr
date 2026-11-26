@@ -193,8 +193,22 @@ impl Entry {
         self.dispatch
     }
 
-    pub(crate) fn shortcut_text(&self, ctx: &egui::Context) -> String {
+    /// Position in [`COMMANDS`] (entries are only ever borrowed from it).
+    pub(crate) fn index(&self) -> usize {
+        (self as *const Entry as usize - COMMANDS.as_ptr() as usize) / std::mem::size_of::<Entry>()
+    }
+
+    /// The shortcuts in use: the default ones unless changed in Settings > Keyboard shortcuts.
+    pub(crate) fn shortcuts(&self) -> Vec<KeyboardShortcut> {
+        keymap().shortcuts[self.index()].clone()
+    }
+
+    pub(crate) fn default_shortcuts(&self) -> &'static [KeyboardShortcut] {
         self.shortcuts
+    }
+
+    pub(crate) fn shortcut_text(&self, ctx: &egui::Context) -> String {
+        self.shortcuts()
             .iter()
             .map(|shortcut| shortcut.format(&ModifierNames::NAMES, ctx.os().is_mac()))
             .collect::<Vec<_>>()
@@ -202,8 +216,12 @@ impl Entry {
     }
 
     pub(crate) fn consume(&self, input: &mut egui::InputState) -> bool {
+        let shortcuts = self.shortcuts();
+        if shortcuts.is_empty() {
+            return false;
+        }
         // Option-letter shortcuts also type a character on macOS (Option+Z types "Ω").
-        let alt_letter = self.shortcuts.iter().any(|s| s.modifiers.alt && s.logical_key.name().len() == 1);
+        let alt_letter = shortcuts.iter().any(|s| s.modifiers.alt && s.logical_key.name().len() == 1);
         if matches!(self.id, Command::SwitchSourceHeader | Command::ShowCallHierarchy) || alt_letter {
             // Option-letter shortcuts can also produce a Text event on macOS.
             let mut consumed = false;
@@ -213,7 +231,7 @@ impl Entry {
                 paired_text = matches!(
                     event,
                     egui::Event::Key { key, pressed: true, modifiers, .. }
-                        if self.shortcuts.iter().any(|shortcut| shortcut.logical_key == *key
+                        if shortcuts.iter().any(|shortcut| shortcut.logical_key == *key
                             && if self.id == Command::SwitchSourceHeader {
                                 *modifiers == shortcut.modifiers
                             } else {
@@ -225,8 +243,166 @@ impl Entry {
             });
             return consumed;
         }
-        self.shortcuts.iter().any(|shortcut| input.consume_shortcut(shortcut))
+        shortcuts.iter().any(|shortcut| input.consume_shortcut(shortcut))
     }
+}
+
+/// Shortcut changes from the settings, by command title: the command's whole list (empty: none).
+pub(crate) type Overrides = std::collections::BTreeMap<String, Vec<KeyboardShortcut>>;
+
+/// The shortcuts in use, per entry of [`COMMANDS`], and the order to try them in.
+pub(crate) struct Keymap {
+    shortcuts: Vec<Vec<KeyboardShortcut>>,
+    order: Vec<usize>,
+}
+
+#[cfg(not(test))]
+static KEYMAP: std::sync::RwLock<Option<std::sync::Arc<Keymap>>> = std::sync::RwLock::new(None);
+
+// Tests run in parallel: each thread has its own keymap, so changing one can't affect another.
+#[cfg(test)]
+thread_local! {
+    static KEYMAP: std::cell::RefCell<Option<std::sync::Arc<Keymap>>> = const { std::cell::RefCell::new(None) };
+}
+
+fn stored_keymap() -> Option<std::sync::Arc<Keymap>> {
+    #[cfg(not(test))]
+    return KEYMAP.read().ok().and_then(|k| k.clone());
+    #[cfg(test)]
+    KEYMAP.with(|k| k.borrow().clone())
+}
+
+fn store_keymap(keymap: std::sync::Arc<Keymap>) {
+    #[cfg(not(test))]
+    if let Ok(mut slot) = KEYMAP.write() {
+        *slot = Some(keymap);
+    }
+    #[cfg(test)]
+    KEYMAP.with(|k| *k.borrow_mut() = Some(keymap));
+}
+
+impl Keymap {
+    fn new(overrides: &Overrides) -> Self {
+        let shortcuts: Vec<Vec<KeyboardShortcut>> = COMMANDS
+            .iter()
+            .map(|entry| overrides.get(entry.title).cloned().unwrap_or_else(|| entry.shortcuts.to_vec()))
+            .collect();
+        // Most modifiers first: egui also matches a shortcut when Shift or Alt is held in addition,
+        // so Ctrl+F would otherwise take Ctrl+Shift+F (Search in files) and Ctrl+Alt+F (Replace).
+        let count = |m: Modifiers| [m.alt, m.shift, m.command || m.ctrl || m.mac_cmd].iter().filter(|b| **b).count();
+        let mut order: Vec<usize> = (0..COMMANDS.len()).collect();
+        order.sort_by_key(|&i| std::cmp::Reverse(shortcuts[i].iter().map(|s| count(s.modifiers)).max().unwrap_or(0)));
+        Self { shortcuts, order }
+    }
+}
+
+fn keymap() -> std::sync::Arc<Keymap> {
+    stored_keymap().unwrap_or_else(|| {
+        let keymap = std::sync::Arc::new(Keymap::new(&Overrides::new()));
+        store_keymap(keymap.clone());
+        keymap
+    })
+}
+
+/// Use the shortcut changes from the settings.
+pub(crate) fn set_overrides(overrides: &Overrides) {
+    store_keymap(std::sync::Arc::new(Keymap::new(overrides)));
+}
+
+/// The changes that turn the defaults into `shortcuts` (one list per entry of [`COMMANDS`]).
+pub(crate) fn overrides_for(shortcuts: &[Vec<KeyboardShortcut>]) -> Overrides {
+    COMMANDS
+        .iter()
+        .zip(shortcuts)
+        .filter(|(entry, list)| entry.shortcuts != list.as_slice())
+        .map(|(entry, list)| (entry.title.to_string(), list.clone()))
+        .collect()
+}
+
+/// The shortcuts in use for every entry of [`COMMANDS`].
+pub(crate) fn all_shortcuts() -> Vec<Vec<KeyboardShortcut>> {
+    keymap().shortcuts.clone()
+}
+
+/// Pressed `m` is exactly `pattern` (no extra Shift / Alt, unlike egui's logical matching).
+pub(crate) fn exact(m: Modifiers, pattern: Modifiers) -> bool {
+    m.alt == pattern.alt
+        && m.shift == pattern.shift
+        && m.command == pattern.command
+        && (m.ctrl && !m.command) == (pattern.ctrl && !pattern.command)
+}
+
+/// The editor action bound to `key` with exactly `m` (Settings > Keyboard shortcuts can change them).
+pub(crate) fn editor_action(key: Key, m: Modifiers) -> Option<Action> {
+    let keymap = keymap();
+    COMMANDS
+        .iter()
+        .zip(&keymap.shortcuts)
+        .find_map(|(entry, shortcuts)| match entry.id {
+            Command::Editor(action) if !entry.dispatch => shortcuts
+                .iter()
+                .any(|s| s.logical_key == key && exact(m, s.modifiers))
+                .then_some(action),
+            _ => None,
+        })
+}
+
+/// "Cmd+Shift+K" (Cmd: Ctrl on Windows and Linux) for the settings file.
+pub(crate) fn shortcut_spec(shortcut: &KeyboardShortcut) -> String {
+    let m = shortcut.modifiers;
+    let mut parts = Vec::new();
+    if m.ctrl && !m.command {
+        parts.push("Ctrl");
+    }
+    if m.command || m.mac_cmd {
+        parts.push("Cmd");
+    }
+    if m.alt {
+        parts.push("Alt");
+    }
+    if m.shift {
+        parts.push("Shift");
+    }
+    parts.push(shortcut.logical_key.name());
+    parts.join("+")
+}
+
+pub(crate) fn parse_shortcut(spec: &str) -> Option<KeyboardShortcut> {
+    let mut modifiers = Modifiers::NONE;
+    let mut key = None;
+    for part in spec.trim().split('+') {
+        match part.trim() {
+            "Ctrl" => modifiers = modifiers.plus(Modifiers::CTRL),
+            "Cmd" => modifiers = modifiers.plus(Modifiers::COMMAND),
+            "Alt" => modifiers = modifiers.plus(Modifiers::ALT),
+            "Shift" => modifiers = modifiers.plus(Modifiers::SHIFT),
+            name => key = Some(Key::from_name(name)?),
+        }
+    }
+    Some(KeyboardShortcut::new(modifiers, key?))
+}
+
+/// Keys the editor handles itself (not commands): assigning one to a command takes it over.
+pub(crate) fn editor_keys() -> Vec<(KeyboardShortcut, &'static str)> {
+    let k = KeyboardShortcut::new;
+    let mut keys = vec![
+        (k(CMD, Key::Z), "Undo"),
+        (k(CMD_SHIFT, Key::Z), "Redo"),
+        (k(CMD, Key::A), "Select all"),
+        (k(CMD, Key::C), "Copy"),
+        (k(CMD, Key::X), "Cut"),
+        (k(CMD, Key::V), "Paste"),
+        (k(CMD, Key::Slash), "Toggle line comment"),
+        (k(CMD.plus(Modifiers::ALT), Key::OpenBracket), "Fold"),
+        (k(CMD.plus(Modifiers::ALT), Key::CloseBracket), "Unfold"),
+        (k(Modifiers::NONE, Key::Tab), "Indent"),
+        (k(Modifiers::SHIFT, Key::Tab), "Outdent"),
+        (k(Modifiers::NONE, Key::Escape), "Single cursor"),
+    ];
+    if !cfg!(target_os = "macos") {
+        keys.push((k(CMD, Key::Y), "Redo"));
+    }
+    keys
 }
 
 const CMD: Modifiers = Modifiers::COMMAND;
@@ -243,7 +419,7 @@ const GO_FORWARD: KeyboardShortcut = KeyboardShortcut::new(Modifiers::ALT, Key::
 
 use Command::*;
 
-pub(crate) const COMMANDS: &[Entry] = &[
+pub(crate) static COMMANDS: &[Entry] = &[
     Entry::new(
         Palette,
         "Command palette",
@@ -477,14 +653,8 @@ pub(crate) const COMMANDS: &[Entry] = &[
 /// Commands in the order their shortcuts are tried: most modifiers first. egui also
 /// matches a shortcut when Shift or Alt is held in addition, so Ctrl+F would otherwise
 /// take Ctrl+Shift+F (Search in files) and Ctrl+Alt+F (Replace).
-pub(crate) fn dispatch_order() -> &'static [&'static Entry] {
-    static ORDER: std::sync::OnceLock<Vec<&'static Entry>> = std::sync::OnceLock::new();
-    ORDER.get_or_init(|| {
-        let count = |m: Modifiers| [m.alt, m.shift, m.command || m.ctrl || m.mac_cmd].iter().filter(|b| **b).count();
-        let mut order: Vec<&Entry> = COMMANDS.iter().collect();
-        order.sort_by_key(|e| std::cmp::Reverse(e.shortcuts.iter().map(|s| count(s.modifiers)).max().unwrap_or(0)));
-        order
-    })
+pub(crate) fn dispatch_order() -> Vec<&'static Entry> {
+    keymap().order.iter().map(|&i| &COMMANDS[i]).collect()
 }
 
 pub(crate) fn entry(id: Command) -> &'static Entry {
@@ -496,12 +666,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn titles_are_unique_and_shortcuts_round_trip() {
+        // Shortcut changes are saved by title.
+        for (i, entry) in COMMANDS.iter().enumerate() {
+            assert!(COMMANDS[..i].iter().all(|other| other.title != entry.title), "{}", entry.title);
+            assert!(!entry.title.contains('='), "{}", entry.title);
+            assert_eq!(entry.index(), i);
+            for shortcut in entry.default_shortcuts() {
+                assert_eq!(parse_shortcut(&shortcut_spec(shortcut)).as_ref(), Some(shortcut), "{}", entry.title);
+            }
+        }
+    }
+
+    #[test]
     fn more_specific_shortcuts_win() {
         let first = |modifiers: Modifiers, key: Key| {
             dispatch_order()
                 .iter()
                 .find(|e| {
-                    e.shortcuts
+                    e.shortcuts()
                         .iter()
                         .any(|s| s.logical_key == key && modifiers.matches_logically(s.modifiers))
                 })

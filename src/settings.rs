@@ -54,6 +54,8 @@ pub(crate) struct Settings {
     /// Kinds of lines sticky scroll pins (saved as the hidden ones).
     pub(crate) sticky_shown: crate::editor::sticky::Kinds,
     pub(crate) show_outline: bool,
+    /// Keyboard shortcuts changed from the defaults (by command title).
+    pub(crate) shortcuts: crate::commands::Overrides,
     /// Wrap long lines at the editor's width.
     pub(crate) word_wrap: bool,
     /// Frames per second and frame time in the status bar.
@@ -92,6 +94,7 @@ impl Default for Settings {
             minimap: true,
             show_fps: false,
             word_wrap: false,
+            shortcuts: Default::default(),
             header_lines: true,
             bracket_colors: true,
             semantic_highlighting: true,
@@ -159,6 +162,18 @@ impl Settings {
     fn parse(text: &str) -> Self {
         let mut settings = Self::default();
         for (key, value) in text.lines().filter_map(entry) {
+            if let Some(title) = key.strip_prefix("shortcut.") {
+                let list: Vec<_> = value
+                    .split(';')
+                    .filter(|spec| !spec.trim().is_empty())
+                    .filter_map(crate::commands::parse_shortcut)
+                    .collect();
+                // An empty value removes the shortcuts; one we can't read keeps the defaults.
+                if value.is_empty() || !list.is_empty() {
+                    settings.shortcuts.insert(title.to_string(), list);
+                }
+                continue;
+            }
             match key {
                 "editor_font" | "ui_font" => {
                     let font = serde_json::from_str(value).ok();
@@ -271,47 +286,49 @@ impl Settings {
     fn format(&self, previous: &str) -> String {
         let mut text = String::new();
         for line in previous.lines() {
-            if !matches!(
-                entry(line),
-                Some((
-                    "changes_tree"
-                        | "highlight_line"
-                        | "show_whitespace"
-                        | "diff_ignore_eol"
-                        | "inline_blame"
-                        | "minimap"
-                        | "bracket_colors"
-                        | "semantic_highlighting"
-                        | "sticky_scroll"
-                        | "sticky_control_flow"
-                        | "sticky_hidden"
-                        | "restore_previous_session"
-                        | "reopen_last_folder"
-                        | "tab_size"
-                        | "editor_font"
-                        | "editor_font_size"
-                        | "ui_font"
-                        | "ui_font_size"
-                        | "breadcrumb_font_size"
-                        | "format_on_save"
-                        | "trim_trailing_whitespace_on_save"
-                        | "insert_final_newline_on_save"
-                        | "show_outline"
-                        | "show_fps"
-                        | "word_wrap"
-                        | "header_lines"
-                        | "outline_expanded"
-                        | "outline_grouped"
-                        | "outline_collapsed_groups"
-                        | "color_window"
-                        | "theme_preference"
-                        | "theme_dark"
-                        | "theme_light"
-                        | "theme_custom_dark"
-                        | "theme_custom_light",
-                    _
-                ))
-            ) {
+            if !entry(line).is_some_and(|(key, _)| key.starts_with("shortcut."))
+                && !matches!(
+                    entry(line),
+                    Some((
+                        "changes_tree"
+                            | "highlight_line"
+                            | "show_whitespace"
+                            | "diff_ignore_eol"
+                            | "inline_blame"
+                            | "minimap"
+                            | "bracket_colors"
+                            | "semantic_highlighting"
+                            | "sticky_scroll"
+                            | "sticky_control_flow"
+                            | "sticky_hidden"
+                            | "restore_previous_session"
+                            | "reopen_last_folder"
+                            | "tab_size"
+                            | "editor_font"
+                            | "editor_font_size"
+                            | "ui_font"
+                            | "ui_font_size"
+                            | "breadcrumb_font_size"
+                            | "format_on_save"
+                            | "trim_trailing_whitespace_on_save"
+                            | "insert_final_newline_on_save"
+                            | "show_outline"
+                            | "show_fps"
+                            | "word_wrap"
+                            | "header_lines"
+                            | "outline_expanded"
+                            | "outline_grouped"
+                            | "outline_collapsed_groups"
+                            | "color_window"
+                            | "theme_preference"
+                            | "theme_dark"
+                            | "theme_light"
+                            | "theme_custom_dark"
+                            | "theme_custom_light",
+                        _
+                    ))
+                )
+            {
                 text.push_str(line);
                 text.push('\n');
             }
@@ -357,6 +374,10 @@ impl Settings {
         text.push_str(&format!("show_outline={}\n", self.show_outline));
         text.push_str(&format!("show_fps={}\n", self.show_fps));
         text.push_str(&format!("word_wrap={}\n", self.word_wrap));
+        for (title, list) in &self.shortcuts {
+            let specs: Vec<String> = list.iter().map(crate::commands::shortcut_spec).collect();
+            text.push_str(&format!("shortcut.{title}={}\n", specs.join(";")));
+        }
         text.push_str(&format!("header_lines={}\n", self.header_lines));
         text.push_str(&format!("outline_expanded={}\n", self.outline_expanded));
         text.push_str(&format!("outline_grouped={}\n", self.outline_grouped));
@@ -578,6 +599,23 @@ mod tests {
             .format("");
             assert_eq!(Settings::parse(&text).highlight_line, highlight_line);
         }
+    }
+
+    #[test]
+    fn shortcut_changes_round_trip() {
+        use eframe::egui::{Key, KeyboardShortcut, Modifiers};
+        let mut settings = Settings::default();
+        let cmd_shift_k = KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::K);
+        let ctrl_minus = KeyboardShortcut::new(Modifiers::CTRL, Key::Minus);
+        settings.shortcuts.insert("Delete line".into(), vec![cmd_shift_k, ctrl_minus]);
+        settings.shortcuts.insert("Join lines".into(), Vec::new());
+        let text = settings.format("shortcut.Old=Cmd+Q\n");
+        assert!(text.contains("shortcut.Delete line=Cmd+Shift+K;Ctrl+Minus\n"), "{text}");
+        assert!(text.contains("shortcut.Join lines=\n"));
+        assert!(!text.contains("shortcut.Old"));
+        assert_eq!(Settings::parse(&text).shortcuts, settings.shortcuts);
+        // Unreadable specs keep the defaults.
+        assert!(Settings::parse("shortcut.Save=Cmd+Nonsense").shortcuts.is_empty());
     }
 
     #[test]

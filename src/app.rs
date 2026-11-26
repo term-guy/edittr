@@ -25,6 +25,7 @@ mod search_replace;
 mod semantic;
 mod session;
 mod settings_page;
+mod shortcuts_page;
 mod stash;
 mod tab_field;
 #[cfg(feature = "tour")]
@@ -541,6 +542,7 @@ pub struct App {
     settings_page: settings_page::Page,
     fps: FrameStats,
     affix: Option<affix::Affix>,
+    shortcut_page: shortcuts_page::Shortcuts,
     affix_last: Option<affix::Affix>,
     graph_dialog: Option<graph_menu::GraphDialog>,
     diff_rx: Option<PendingDiff>,
@@ -622,6 +624,7 @@ impl App {
             std::thread::spawn(crate::shell_menu::follow_newest);
         }
         settings.themes.apply(&cc.egui_ctx, settings.color_window);
+        commands::set_overrides(&settings.shortcuts);
         cc.egui_ctx.global_style_mut(|s| {
             s.spacing.item_spacing.y = 3.0;
         });
@@ -672,6 +675,7 @@ impl App {
             settings_page: Default::default(),
             fps: Default::default(),
             affix: None,
+            shortcut_page: Default::default(),
             affix_last: None,
             graph_dialog: None,
             diff_rx: None,

@@ -2205,39 +2205,9 @@ fn run_action(st: &mut State, text: &mut String, version: u64, action: Action) -
     }
 }
 
-/// The action an editor shortcut runs, if any.
+/// The action an editor shortcut runs, if any (Settings > Keyboard shortcuts can change them).
 fn shortcut_action(key: Key, m: egui::Modifiers) -> Option<Action> {
-    let (shift, alt, command) = (m.shift, m.alt, m.command);
-    Some(match key {
-        Key::D if command && !shift && !alt => Action::Duplicate,
-        Key::J if alt && !command => {
-            if shift {
-                Action::RemoveLastOccurrence
-            } else {
-                Action::AddNextOccurrence
-            }
-        }
-        Key::ArrowUp if alt && !command => {
-            if shift {
-                Action::CopyLinesUp
-            } else {
-                Action::MoveLinesUp
-            }
-        }
-        Key::ArrowDown if alt && !command => {
-            if shift {
-                Action::CopyLinesDown
-            } else {
-                Action::MoveLinesDown
-            }
-        }
-        Key::K if command && shift && !alt => Action::DeleteLines,
-        Key::J if command && !shift && !alt => Action::JoinLines,
-        Key::F2 if command && !shift && !alt => Action::ToggleBookmark,
-        Key::PageDown if alt && !command && !shift => Action::NextBookmark,
-        Key::PageUp if alt && !command && !shift => Action::PreviousBookmark,
-        _ => return None,
-    })
+    crate::commands::editor_action(key, m)
 }
 
 fn add_next_occurrence(st: &mut State, text: &str, ix: &LineIndex) {

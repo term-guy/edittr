@@ -353,6 +353,7 @@ impl App {
                                     .show(ui, |ui| self.theme_editor(ui));
                             }
                         }
+                        shown += self.shortcuts_section(ui, &filter, section_size);
                         if shown == 0 {
                             ui.add_space(18.0);
                             ui.weak("No settings match your search.");
