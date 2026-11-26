@@ -11,6 +11,7 @@ mod diagnostics;
 mod diff;
 mod editor;
 mod editorconfig;
+mod encoding;
 mod file_history;
 mod fonts;
 mod formatter;

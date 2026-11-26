@@ -464,7 +464,7 @@ impl Overlay {
             );
             text_painter.galley(
                 Pos2::new(text_x, rect.top()),
-                lines.galley(line),
+                lines.galley_unwrapped(line),
                 lines.palette.color(crate::theme::Part::Foreground),
             );
             bottom = Some(rect.bottom());

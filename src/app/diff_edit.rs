@@ -4,9 +4,14 @@
 //! work as usual). Changed lines are tinted and recomputed as you type, and the two
 //! panes scroll together, lined up through the diff.
 
-use super::{App, DiskText, Doc, EditorOut, Tab, background, diff_colors, editor, file_name, icon_button, read_doc_text, receive};
+use super::{
+    App, DiffSource, DiskText, Doc, EditorOut, LiveDiffMarks, Tab, background, diff_colors, editor, file_name, gutter, icon_button,
+    read_doc_text, receive,
+};
 use crate::commands::{Command, Setting};
-use crate::diff::{with_editor_eol, without_cr_at_eol};
+use crate::diff::{Hunk, with_editor_eol, without_cr_at_eol};
+use crate::git::BufferBase;
+use crate::vcs::Vcs;
 use crate::{editor as ed, highlight, icons as ic};
 use eframe::egui::{self, Color32};
 use similar::{Algorithm, DiffTag};
@@ -29,6 +34,7 @@ pub(super) struct LiveDiff {
     ops: Vec<(DiffTag, Range<usize>, Range<usize>)>,
     left_bg: Vec<(usize, Color32)>,
     right_bg: Vec<(usize, Color32)>,
+    change_marks: Vec<(usize, Color32, bool)>,
     added: usize,
     removed: usize,
     only_line_endings: bool,
@@ -50,6 +56,7 @@ impl LiveDiff {
             ops: Vec::new(),
             left_bg: Vec::new(),
             right_bg: Vec::new(),
+            change_marks: Vec::new(),
             added: 0,
             removed: 0,
             only_line_endings: false,
@@ -76,10 +83,17 @@ impl LiveDiff {
         let (add, del) = (add.gamma_multiply(0.16), del.gamma_multiply(0.16));
         self.left_bg.clear();
         self.right_bg.clear();
+        self.change_marks.clear();
         for (tag, old, new) in &self.ops {
             if *tag != DiffTag::Equal {
                 self.left_bg.extend(old.clone().map(|l| (l, del)));
                 self.right_bg.extend(new.clone().map(|l| (l, add)));
+                let change = match tag {
+                    DiffTag::Delete => gutter::Change::Deleted,
+                    DiffTag::Insert => gutter::Change::Added,
+                    _ => gutter::Change::Modified,
+                };
+                self.change_marks.push((new.start, gutter::color(change, dark), new.is_empty()));
             }
         }
         self.removed = self.left_bg.len();
@@ -108,6 +122,21 @@ impl LiveDiff {
             .filter(|(t, ..)| *t != DiffTag::Equal)
             .map(|(_, _, new)| new.start)
             .collect()
+    }
+
+    fn hunks(&self) -> impl Iterator<Item = Hunk> + '_ {
+        self.ops
+            .iter()
+            .filter(|(tag, ..)| *tag != DiffTag::Equal)
+            .map(|(_, old, new)| Hunk {
+                old: old.clone(),
+                new: new.clone(),
+            })
+    }
+
+    pub(super) fn keep_scroll_from(&mut self, previous: &Self) {
+        self.tops = previous.tops;
+        self.base_state.scroll_to_line(self.tops.0);
     }
 
     /// The line on the other side matching `line` (fractional) on this side.
@@ -142,6 +171,102 @@ fn two_tabs(tabs: &mut [Tab], a: usize, b: usize) -> (&mut Tab, &mut Tab) {
 }
 
 impl App {
+    pub(super) fn hunk_command(&mut self, cmd: Command) {
+        let active = self.active;
+        let action = match cmd {
+            Command::NextChange => gutter::Action::Next,
+            Command::PreviousChange => gutter::Action::Previous,
+            Command::StageHunk | Command::StageSelectedLines => gutter::Action::Stage,
+            _ => gutter::Action::Revert,
+        };
+        let unstage = matches!(cmd, Command::UnstageHunk | Command::UnstageSelectedLines);
+        let selected = matches!(
+            cmd,
+            Command::StageSelectedLines | Command::UnstageSelectedLines | Command::RevertSelectedLines
+        );
+        if matches!(self.tabs.get(active), Some(Tab::File(_))) && !unstage {
+            self.gutter_action(active, action, selected, None);
+            return;
+        }
+        if let Some(file) = self.live_diff_doc(active)
+            && self.is_live_diff(active)
+            && !unstage
+        {
+            self.live_hunk_action(active, file, action, selected, None);
+            return;
+        }
+        let Some(Tab::Diff(d)) = self.tabs.get_mut(active) else { return };
+        if d.inline || d.hunks_stale || d.blocks.is_empty() {
+            return;
+        }
+        match cmd {
+            Command::NextChange | Command::PreviousChange => d.move_change(cmd == Command::NextChange),
+            Command::StageHunk | Command::UnstageHunk | Command::StageSelectedLines | Command::UnstageSelectedLines
+                if d.source.git_hunks().is_some_and(|(_, staged)| staged == unstage) =>
+            {
+                let hunk = if selected {
+                    d.selected_hunk()
+                } else {
+                    Some(d.sbs.blocks[d.current_change()].1.clone())
+                };
+                if let Some(hunk) = hunk {
+                    self.apply_diff_hunk(active, hunk);
+                } else {
+                    self.message = "Select lines within one hunk".into();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn live_hunk_action(&mut self, active: usize, file: usize, action: gutter::Action, selected: bool, picked: Option<usize>) {
+        let (Tab::Diff(d), Tab::File(doc)) = two_tabs(&mut self.tabs, active, file) else {
+            return;
+        };
+        if d.hunks_stale {
+            return;
+        }
+        let live = d.live.as_mut().unwrap();
+        live.update(doc, self.ctx.theme() == egui::Theme::Dark, self.settings.diff_ignore_eol);
+        let hunks: Vec<_> = live.hunks().collect();
+        if hunks.is_empty() {
+            return;
+        }
+        let primary = doc.ed.primary();
+        let ix = doc.ed.index(&doc.text, doc.version);
+        let line = ix.line_of_byte(primary.head);
+        let last = ix.lines() - 1;
+        let current = picked.or_else(|| hunks.iter().position(|h| h.at(line, last)));
+        if matches!(action, gutter::Action::Next | gutter::Action::Previous) {
+            let target = gutter::step(&hunks, current, line, last, matches!(action, gutter::Action::Next));
+            gutter::goto(doc, hunks[target].new.start);
+            return;
+        }
+        let hunk = if selected {
+            gutter::selected_hunk(&hunks, ix, primary).map(|(_, hunk)| hunk)
+        } else {
+            current.and_then(|i| hunks.get(i).cloned())
+        };
+        let Some(hunk) = hunk else {
+            self.message = "Place the caret on a changed line or select lines within one hunk".into();
+            return;
+        };
+        match action {
+            gutter::Action::Stage if self.bg_task.is_none() => {
+                let Some((change, false)) = d.source.git_hunks() else { return };
+                let (path, base, text, crlf) = (change.path.clone(), live.base.clone(), doc.text.clone(), doc.crlf);
+                self.stage_buffer_hunk(path, BufferBase::Index(base), text, crlf, hunk);
+            }
+            gutter::Action::Revert => {
+                let base = without_cr_at_eol(&live.base, true);
+                let index = ed::buffer::LineIndex::new(&base);
+                gutter::revert(doc, &base, &index, hunk);
+                self.message = "Reverted hunk in the editor".into();
+            }
+            _ => {}
+        }
+    }
+
     /// The file tab edited by the live diff in tab `i`, if it is one.
     pub(super) fn live_diff_doc(&self, i: usize) -> Option<usize> {
         let Some(Tab::Diff(d)) = self.tabs.get(i) else { return None };
@@ -158,6 +283,10 @@ impl App {
         let open_doc = self.live_diff_doc(active);
         // The right pane edits the file's own document, using the worker's snapshot if unopened.
         let Tab::Diff(d) = &mut self.tabs[active] else { return None };
+        if d.hunks_stale {
+            ui.weak("Loading diff…");
+            return None;
+        }
         let path = d.path.clone();
         let live = d.live.as_mut()?;
         let mut disk = live.initial_disk.take();
@@ -184,7 +313,7 @@ impl App {
                     };
                 }
                 let disk = disk.as_mut().unwrap();
-                self.add_file_tab(&path, std::mem::take(&mut disk.text), disk.crlf);
+                self.add_file_tab(&path, std::mem::take(&mut disk.text), disk.crlf, disk.encoding);
                 self.record_tab_recent(self.tabs.len() - 1);
                 self.tabs.len() - 1
             }
@@ -204,7 +333,13 @@ impl App {
         live.update(doc, dark, settings.diff_ignore_eol);
 
         let mut open_path = None;
-        let mut jump = None;
+        let mut navigate = None;
+        let mut clicked_hunk = None;
+        let hunk_button = match &d.source {
+            DiffSource::Vcs { vcs: Vcs::Svn, .. } => Some((gutter::Action::Revert, (ic::ARROW_U_UP_LEFT, "Revert hunk"))),
+            _ if d.source.git_hunks().is_some() && self.bg_task.is_none() => Some((gutter::Action::Stage, (ic::PLUS, "Stage hunk"))),
+            _ => None,
+        };
         let mut ignore_eol = settings.diff_ignore_eol;
         ui.horizontal(|ui| {
             if ui.button(format!("{} Open file", ic::ARROW_SQUARE_OUT)).clicked() {
@@ -219,13 +354,13 @@ impl App {
             let blocks = live.blocks();
             if !blocks.is_empty() {
                 ui.separator();
-                let top = live.tops.1 + 3.0;
-                let current = blocks.iter().rposition(|&b| b as f32 <= top).unwrap_or(0);
+                let caret = doc.line_col().0;
+                let current = blocks.partition_point(|&b| b <= caret).saturating_sub(1);
                 if icon_button(ui, ic::ARROW_UP).on_hover_text("Previous change").clicked() {
-                    jump = blocks.iter().rev().find(|&&b| (b as f32) + 1.0 < top).or(blocks.last()).copied();
+                    navigate = Some(gutter::Action::Previous);
                 }
                 if icon_button(ui, ic::ARROW_DOWN).on_hover_text("Next change").clicked() {
-                    jump = blocks.iter().find(|&&b| b as f32 > top).or(blocks.first()).copied();
+                    navigate = Some(gutter::Action::Next);
                 }
                 ui.weak(format!("change {} of {}", current + 1, blocks.len()));
             }
@@ -238,9 +373,6 @@ impl App {
         });
         if live.only_line_endings {
             ui.weak("Only line endings differ");
-        }
-        if let Some(line) = jump {
-            doc.ed.scroll_to_line(line.saturating_sub(3) as f32);
         }
 
         let lang = Path::new(&path)
@@ -264,6 +396,7 @@ impl App {
                 sticky_scroll: false,
                 sticky_control_flow: false,
                 sticky_line: true,
+                wrap: false,
                 sticky_shown: crate::editor::sticky::Kinds::ALL,
                 navigation_menu: false,
                 read_only: true,
@@ -294,11 +427,21 @@ impl App {
                 &[],
                 &[],
                 3,
-                &live.right_bg,
+                Some(LiveDiffMarks {
+                    line_bg: &live.right_bg,
+                    gutter: if hunk_button.is_some() { &live.change_marks } else { &[] },
+                    button: hunk_button.map(|(_, button)| button),
+                }),
                 &[],
                 highlights,
             ));
         });
+        if let Some((line, deleted, _, _)) = out.as_ref().and_then(|o| o.gutter_click) {
+            clicked_hunk = live
+                .change_marks
+                .iter()
+                .position(|&(start, _, empty)| start == line && empty == deleted);
+        }
         // Keep the panes lined up: whichever one the user scrolled leads.
         let right_top = out.as_ref().map_or(live.tops.1, |o| o.top_line);
         if (right_top - live.tops.1).abs() > 0.01 {
@@ -320,6 +463,12 @@ impl App {
         if let Some(idx) = goto {
             self.activate_tab(file);
             self.go_to_definition(idx, &ui.ctx().clone());
+        }
+        if let (Some(hunk), Some((action, _))) = (clicked_hunk, hunk_button) {
+            self.live_hunk_action(active, file, action, false, Some(hunk));
+        } else if let Some(action) = navigate {
+            self.live_hunk_action(active, file, action, false, None);
+            ui.ctx().request_repaint();
         }
         open_path
     }

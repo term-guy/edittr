@@ -118,6 +118,65 @@ impl Drop for TestRepo {
 }
 
 #[test]
+fn stash_workflow_keeps_conflicted_pops_and_rejects_stale_reflog_positions() {
+    let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let repo = TestRepo(std::env::temp_dir().join(format!("edittr-git-stash-{}-{unique}", std::process::id())));
+    fs::create_dir(&repo.0).unwrap();
+    let root = &repo.0;
+    let git = |args: &[&str]| run(root, args).unwrap();
+    git(&["init", "-b", "main"]);
+    git(&["config", "user.name", "Test Author"]);
+    git(&["config", "user.email", "author@example.invalid"]);
+    git(&["config", "core.hooksPath", ".git/test-hooks"]);
+    git(&["config", "core.autocrlf", "false"]);
+    let tracked = root.join("tracked.txt");
+    let untracked = root.join("new.txt");
+    fs::write(&tracked, "base\n").unwrap();
+    git(&["add", "tracked.txt"]);
+    git(&["-c", "commit.gpgsign=false", "commit", "-m", "Initial"]);
+
+    let vcs = Vcs::Git;
+    assert!(vcs.stashes(root).unwrap().is_empty());
+    fs::write(&tracked, "first change\n").unwrap();
+    git(&["add", "tracked.txt"]);
+    fs::write(&untracked, "new file\n").unwrap();
+    vcs.stash_push(root, "", false).unwrap();
+    let first = vcs.stashes(root).unwrap().remove(0);
+    assert_eq!(first.selector, "stash@{0}");
+    assert_eq!(first.commit.parents.len(), 2);
+    assert_eq!(fs::read_to_string(&tracked).unwrap(), "base\n");
+    assert!(untracked.exists());
+    assert!(vcs.status(root).unwrap().staged.is_empty());
+
+    vcs.stash_push(root, "--custom stash message", true).unwrap();
+    let entries = vcs.stashes(root).unwrap();
+    assert_eq!(entries.len(), 2);
+    let newest = &entries[0];
+    assert!(newest.commit.subject.ends_with("--custom stash message"));
+    assert_eq!(newest.commit.parents.len(), 3);
+    assert!(!untracked.exists());
+    for action in [StashAction::Pop, StashAction::Drop] {
+        assert!(vcs.stash_action(root, &first, action).unwrap_err().contains("has changed"));
+        assert_eq!(vcs.stashes(root).unwrap().len(), 2);
+    }
+
+    vcs.stash_action(root, &first, StashAction::Apply).unwrap();
+    assert_eq!(fs::read_to_string(&tracked).unwrap(), "first change\n");
+    assert_eq!(vcs.stashes(root).unwrap().len(), 2);
+    vcs.stash_action(root, newest, StashAction::Drop).unwrap();
+    fs::write(&tracked, "conflicting change\n").unwrap();
+    git(&["add", "tracked.txt"]);
+    git(&["-c", "commit.gpgsign=false", "commit", "-m", "Conflicting change"]);
+    assert!(vcs.stash_action(root, &first, StashAction::Pop).is_err());
+    assert_eq!(vcs.stashes(root).unwrap()[0].commit.hash, first.commit.hash);
+    assert_eq!(vcs.status(root).unwrap().unstaged[0].code, 'U');
+    git(&["reset", "--hard", "HEAD^"]);
+    vcs.stash_action(root, &first, StashAction::Pop).unwrap();
+    assert!(vcs.stashes(root).unwrap().is_empty());
+    assert_eq!(fs::read_to_string(&tracked).unwrap(), "first change\n");
+}
+
+#[test]
 fn diff_can_ignore_crlf_only_changes_in_the_worktree_and_index() {
     let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
     let repo = TestRepo(std::env::temp_dir().join(format!("edittr-git-eol-{}-{unique}", std::process::id())));

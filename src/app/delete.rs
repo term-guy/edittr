@@ -479,7 +479,7 @@ mod tests {
         let nested = target.path.join("nested/two.rs");
         let sibling = root.join("src-other/keep.rs");
         for path in [&direct, &nested, &sibling] {
-            app.add_file_tab(path, String::new(), false);
+            app.add_file_tab(path, String::new(), false, crate::encoding::Encoding::default());
         }
         assert_eq!(file(direct).tabs(&app.tabs), [0]);
         let Tab::File(doc) = &mut app.tabs[1] else { unreachable!() };

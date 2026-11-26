@@ -139,12 +139,30 @@ pub struct History {
     redo: Vec<Group>,
     /// Bytes of text kept in history; old steps are dropped past `BUDGET`.
     bytes: usize,
+    /// Every replacement made to the text (edits, undo, redo) since the last `take_log`,
+    /// in order, as (start, end, inserted length): for keeping marks such as bookmarks on their text.
+    log: Vec<(usize, usize, usize)>,
+    /// The log grew too long without being read: marks can't be mapped exactly.
+    log_overflow: bool,
 }
 
 const MERGE_WINDOW: Duration = Duration::from_millis(800);
 const BUDGET: usize = 64 * 1024 * 1024;
 
 impl History {
+    fn log(&mut self, start: usize, end: usize, inserted: usize) {
+        if self.log.len() >= 100_000 {
+            self.log.clear();
+            self.log_overflow = true;
+        }
+        self.log.push((start, end, inserted));
+    }
+
+    /// The replacements since the last call (see `log`), and whether some were dropped.
+    pub fn take_log(&mut self) -> (Vec<(usize, usize, usize)>, bool) {
+        (std::mem::take(&mut self.log), std::mem::take(&mut self.log_overflow))
+    }
+
     fn record(&mut self, change: Change, before: &[Sel], after: &[Sel], kind: Kind) {
         self.redo.clear();
         let size: usize = change.parts.iter().map(|(_, a, b)| a.len() + b.len()).sum();
@@ -189,7 +207,7 @@ impl History {
     pub fn undo(&mut self, text: &mut String) -> Option<Vec<Sel>> {
         let mut g = self.undo.pop()?;
         for c in g.changes.iter_mut().rev() {
-            *c = invert(text, c);
+            *c = invert(text, c, &mut self.log, &mut self.log_overflow);
         }
         g.changes.reverse();
         let sels = g.before.clone();
@@ -202,7 +220,7 @@ impl History {
     pub fn redo(&mut self, text: &mut String) -> Option<Vec<Sel>> {
         let mut g = self.redo.pop()?;
         for c in g.changes.iter_mut().rev() {
-            *c = invert(text, c);
+            *c = invert(text, c, &mut self.log, &mut self.log_overflow);
         }
         g.changes.reverse();
         let sels = g.before.clone();
@@ -213,23 +231,43 @@ impl History {
 }
 
 /// Undo `c` on `text` (which is in `c`'s "after" coordinates); returns the inverse change.
-fn invert(text: &mut String, c: &Change) -> Change {
-    // Parts are sorted by position; replace from the back so earlier ranges stay valid.
+fn invert(text: &mut String, c: &Change, log: &mut Vec<(usize, usize, usize)>, overflow: &mut bool) -> Change {
+    replace_ranges(text, c.parts.iter().map(|(range, removed, _)| (range, removed.as_str())));
+    for (range, removed, _) in c.parts.iter().rev() {
+        if log.len() >= 100_000 {
+            log.clear();
+            *overflow = true;
+        }
+        log.push((range.start, range.end, removed.len()));
+    }
     let mut parts = Vec::with_capacity(c.parts.len());
     let mut delta: isize = 0;
-    let mut out: Vec<(Range<usize>, String, String)> = Vec::new();
-    for (range, removed, inserted) in c.parts.iter() {
-        out.push((range.clone(), removed.clone(), inserted.clone()));
-    }
-    for (range, removed, _) in out.iter().rev() {
-        text.replace_range(range.clone(), removed);
-    }
-    for (range, removed, inserted) in out {
+    for (range, removed, inserted) in &c.parts {
         let start = (range.start as isize + delta) as usize;
-        parts.push((start..start + removed.len(), inserted, removed.clone()));
+        parts.push((start..start + removed.len(), inserted.clone(), removed.clone()));
         delta += removed.len() as isize - (range.end - range.start) as isize;
     }
     Change { parts }
+}
+
+/// Replace sorted, disjoint ranges. For bulk edits such as trimming on save,
+/// copy the buffer in one pass to avoid shifting the tail once per line.
+fn replace_ranges<'a>(text: &mut String, edits: impl DoubleEndedIterator<Item = (&'a Range<usize>, &'a str)> + ExactSizeIterator) {
+    if edits.len() <= 32 {
+        for (range, replacement) in edits.rev() {
+            text.replace_range(range.clone(), replacement);
+        }
+        return;
+    }
+    let mut output = String::with_capacity(text.len());
+    let mut start = 0;
+    for (range, replacement) in edits {
+        output.push_str(&text[start..range.start]);
+        output.push_str(replacement);
+        start = range.end;
+    }
+    output.push_str(&text[start..]);
+    *text = output;
 }
 
 /// Replace each `(range, insert)` (ranges in the current text, any order) and put a
@@ -292,6 +330,34 @@ pub fn edit_keep(text: &mut String, history: &mut History, sels: &[Sel], edits: 
     after
 }
 
+/// Apply non-overlapping `edits` (ranges in the current text) as one undoable step and
+/// set `after` (positions in the new text) as the selections.
+pub fn edit_select(
+    text: &mut String,
+    history: &mut History,
+    sels: &[Sel],
+    edits: Vec<(Range<usize>, String)>,
+    after: Vec<Sel>,
+) -> Vec<Sel> {
+    let merged = merge(edits.into_iter().map(|(r, s)| (r, s, 0)).collect());
+    apply(text, history, sels, &merged, &after, Kind::Other);
+    history.seal();
+    after
+}
+
+/// Where byte `p` of the text before `log`'s replacements is afterwards (inside a replaced
+/// range: its start).
+pub fn map_through(log: &[(usize, usize, usize)], mut p: usize) -> usize {
+    for &(start, end, inserted) in log {
+        if p >= end {
+            p = p - (end - start) + inserted;
+        } else if p > start {
+            p = start;
+        }
+    }
+    p
+}
+
 fn merge(mut edits: Vec<(Range<usize>, String, usize)>) -> Vec<(Range<usize>, String, usize)> {
     edits.sort_by_key(|(r, _, _)| (r.start, r.end));
     let mut merged: Vec<(Range<usize>, String, usize)> = Vec::with_capacity(edits.len());
@@ -315,8 +381,10 @@ fn apply(text: &mut String, history: &mut History, before: &[Sel], merged: &[(Ra
         parts.push((start..start + s.len(), text[r.clone()].to_string(), s.clone()));
         delta += s.len() as isize - (r.end - r.start) as isize;
     }
+    replace_ranges(text, merged.iter().map(|(range, replacement, _)| (range, replacement.as_str())));
+    // Logged from the back, each in the coordinates left by the previous ones (see `map_through`).
     for (r, s, _) in merged.iter().rev() {
-        text.replace_range(r.clone(), s);
+        history.log(r.start, r.end, s.len());
     }
     history.record(Change { parts }, before, after, kind);
 }

@@ -4,7 +4,7 @@ use crate::{diff::FileDiff, git, svn};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-pub use git::{Commit, FileChange, Status};
+pub use git::{Commit, FileChange, Stash, StashAction, Status};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Vcs {
@@ -84,6 +84,27 @@ impl Vcs {
         Ok(status)
     }
 
+    pub fn stashes(self, root: &Path) -> Result<Vec<Stash>, String> {
+        match self {
+            Self::Git => git::stashes(root),
+            Self::Svn => Ok(Vec::new()),
+        }
+    }
+
+    pub fn stash_push(self, root: &Path, message: &str, include_untracked: bool) -> Result<String, String> {
+        match self {
+            Self::Git => git::stash_push(root, message, include_untracked),
+            Self::Svn => Err("Stashes are available only in Git repositories".into()),
+        }
+    }
+
+    pub fn stash_action(self, root: &Path, stash: &Stash, action: StashAction) -> Result<String, String> {
+        match self {
+            Self::Git => git::stash_action(root, stash, action),
+            Self::Svn => Err("Stashes are available only in Git repositories".into()),
+        }
+    }
+
     pub fn diff(self, root: &Path, change: &FileChange, staged: bool, ignore_eol: bool) -> FileDiff {
         match self {
             Self::Git => git::diff(root, change, staged, ignore_eol),
@@ -132,6 +153,36 @@ impl Vcs {
             (Self::Git, None, true) => git::stage_all(root),
             (Self::Git, None, false) => git::unstage_all(root),
             (Self::Svn, _, _) => Err("Subversion has no staging area".into()),
+        }
+    }
+
+    pub(crate) fn stage_buffer_hunk(
+        self,
+        root: &Path,
+        path: &str,
+        base: git::BufferBase,
+        text: &str,
+        crlf: bool,
+        hunk: crate::diff::Hunk,
+    ) -> Result<String, String> {
+        match self {
+            Self::Git => git::stage_buffer_hunk(root, path, base, text, crlf, hunk),
+            Self::Svn => Err("Subversion has no staging area".into()),
+        }
+    }
+
+    pub(crate) fn apply_diff_hunk(
+        self,
+        root: &Path,
+        change: &FileChange,
+        staged: bool,
+        ignore_eol: bool,
+        snapshot: &str,
+        hunk: crate::diff::Hunk,
+    ) -> Result<String, String> {
+        match self {
+            Self::Git => git::apply_diff_hunk(root, change, staged, ignore_eol, snapshot, hunk),
+            Self::Svn => Err("Subversion has no staging area".into()),
         }
     }
 

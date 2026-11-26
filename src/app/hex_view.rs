@@ -509,13 +509,27 @@ impl App {
         if refresh && current.is_none() {
             return;
         }
+        if refresh
+            && current
+                .as_ref()
+                .is_some_and(|current| current.path != tab.path || current.title != tab.title)
+        {
+            return;
+        }
         if tab.ignore_eol != self.settings.diff_ignore_eol && !matches!(tab.source, DiffSource::Commit) {
             self.load_diff(tab.title, tab.path, tab.source, refresh);
         } else {
             if let Some(current) = current {
                 tab.inline = current.inline;
                 if refresh {
-                    tab.live = current.live.take();
+                    if current.hunks_stale {
+                        tab.jump = Some(current.top_row.saturating_add(3).min(tab.sbs.rows.len().saturating_sub(1)));
+                        if let (Some(next), Some(previous)) = (&mut tab.live, &current.live) {
+                            next.keep_scroll_from(previous);
+                        }
+                    } else {
+                        tab.live = current.live.take();
+                    }
                     *current = tab;
                     return;
                 }

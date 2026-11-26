@@ -14,8 +14,7 @@ pub(super) fn show(
     if resp.secondary_clicked()
         && let Some(pos) = resp.interact_pointer_pos()
     {
-        let row = ((pos.y - lay.top) / lay.row_h).floor().max(0.0) as usize;
-        let byte = lines.byte_at_x(lay.view.line(row), pos.x - lay.text_x);
+        let byte = lay.byte_at(lines, pos);
         resp.ctx.data_mut(|data| data.insert_temp(key, (version, byte)));
     }
     let target = resp

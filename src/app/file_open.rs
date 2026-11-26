@@ -35,6 +35,38 @@ pub(super) struct OpenJob {
     rx: Option<Receiver<Result<Opened, String>>>,
 }
 
+pub(super) struct ReopenJob {
+    id: u64,
+    version: u64,
+    path: PathBuf,
+    rx: Option<Receiver<std::io::Result<DiskText>>>,
+}
+
+fn is_text_sample(sample: &[u8], previous: Option<Encoding>) -> bool {
+    Encoding::detect_bom(sample).is_some_and(Encoding::is_utf16)
+        || previous.is_some_and(Encoding::is_unmarked_utf16)
+        || !crate::hex::has_binary_controls(sample)
+}
+
+fn normalize(text: String, encoding: Encoding) -> DiskText {
+    let crlf = text.contains("\r\n");
+    DiskText {
+        raw_crlf: crlf.then(|| Arc::from(text.as_str())),
+        text: if crlf { text.replace("\r\n", "\n") } else { text },
+        crlf,
+        encoding,
+    }
+}
+
+pub(super) fn read_disk_text(path: &Path, previous: Option<Encoding>) -> std::io::Result<Option<DiskText>> {
+    let bytes = std::fs::read(path)?;
+    if !is_text_sample(&bytes[..bytes.len().min(8000)], previous) {
+        return Ok(None);
+    }
+    let (text, encoding) = Encoding::decode_auto(bytes, previous)?;
+    Ok(Some(normalize(text, encoding)))
+}
+
 impl App {
     pub(super) fn open_file(&mut self, path: &Path) {
         self.open_with_target(path, Target::None);
@@ -73,10 +105,16 @@ impl App {
             let opened = || -> std::io::Result<Opened> {
                 let source = crate::hex::Source::open(&requested)?;
                 let size = source.size;
-                if source.is_binary()? {
+                let sample = source.read(0..8000)?;
+                if size >= crate::large::THRESHOLD {
+                    // The large-file viewer indexes UTF-8 by byte. Keep its existing binary check.
+                    if crate::hex::is_binary(&sample) || Encoding::detect_bom(&sample).is_some_and(Encoding::is_utf16) {
+                        Ok(Opened::Hex(source))
+                    } else {
+                        Ok(Opened::Large(size))
+                    }
+                } else if !is_text_sample(&sample, None) {
                     Ok(Opened::Hex(source))
-                } else if size >= crate::large::THRESHOLD {
-                    Ok(Opened::Large(size))
                 } else {
                     match read_doc_text(&requested)? {
                         Some(text) => Ok(Opened::Text(text)),
@@ -94,7 +132,73 @@ impl App {
         });
     }
 
+    pub(super) fn reopen_with_encoding(&mut self, index: usize, encoding: Encoding) {
+        let Some(Tab::File(doc)) = self.tabs.get(index) else {
+            return;
+        };
+        if doc.untitled {
+            return;
+        }
+        if doc.dirty() {
+            self.confirm = Some(Confirm::ReopenEncoding(doc.id, encoding, doc.name()));
+        } else {
+            self.start_reopen_with_encoding(doc.id, encoding);
+        }
+    }
+
+    pub(super) fn start_reopen_with_encoding(&mut self, id: u64, encoding: Encoding) {
+        let Some(doc) = self.tabs.iter().find_map(|tab| match tab {
+            Tab::File(doc) if doc.id == id => Some(doc),
+            _ => None,
+        }) else {
+            return;
+        };
+        if self.document_action_pending(|path| path == doc.path) || self.search_replace.is_writing(&doc.path) {
+            self.message = "Wait for the file operation to finish before reopening".into();
+            return;
+        }
+        let (version, path) = (doc.version, doc.path.clone());
+        let source = path.clone();
+        let rx = background(&self.ctx, move || {
+            let bytes = std::fs::read(source)?;
+            let encoding = encoding.for_reopen(&bytes);
+            Ok(normalize(encoding.decode(&bytes)?, encoding))
+        });
+        self.reopen_jobs.retain(|job| job.id != id);
+        self.reopen_jobs.push(ReopenJob {
+            id,
+            version,
+            path,
+            rx: Some(rx),
+        });
+    }
+
+    fn poll_reopen_files(&mut self) {
+        let jobs = std::mem::take(&mut self.reopen_jobs);
+        for mut job in jobs {
+            let result = receive(&mut job.rx);
+            if job.rx.is_some() {
+                self.reopen_jobs.push(job);
+                continue;
+            }
+            let busy = self.document_action_pending(|path| path == job.path) || self.search_replace.is_writing(&job.path);
+            let Some(doc) = self.document_mut(job.id).filter(|doc| doc.path == job.path) else {
+                continue;
+            };
+            self.message = match result {
+                Some(Ok(disk)) if !busy && doc.version == job.version => {
+                    doc.reload(disk);
+                    format!("Reopened {} with {}", job.path.display(), doc.encoding.label())
+                }
+                Some(Ok(_)) => format!("{} changed while reopening. Run the command again.", job.path.display()),
+                Some(Err(err)) => format!("Reopen failed for {}: {err}", job.path.display()),
+                None => format!("Reopen worker stopped for {}", job.path.display()),
+            };
+        }
+    }
+
     pub(super) fn poll_open_files(&mut self) {
+        self.poll_reopen_files();
         let mut jobs = std::mem::take(&mut self.open_jobs);
         for mut job in jobs.drain(..) {
             let result = receive(&mut job.rx);
@@ -109,7 +213,7 @@ impl App {
                     if self.tabs.iter().any(|t| matches!(t, Tab::File(doc) if doc.path == path)) {
                         continue;
                     }
-                    self.add_file_tab(&path, text.text, text.crlf);
+                    self.add_file_tab(&path, text.text, text.crlf, text.encoding);
                 }
                 Some(Ok(Opened::Large(size))) => {
                     let viewer = crate::large::Viewer::open(&path, size, &self.ctx);
@@ -132,4 +236,38 @@ impl App {
             }
         }
     }
+}
+
+pub(super) fn format_status(ui: &mut egui::Ui, doc: &Doc) -> Option<Command> {
+    let mut command = None;
+    ui.menu_button(RichText::new(if doc.crlf { "CRLF" } else { "LF" }).weak(), |ui| {
+        for (crlf, label) in [(false, "LF"), (true, "CRLF")] {
+            if ui.radio(doc.crlf == crlf, label).clicked() {
+                command = Some(Command::ChangeLineEndings(crlf));
+                ui.close();
+            }
+        }
+    });
+    ui.menu_button(RichText::new(doc.encoding.label()).weak(), |ui| {
+        ui.add_enabled_ui(!doc.untitled, |ui| {
+            ui.menu_button("Reopen with encoding", |ui| {
+                for encoding in Encoding::ALL {
+                    if ui.button(encoding.label()).clicked() {
+                        command = Some(Command::ReopenWithEncoding(encoding));
+                    }
+                }
+            });
+        });
+        ui.menu_button("Save with encoding", |ui| {
+            for encoding in Encoding::ALL {
+                if ui.button(encoding.label()).clicked() {
+                    command = Some(Command::SaveWithEncoding(encoding));
+                }
+            }
+        });
+        if command.is_some() {
+            ui.close();
+        }
+    });
+    command
 }

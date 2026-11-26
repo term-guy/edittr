@@ -38,6 +38,11 @@ const SECTIONS: &[(&str, &[Item])] = &[
         &[
             item(Theme, "Theme", "Follow the system, or always use the dark or light theme."),
             item(
+                Toggle(Setting::ColorWindow),
+                "Color the whole window from the theme",
+                "Use the editor palette for panels, menus and controls. The edittr presets keep the default interface colors.",
+            ),
+            item(
                 Font(fonts::Target::Ui),
                 "UI font",
                 "Font family and size for menus, panels and dialogs.",
@@ -99,9 +104,24 @@ const SECTIONS: &[(&str, &[Item])] = &[
                 "Font family and size for code, line numbers and diffs.",
             ),
             item(
+                Toggle(Setting::WordWrap),
+                "Word wrap",
+                "Wrap long lines at the editor's width instead of scrolling sideways (Alt+Z).",
+            ),
+            item(
                 Toggle(Setting::FormatOnSave),
                 "Format on save",
                 "Format the file with its language server before saving.",
+            ),
+            item(
+                Toggle(Setting::TrimTrailingWhitespaceOnSave),
+                Setting::TrimTrailingWhitespaceOnSave.label(),
+                "Remove trailing whitespace when saving. Markdown hard line breaks are preserved. EditorConfig can override this setting.",
+            ),
+            item(
+                Toggle(Setting::InsertFinalNewlineOnSave),
+                Setting::InsertFinalNewlineOnSave.label(),
+                "Add a newline to the end of a nonempty file when saving. EditorConfig can override this setting.",
             ),
             item(
                 Toggle(Setting::StickyScroll),
@@ -250,7 +270,7 @@ fn theme_matches(filter: &str) -> bool {
 }
 
 /// An on/off switch, drawn like the ones in system settings.
-fn switch(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
+fn switch(ui: &mut egui::Ui, on: &mut bool, color_window: bool) -> egui::Response {
     let size = ui.spacing().interact_size.y * egui::vec2(1.8, 1.0);
     let (rect, mut response) = ui.allocate_exact_size(size, egui::Sense::click());
     if response.clicked() {
@@ -262,15 +282,14 @@ fn switch(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
         let t = ui.ctx().animate_bool_responsive(response.id, *on);
         let visuals = ui.style().interact_selectable(&response, *on);
         let radius = rect.height() / 2.0;
-        // Light mode's selection fill is too pale behind a white knob: use the selection text color instead.
-        let fill = match (*on, ui.visuals().dark_mode) {
-            (true, true) => ui.visuals().selection.bg_fill,
-            (true, false) => ui.visuals().selection.stroke.color,
-            (false, _) => visuals.bg_fill,
+        let (fill, knob) = match (*on, color_window, ui.visuals().dark_mode) {
+            (false, _, _) => (visuals.bg_fill, visuals.fg_stroke.color),
+            (true, true, _) => (ui.visuals().hyperlink_color, ui.visuals().extreme_bg_color),
+            (true, false, true) => (ui.visuals().selection.bg_fill, egui::Color32::WHITE),
+            (true, false, false) => (ui.visuals().selection.stroke.color, egui::Color32::WHITE),
         };
         ui.painter().rect(rect, radius, fill, visuals.bg_stroke, egui::StrokeKind::Inside);
         let x = egui::lerp((rect.left() + radius)..=(rect.right() - radius), t);
-        let knob = if *on { egui::Color32::WHITE } else { visuals.fg_stroke.color };
         ui.painter().circle_filled(egui::pos2(x, rect.center().y), radius * 0.72, knob);
     }
     response
@@ -357,8 +376,7 @@ impl App {
 
     pub(super) fn set_theme_preference(&mut self, preference: egui::ThemePreference) {
         self.settings.themes.preference = preference;
-        self.ctx.set_theme(preference);
-        self.ctx.request_repaint();
+        self.settings.themes.apply(&self.ctx, self.settings.color_window);
         self.save_settings(&self.ctx.clone());
     }
 
@@ -467,7 +485,8 @@ impl App {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| match item.control {
                 Toggle(setting) => {
                     let mut on = *setting.value(&mut self.settings);
-                    if switch(ui, &mut on).on_hover_text(setting.label()).changed() {
+                    let color_window = self.colors_window(ui);
+                    if switch(ui, &mut on, color_window).on_hover_text(setting.label()).changed() {
                         *run = Some(Command::ToggleSetting(setting));
                     }
                 }
@@ -548,7 +567,10 @@ impl App {
             State::Other(command) => format!("The Explorer menu opens another copy: {command}\nTurn on to use this one."),
             State::AllUsers => "Added for all users by the installer; change it by running the installer again".to_string(),
         };
-        let response = ui.add_enabled_ui(state != State::AllUsers, |ui| switch(ui, &mut on)).inner;
+        let color_window = self.colors_window(ui);
+        let response = ui
+            .add_enabled_ui(state != State::AllUsers, |ui| switch(ui, &mut on, color_window))
+            .inner;
         if response
             .on_hover_text(hover)
             .on_disabled_hover_text("Added for all users by the installer")
@@ -779,6 +801,48 @@ mod tests {
         let database = &SECTIONS[4].1[1];
         assert!(!super::matches("tab", "C / C++", database));
         assert!(super::matches("comp", "C / C++", database));
+    }
+
+    #[test]
+    fn themed_switch_paints_the_accent_and_responds_to_clicks() {
+        let ctx = egui::Context::default();
+        for (preset, theme) in [("tidal-glass", egui::Theme::Dark), ("oat-paper", egui::Theme::Light)] {
+            let mut themes = crate::theme::Themes {
+                preference: theme.into(),
+                ..Default::default()
+            };
+            themes.set_palette(Palette::parse(preset, theme).unwrap());
+            themes.apply(&ctx, true);
+            let accent = ctx.global_style().visuals.hyperlink_color;
+            let mut on = true;
+            let mut frame = |events| {
+                let mut rect = egui::Rect::NOTHING;
+                let input = egui::RawInput {
+                    events,
+                    ..Default::default()
+                };
+                let mut out = ctx.run_ui(input, |ui| rect = switch(ui, &mut on, true).rect);
+                out.textures_delta.clear();
+                (rect, out.shapes)
+            };
+            let (rect, shapes) = frame(Vec::new());
+            assert!(
+                shapes
+                    .iter()
+                    .any(|shape| matches!(&shape.shape, egui::Shape::Rect(switch) if switch.fill == accent))
+            );
+            let pos = rect.center();
+            let click = |pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: Default::default(),
+            };
+            frame(vec![egui::Event::PointerMoved(pos)]);
+            frame(vec![click(true)]);
+            frame(vec![click(false)]);
+            assert!(!on);
+        }
     }
 
     #[test]

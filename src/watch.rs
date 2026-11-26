@@ -156,6 +156,7 @@ fn git_metadata(path: &Path) -> bool {
     let top = path.iter().next().and_then(|part| part.to_str()).unwrap_or_default();
     match top {
         "refs" | "reftable" | "rebase-apply" | "rebase-merge" | "sequencer" => true,
+        "logs" => path == Path::new("logs/refs/stash"),
         "index" | "HEAD" | "packed-refs" | "MERGE_HEAD" | "MERGE_MSG" | "CHERRY_PICK_HEAD" | "REVERT_HEAD" | "REBASE_HEAD"
         | "ORIG_HEAD" | "FETCH_HEAD" | "BISECT_LOG" | "config" | "config.worktree" | "commondir" => path == Path::new(top),
         _ => false,
@@ -447,6 +448,7 @@ mod tests {
         fs::create_dir_all(base.0.join(".svn")).unwrap();
         fs::create_dir_all(root.join("target")).unwrap();
         fs::create_dir_all(common.join("refs/heads")).unwrap();
+        fs::create_dir_all(common.join("logs/refs")).unwrap();
         fs::create_dir_all(common.join("objects")).unwrap();
         fs::create_dir_all(&admin).unwrap();
         fs::write(root.join(".git"), "gitdir: ../admin/worktrees/test\n").unwrap();
@@ -516,6 +518,10 @@ mod tests {
 
         fs::write(common.join("refs/heads/main"), "ref").unwrap();
         assert!(receive().0.vcs);
+        fs::write(common.join("logs/refs/stash"), "stash reflog").unwrap();
+        let (changes, _) = receive();
+        assert!(changes.vcs);
+        assert!(changes.paths.is_empty());
         for db in [root.join("src/.svn/wc.db"), base.0.join(".svn/wc.db")] {
             fs::write(db, "svn").unwrap();
             let (changes, _) = receive();

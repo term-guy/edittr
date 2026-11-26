@@ -298,7 +298,7 @@ mod tests {
         app.settings.outline_collapsed_groups.toggle(Group::Macros);
         let path = Path::new("outline-test.h");
         let source = "#define ENABLED 1\nvoid run(void);\n";
-        app.add_file_tab(path, source.to_owned(), false);
+        app.add_file_tab(path, source.to_owned(), false, crate::encoding::Encoding::default());
         let revision = (0, 0);
         app.outline.snapshot = Some(Snapshot {
             revision,

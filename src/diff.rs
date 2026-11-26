@@ -16,6 +16,101 @@ impl FileDiff {
 
 const NO_NEWLINE: &str = "\\ No newline at end of file";
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Hunk {
+    pub old: Range<usize>,
+    pub new: Range<usize>,
+}
+
+impl Hunk {
+    pub fn reversed(self) -> Self {
+        Self {
+            old: self.new,
+            new: self.old,
+        }
+    }
+
+    pub fn intersects(&self, lines: &Range<usize>) -> bool {
+        !self.new.is_empty() && self.new.start < lines.end && self.new.end > lines.start
+    }
+
+    pub fn at(&self, line: usize, last_line: usize) -> bool {
+        if self.new.is_empty() {
+            self.new.start.min(last_line) == line
+        } else {
+            self.new.contains(&line)
+        }
+    }
+
+    /// Slice additions and one-for-one replacements on line boundaries.
+    pub fn selected(&self, lines: &Range<usize>) -> Option<Self> {
+        let start = self.new.start.max(lines.start);
+        let end = self.new.end.min(lines.end);
+        if start >= end {
+            return None;
+        }
+        if start == self.new.start && end == self.new.end {
+            return Some(self.clone());
+        }
+        let old = if self.old.is_empty() {
+            self.old.clone()
+        } else if self.old.len() == self.new.len() {
+            self.old.start + (start - self.new.start)..self.old.start + (end - self.new.start)
+        } else {
+            return None;
+        };
+        Some(Self { old, new: start..end })
+    }
+}
+
+pub fn changed_blocks(old: &str, new: &str) -> Vec<Hunk> {
+    similar::TextDiff::configure()
+        .algorithm(similar::Algorithm::Myers)
+        .timeout(std::time::Duration::from_millis(500))
+        .diff_slices(
+            &old.split_inclusive('\n').collect::<Vec<_>>(),
+            &new.split_inclusive('\n').collect::<Vec<_>>(),
+        )
+        .ops()
+        .iter()
+        .filter(|op| op.tag() != similar::DiffTag::Equal)
+        .map(|op| Hunk {
+            old: op.old_range(),
+            new: op.new_range(),
+        })
+        .collect()
+}
+
+/// A single change, with up to three lines of exact preimage context.
+pub fn patch_block(old: &[&str], start: usize, end: usize, insert: &[&str]) -> String {
+    let before = start.saturating_sub(3);
+    let after = end.saturating_add(3).min(old.len());
+    let old_count = after - before;
+    let new_count = old_count - (end - start) + insert.len();
+    let mut patch = format!(
+        "@@ -{},{} +{},{} @@\n",
+        before + usize::from(old_count != 0),
+        old_count,
+        before + usize::from(new_count != 0),
+        new_count,
+    );
+    for (tag, lines) in [
+        (' ', &old[before..start]),
+        ('-', &old[start..end]),
+        ('+', insert),
+        (' ', &old[end..after]),
+    ] {
+        for line in lines {
+            patch.push(tag);
+            patch.push_str(line);
+            if !line.ends_with('\n') {
+                let _ = writeln!(patch, "\n{NO_NEWLINE}");
+            }
+        }
+    }
+    patch
+}
+
 /// The editor stores LF internally and writes its configured line endings on save.
 pub fn with_editor_eol(text: &str, crlf: bool) -> Cow<'_, str> {
     if crlf {
@@ -90,21 +185,35 @@ pub struct Row {
 
 pub struct SideBySide {
     pub rows: Vec<Row>,
+    pub blocks: Vec<(usize, Hunk)>,
     /// Set for binary files, renames without content, etc.
     pub note: Option<String>,
 }
 
 pub fn side_by_side(unified: &str) -> SideBySide {
     let mut rows = Vec::new();
+    let mut blocks = Vec::new();
     let mut note = None;
     let (mut dels, mut adds): (Vec<Side>, Vec<Side>) = (Vec::new(), Vec::new());
     let (mut ln, mut rn) = (0usize, 0usize);
     let mut in_hunk = false;
     let mut last_old_end = 0usize;
+    let flush = |rows: &mut Vec<Row>, blocks: &mut Vec<(usize, Hunk)>, dels: &mut Vec<Side>, adds: &mut Vec<Side>, ln: usize, rn: usize| {
+        if !dels.is_empty() || !adds.is_empty() {
+            blocks.push((
+                rows.len(),
+                Hunk {
+                    old: ln - 1 - dels.len()..ln - 1,
+                    new: rn - 1 - adds.len()..rn - 1,
+                },
+            ));
+            flush(rows, dels, adds);
+        }
+    };
 
     for line in unified.lines() {
         if let Some(h) = line.strip_prefix("@@ ") {
-            flush(&mut rows, &mut dels, &mut adds);
+            flush(&mut rows, &mut blocks, &mut dels, &mut adds, ln, rn);
             let (old_start, new_start) = parse_hunk_header(h);
             if old_start > last_old_end + 1 && !rows.is_empty() {
                 rows.push(Row {
@@ -132,7 +241,7 @@ pub fn side_by_side(unified: &str) -> SideBySide {
         }
         match line.as_bytes().first() {
             Some(b' ') => {
-                flush(&mut rows, &mut dels, &mut adds);
+                flush(&mut rows, &mut blocks, &mut dels, &mut adds, ln, rn);
                 let text = line[1..].to_string();
                 rows.push(Row {
                     kind: Kind::Same,
@@ -167,7 +276,7 @@ pub fn side_by_side(unified: &str) -> SideBySide {
             Some(b'\\') => {} // "\ No newline at end of file"
             None => {
                 // Some tools strip the leading space of empty context lines.
-                flush(&mut rows, &mut dels, &mut adds);
+                flush(&mut rows, &mut blocks, &mut dels, &mut adds, ln, rn);
                 rows.push(Row {
                     kind: Kind::Same,
                     left: Some(Side {
@@ -185,11 +294,12 @@ pub fn side_by_side(unified: &str) -> SideBySide {
                 rn += 1;
             }
             _ => {
+                flush(&mut rows, &mut blocks, &mut dels, &mut adds, ln, rn);
                 in_hunk = false; // next file header in a multi-file diff
             }
         }
     }
-    flush(&mut rows, &mut dels, &mut adds);
+    flush(&mut rows, &mut blocks, &mut dels, &mut adds, ln, rn);
     if rows.is_empty() && note.is_none() {
         note = Some(if unified.trim().is_empty() {
             "No changes".into()
@@ -197,7 +307,7 @@ pub fn side_by_side(unified: &str) -> SideBySide {
             "No text changes (mode or rename only)".into()
         });
     }
-    SideBySide { rows, note }
+    SideBySide { rows, blocks, note }
 }
 
 /// Pair up a block of removed and added lines row by row.
@@ -225,15 +335,12 @@ fn flush(rows: &mut Vec<Row>, dels: &mut Vec<Side>, adds: &mut Vec<Side>) {
 fn parse_hunk_header(h: &str) -> (usize, usize) {
     let mut it = h.split_whitespace();
     let num = |s: Option<&str>, sign: char| {
-        s.and_then(|s| s.strip_prefix(sign))
-            .and_then(|s| s.split(',').next())
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(1)
+        let s = s.and_then(|s| s.strip_prefix(sign)).unwrap_or("");
+        let (start, count) = s.split_once(',').unwrap_or((s, "1"));
+        let start = start.parse::<usize>().unwrap_or(1);
+        if count == "0" { start.saturating_add(1) } else { start.max(1) }
     };
-    let old = num(it.next(), '-');
-    let new = num(it.next(), '+');
-    // An empty side is reported as start 0 ("-0,0"); lines then start at 1.
-    (old.max(1), new.max(1))
+    (num(it.next(), '-'), num(it.next(), '+'))
 }
 
 /// Char ranges of the differing middle part of two lines (common prefix/suffix removed).
@@ -297,6 +404,16 @@ mod tests {
         assert_eq!(
             side_by_side("Binary files a/x and b/x differ\n").note.as_deref(),
             Some("Binary file changed")
+        );
+    }
+
+    #[test]
+    fn side_by_side_tracks_change_ranges_with_empty_sides() {
+        let diff = "@@ -2,0 +3,1 @@\n+added\n@@ -6,1 +6,0 @@\n-removed\n";
+        let sides = side_by_side(diff);
+        assert_eq!(
+            sides.blocks.iter().map(|(_, h)| h).collect::<Vec<_>>(),
+            [&Hunk { old: 2..2, new: 2..3 }, &Hunk { old: 5..6, new: 6..6 }]
         );
     }
 

@@ -147,9 +147,11 @@ impl Source {
 
 pub(crate) fn is_binary(sample: &[u8]) -> bool {
     let invalid = std::str::from_utf8(sample).is_err_and(|err| err.error_len().is_some());
-    (invalid && sample.iter().filter(|b| !b.is_ascii()).count() > sample.len() / 5)
-        || sample.contains(&0)
-        || sample.iter().filter(|&&b| matches!(b, 1..=8 | 14..=26 | 28..=31)).count() > sample.len() / 10
+    (invalid && sample.iter().filter(|b| !b.is_ascii()).count() > sample.len() / 5) || has_binary_controls(sample)
+}
+
+pub(crate) fn has_binary_controls(sample: &[u8]) -> bool {
+    sample.contains(&0) || sample.iter().filter(|&&b| matches!(b, 1..=8 | 14..=26 | 28..=31)).count() > sample.len() / 10
 }
 
 pub(crate) fn parse_offset(text: &str) -> Option<u64> {

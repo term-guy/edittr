@@ -285,7 +285,7 @@ impl App {
                     continue;
                 }
                 let index = self.tabs.len();
-                self.add_file_tab(&path, text.text, text.crlf);
+                self.add_file_tab(&path, text.text, text.crlf, text.encoding);
                 if let Tab::File(doc) = &mut self.tabs[index] {
                     doc.cursor = tab.cursor;
                     doc.anchor = tab.anchor;

@@ -57,7 +57,7 @@ impl App {
                 .any(|t| matches!(t, Tab::File(d) if d.untitled && d.path == Path::new(name)))
         };
         let name = (1..).map(|n| format!("Untitled-{n}")).find(|name| !taken(name)).unwrap_or_default();
-        self.add_file_tab(Path::new(&name), String::new(), false);
+        self.add_file_tab(Path::new(&name), String::new(), false, crate::encoding::Encoding::default());
         if let Some(Tab::File(doc)) = self.tabs.last_mut() {
             doc.untitled = true;
             // Focus the editor so typing goes straight into the new file.

@@ -58,18 +58,26 @@ pub fn regions(text: &str, ix: &LineIndex) -> Vec<Range<usize>> {
     out
 }
 
-/// Which document lines are shown, given the folded region starts.
+/// Which document lines are shown, given the folded region starts, and (with word wrap)
+/// how many display rows each shown line takes.
 #[derive(Default, Clone)]
 pub struct View {
     /// Visible lines in order; None = all lines visible (no folds).
     rows: Option<Vec<usize>>,
     lines: usize,
+    /// Word wrap: first display row of each visible line, plus the total at the end.
+    /// None = one row per visible line.
+    starts: Option<Vec<usize>>,
 }
 
 impl View {
     pub fn new(lines: usize, regions: &[Range<usize>], folded: &BTreeSet<usize>) -> Self {
         if folded.is_empty() {
-            return Self { rows: None, lines };
+            return Self {
+                rows: None,
+                lines,
+                starts: None,
+            };
         }
         let mut hidden = vec![false; lines];
         for r in regions.iter().filter(|r| folded.contains(&r.start)) {
@@ -78,25 +86,87 @@ impl View {
             }
         }
         let rows = (0..lines).filter(|&l| !hidden[l]).collect();
-        Self { rows: Some(rows), lines }
-    }
-
-    pub fn count(&self) -> usize {
-        self.rows.as_ref().map_or(self.lines, Vec::len)
-    }
-
-    pub fn line(&self, row: usize) -> usize {
-        match &self.rows {
-            None => row.min(self.lines.saturating_sub(1)),
-            Some(r) => r.get(row).copied().unwrap_or_else(|| r.last().copied().unwrap_or(0)),
+        Self {
+            rows: Some(rows),
+            lines,
+            starts: None,
         }
     }
 
-    /// Display row of `line` (a hidden line maps to its fold's header row).
-    pub fn row(&self, line: usize) -> usize {
+    /// The same view with `rows_of(line)` display rows per line (word wrap).
+    pub fn wrapped(&self, mut rows_of: impl FnMut(usize) -> usize) -> Self {
+        let visible = self.visible_count();
+        let mut starts = Vec::with_capacity(visible + 1);
+        let mut row = 0;
+        for i in 0..visible {
+            starts.push(row);
+            row += rows_of(self.visible_line(i)).max(1);
+        }
+        starts.push(row);
+        Self {
+            rows: self.rows.clone(),
+            lines: self.lines,
+            starts: Some(starts),
+        }
+    }
+
+    fn visible_count(&self) -> usize {
+        self.rows.as_ref().map_or(self.lines, Vec::len)
+    }
+
+    fn visible_line(&self, i: usize) -> usize {
+        match &self.rows {
+            None => i.min(self.lines.saturating_sub(1)),
+            Some(r) => r.get(i).copied().unwrap_or_else(|| r.last().copied().unwrap_or(0)),
+        }
+    }
+
+    /// Index among the visible lines (a hidden line maps to its fold's header).
+    fn visible_index(&self, line: usize) -> usize {
         match &self.rows {
             None => line,
             Some(r) => r.partition_point(|&l| l <= line).saturating_sub(1),
+        }
+    }
+
+    /// Display rows in total.
+    pub fn count(&self) -> usize {
+        match &self.starts {
+            Some(starts) => starts.last().copied().unwrap_or(0),
+            None => self.visible_count(),
+        }
+    }
+
+    /// The line shown on display row `row`.
+    pub fn line(&self, row: usize) -> usize {
+        match &self.starts {
+            Some(starts) => {
+                let i = starts[..starts.len().saturating_sub(1)]
+                    .partition_point(|&s| s <= row)
+                    .saturating_sub(1);
+                self.visible_line(i)
+            }
+            None => self.visible_line(row),
+        }
+    }
+
+    /// First display row of `line` (a hidden line maps to its fold's header row).
+    pub fn row(&self, line: usize) -> usize {
+        let i = self.visible_index(line);
+        match &self.starts {
+            Some(starts) => starts.get(i).copied().unwrap_or_else(|| self.count()),
+            None => i,
+        }
+    }
+
+    /// Display rows `line` takes (1 without word wrap).
+    pub fn rows_of(&self, line: usize) -> usize {
+        match &self.starts {
+            Some(starts) => {
+                let i = self.visible_index(line);
+                starts.get(i + 1).zip(starts.get(i)).map_or(1, |(b, a)| b - a)
+            }
+            None => 1,
         }
     }
 
@@ -134,6 +204,24 @@ mod tests {
         let v = View::new(ix.lines(), &r, &folded);
         assert_eq!(v.line(1), 6);
         assert_eq!(v.count(), ix.lines() - 5);
+    }
+
+    #[test]
+    fn wrapped_rows_map_to_lines_and_back() {
+        let text = "fn a() {\n    x;\n}\nlong\nend\n";
+        let ix = LineIndex::new(text);
+        let r = regions(text, &ix);
+        // Line 3 takes three rows, everything else one.
+        let rows = |l: usize| if l == 3 { 3 } else { 1 };
+        let v = View::new(ix.lines(), &r, &BTreeSet::new()).wrapped(rows);
+        assert_eq!(v.count(), ix.lines() + 2);
+        assert_eq!((v.row(3), v.rows_of(3), v.row(4)), (3, 3, 6));
+        assert_eq!([v.line(3), v.line(4), v.line(5), v.line(6)], [3, 3, 3, 4]);
+        // Folded and wrapped: line 1 is hidden, so line 3 starts on row 2.
+        let v = View::new(ix.lines(), &r, &BTreeSet::from([0])).wrapped(rows);
+        assert!(v.is_hidden(1));
+        assert_eq!((v.row(3), v.line(4), v.row(4)), (2, 3, 5));
+        assert_eq!(v.row(1), 0);
     }
 
     #[test]

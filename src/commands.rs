@@ -1,3 +1,5 @@
+use crate::editor::Action;
+use crate::encoding::Encoding;
 use crate::settings::Settings;
 use eframe::egui::{self, Key, KeyboardShortcut, ModifierNames, Modifiers};
 
@@ -29,6 +31,14 @@ pub(crate) enum Command {
     Explorer,
     ToggleSidebar,
     SourceControl,
+    NextChange,
+    PreviousChange,
+    StageHunk,
+    UnstageHunk,
+    RevertHunk,
+    StageSelectedLines,
+    UnstageSelectedLines,
+    RevertSelectedLines,
     History,
     FileHistory,
     SelectionHistory,
@@ -37,7 +47,14 @@ pub(crate) enum Command {
     CompareWithSelected,
     Refresh,
     Commit,
+    StashChanges,
+    ShowStashes,
+    StashEntry(crate::vcs::StashAction),
+    ViewStash,
     Save,
+    ReopenWithEncoding(Encoding),
+    SaveWithEncoding(Encoding),
+    ChangeLineEndings(bool),
     CloseTab,
     CloseAllTabs,
     ToggleTheme,
@@ -55,10 +72,21 @@ pub(crate) enum Command {
     GenerateCompileDatabase,
     ToggleSetting(Setting),
     TabSize(usize),
+    /// Line editing, bookmarks and merge conflicts in the active editor.
+    Editor(crate::editor::Action),
+    Bookmarks,
+    AffixLines,
+}
+
+impl Command {
+    pub(crate) fn is_stash(self) -> bool {
+        matches!(self, Self::StashChanges | Self::ShowStashes | Self::StashEntry(_) | Self::ViewStash)
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Setting {
+    ColorWindow,
     HighlightLine,
     ShowWhitespace,
     DiffIgnoreEol,
@@ -67,6 +95,8 @@ pub(crate) enum Setting {
     RestoreSession,
     ReopenLastFolder,
     FormatOnSave,
+    TrimTrailingWhitespaceOnSave,
+    InsertFinalNewlineOnSave,
     Minimap,
     BracketColors,
     SemanticHighlighting,
@@ -75,11 +105,13 @@ pub(crate) enum Setting {
     ShowOutline,
     ShowFps,
     HeaderLines,
+    WordWrap,
 }
 
 impl Setting {
-    pub(crate) fn label(self) -> &'static str {
+    pub(crate) const fn label(self) -> &'static str {
         match self {
+            Self::ColorWindow => "Color the whole window from the theme",
             Self::HighlightLine => "Highlight current line",
             Self::ShowWhitespace => "Show whitespace",
             Self::DiffIgnoreEol => "Diff: ignore line ending differences",
@@ -88,6 +120,8 @@ impl Setting {
             Self::RestoreSession => "Restore previous session",
             Self::ReopenLastFolder => "Reopen last folder at startup",
             Self::FormatOnSave => "Format on save",
+            Self::TrimTrailingWhitespaceOnSave => "Trim trailing whitespace on save",
+            Self::InsertFinalNewlineOnSave => "Insert final newline on save",
             Self::Minimap => "Show minimap",
             Self::BracketColors => "Color nested brackets",
             Self::SemanticHighlighting => "Semantic highlighting (colors from the language server)",
@@ -96,11 +130,13 @@ impl Setting {
             Self::ShowOutline => "Show outline",
             Self::ShowFps => "Show frames per second in the status bar",
             Self::HeaderLines => "Lines under the breadcrumbs and sticky scroll",
+            Self::WordWrap => "Word wrap",
         }
     }
 
     pub(crate) fn value(self, settings: &mut Settings) -> &mut bool {
         match self {
+            Self::ColorWindow => &mut settings.color_window,
             Self::HighlightLine => &mut settings.highlight_line,
             Self::ShowWhitespace => &mut settings.show_whitespace,
             Self::DiffIgnoreEol => &mut settings.diff_ignore_eol,
@@ -109,6 +145,8 @@ impl Setting {
             Self::RestoreSession => &mut settings.restore_previous_session,
             Self::ReopenLastFolder => &mut settings.reopen_last_folder,
             Self::FormatOnSave => &mut settings.format_on_save,
+            Self::TrimTrailingWhitespaceOnSave => &mut settings.trim_trailing_whitespace_on_save,
+            Self::InsertFinalNewlineOnSave => &mut settings.insert_final_newline_on_save,
             Self::Minimap => &mut settings.minimap,
             Self::BracketColors => &mut settings.bracket_colors,
             Self::SemanticHighlighting => &mut settings.semantic_highlighting,
@@ -117,6 +155,7 @@ impl Setting {
             Self::ShowOutline => &mut settings.show_outline,
             Self::ShowFps => &mut settings.show_fps,
             Self::HeaderLines => &mut settings.header_lines,
+            Self::WordWrap => &mut settings.word_wrap,
         }
     }
 }
@@ -125,11 +164,33 @@ pub(crate) struct Entry {
     pub(crate) id: Command,
     pub(crate) title: &'static str,
     shortcuts: &'static [KeyboardShortcut],
+    /// The app runs the command when its shortcut is pressed (false: the editor handles the
+    /// keys itself, only while it has the focus; they are listed for the palette).
+    dispatch: bool,
 }
 
 impl Entry {
     const fn new(id: Command, title: &'static str, shortcuts: &'static [KeyboardShortcut]) -> Self {
-        Self { id, title, shortcuts }
+        Self {
+            id,
+            title,
+            shortcuts,
+            dispatch: true,
+        }
+    }
+
+    /// A command whose shortcuts the editor widget handles.
+    const fn editor(action: crate::editor::Action, title: &'static str, shortcuts: &'static [KeyboardShortcut]) -> Self {
+        Self {
+            id: Command::Editor(action),
+            title,
+            shortcuts,
+            dispatch: false,
+        }
+    }
+
+    pub(crate) fn dispatches(&self) -> bool {
+        self.dispatch
     }
 
     pub(crate) fn shortcut_text(&self, ctx: &egui::Context) -> String {
@@ -141,7 +202,9 @@ impl Entry {
     }
 
     pub(crate) fn consume(&self, input: &mut egui::InputState) -> bool {
-        if matches!(self.id, Command::SwitchSourceHeader | Command::ShowCallHierarchy) {
+        // Option-letter shortcuts also type a character on macOS (Option+Z types "Ω").
+        let alt_letter = self.shortcuts.iter().any(|s| s.modifiers.alt && s.logical_key.name().len() == 1);
+        if matches!(self.id, Command::SwitchSourceHeader | Command::ShowCallHierarchy) || alt_letter {
             // Option-letter shortcuts can also produce a Text event on macOS.
             let mut consumed = false;
             let mut paired_text = false;
@@ -167,6 +230,7 @@ impl Entry {
 }
 
 const CMD: Modifiers = Modifiers::COMMAND;
+const ALT_SHIFT: Modifiers = Modifiers::ALT.plus(Modifiers::SHIFT);
 const CMD_SHIFT: Modifiers = CMD.plus(Modifiers::SHIFT);
 #[cfg(target_os = "macos")]
 const GO_BACK: KeyboardShortcut = KeyboardShortcut::new(Modifiers::CTRL, Key::Minus);
@@ -251,6 +315,18 @@ pub(crate) const COMMANDS: &[Entry] = &[
     Entry::new(Explorer, "Show Explorer", &[]),
     Entry::new(ToggleSidebar, "Toggle sidebar", &[]),
     Entry::new(SourceControl, "Show source control", &[]),
+    Entry::new(NextChange, "Go to next change", &[KeyboardShortcut::new(Modifiers::ALT, Key::F5)]),
+    Entry::new(
+        PreviousChange,
+        "Go to previous change",
+        &[KeyboardShortcut::new(Modifiers::SHIFT.plus(Modifiers::ALT), Key::F5)],
+    ),
+    Entry::new(StageHunk, "Stage hunk at caret", &[]),
+    Entry::new(UnstageHunk, "Unstage current hunk", &[]),
+    Entry::new(RevertHunk, "Revert hunk at caret", &[]),
+    Entry::new(StageSelectedLines, "Stage selected lines", &[]),
+    Entry::new(UnstageSelectedLines, "Unstage selected lines", &[]),
+    Entry::new(RevertSelectedLines, "Revert selected lines", &[]),
     Entry::new(History, "Show Git graph / repository history", &[]),
     Entry::new(FileHistory, "File History", &[]),
     Entry::new(SelectionHistory, "File History for Selection", &[]),
@@ -259,12 +335,33 @@ pub(crate) const COMMANDS: &[Entry] = &[
     Entry::new(CompareWithSelected, "Compare with Selected", &[]),
     Entry::new(Refresh, "Refresh project and source control", &[]),
     Entry::new(Commit, "Commit changes", &[KeyboardShortcut::new(CMD, Key::Enter)]),
+    Entry::new(StashChanges, "Git: Stash changes…", &[]),
+    Entry::new(ShowStashes, "Git: Show stashes", &[]),
+    Entry::new(StashEntry(crate::vcs::StashAction::Apply), "Git: Apply stash…", &[]),
+    Entry::new(StashEntry(crate::vcs::StashAction::Pop), "Git: Pop stash…", &[]),
+    Entry::new(StashEntry(crate::vcs::StashAction::Drop), "Git: Drop stash…", &[]),
+    Entry::new(ViewStash, "Git: View stash diff…", &[]),
     Entry::new(SaveAs, "Save as…", &[KeyboardShortcut::new(CMD_SHIFT, Key::S)]),
     Entry::new(Save, "Save", &[KeyboardShortcut::new(CMD, Key::S)]),
+    Entry::new(ReopenWithEncoding(Encoding::Utf8), "Reopen with encoding: UTF-8", &[]),
+    Entry::new(ReopenWithEncoding(Encoding::Utf8Bom), "Reopen with encoding: UTF-8 with BOM", &[]),
+    Entry::new(ReopenWithEncoding(Encoding::Utf16Le), "Reopen with encoding: UTF-16 LE", &[]),
+    Entry::new(ReopenWithEncoding(Encoding::Utf16Be), "Reopen with encoding: UTF-16 BE", &[]),
+    Entry::new(ReopenWithEncoding(Encoding::Windows1252), "Reopen with encoding: Windows-1252", &[]),
+    Entry::new(ReopenWithEncoding(Encoding::Latin1), "Reopen with encoding: ISO-8859-1", &[]),
+    Entry::new(SaveWithEncoding(Encoding::Utf8), "Save with encoding: UTF-8", &[]),
+    Entry::new(SaveWithEncoding(Encoding::Utf8Bom), "Save with encoding: UTF-8 with BOM", &[]),
+    Entry::new(SaveWithEncoding(Encoding::Utf16Le), "Save with encoding: UTF-16 LE", &[]),
+    Entry::new(SaveWithEncoding(Encoding::Utf16Be), "Save with encoding: UTF-16 BE", &[]),
+    Entry::new(SaveWithEncoding(Encoding::Windows1252), "Save with encoding: Windows-1252", &[]),
+    Entry::new(SaveWithEncoding(Encoding::Latin1), "Save with encoding: ISO-8859-1", &[]),
+    Entry::new(ChangeLineEndings(false), "Change line endings to LF", &[]),
+    Entry::new(ChangeLineEndings(true), "Change line endings to CRLF", &[]),
     Entry::new(CloseTab, "Close tab", &[KeyboardShortcut::new(CMD, Key::W)]),
     Entry::new(CloseAllTabs, "Close all tabs", &[]),
     Entry::new(OpenSettings, "Open settings", &[KeyboardShortcut::new(CMD, Key::Comma)]),
     Entry::new(ToggleTheme, "Toggle theme", &[]),
+    Entry::new(ToggleSetting(Setting::ColorWindow), "Toggle whole window theme colors", &[]),
     Entry::new(
         SplitEditor,
         "Split editor (open the file to the side)",
@@ -282,7 +379,22 @@ pub(crate) const COMMANDS: &[Entry] = &[
         &[],
     ),
     Entry::new(ToggleSetting(Setting::FormatOnSave), "Toggle format on save", &[]),
+    Entry::new(
+        ToggleSetting(Setting::TrimTrailingWhitespaceOnSave),
+        "Toggle trim trailing whitespace on save",
+        &[],
+    ),
+    Entry::new(
+        ToggleSetting(Setting::InsertFinalNewlineOnSave),
+        "Toggle insert final newline on save",
+        &[],
+    ),
     Entry::new(ToggleSetting(Setting::Minimap), "Toggle minimap", &[]),
+    Entry::new(
+        ToggleSetting(Setting::WordWrap),
+        "Toggle word wrap",
+        &[KeyboardShortcut::new(Modifiers::ALT, Key::Z)],
+    ),
     Entry::new(ToggleSetting(Setting::BracketColors), "Toggle bracket pair colors", &[]),
     Entry::new(ToggleSetting(Setting::SemanticHighlighting), "Toggle semantic highlighting", &[]),
     Entry::new(ToggleSetting(Setting::StickyScroll), "Toggle sticky scroll", &[]),
@@ -304,6 +416,62 @@ pub(crate) const COMMANDS: &[Entry] = &[
         "Format document",
         &[KeyboardShortcut::new(Modifiers::SHIFT.plus(Modifiers::ALT), Key::F)],
     ),
+    Entry::editor(
+        Action::Duplicate,
+        "Duplicate line or selection",
+        &[KeyboardShortcut::new(CMD, Key::D)],
+    ),
+    Entry::editor(
+        Action::MoveLinesUp,
+        "Move line up",
+        &[KeyboardShortcut::new(Modifiers::ALT, Key::ArrowUp)],
+    ),
+    Entry::editor(
+        Action::MoveLinesDown,
+        "Move line down",
+        &[KeyboardShortcut::new(Modifiers::ALT, Key::ArrowDown)],
+    ),
+    Entry::editor(
+        Action::CopyLinesUp,
+        "Copy line up",
+        &[KeyboardShortcut::new(ALT_SHIFT, Key::ArrowUp)],
+    ),
+    Entry::editor(
+        Action::CopyLinesDown,
+        "Copy line down",
+        &[KeyboardShortcut::new(ALT_SHIFT, Key::ArrowDown)],
+    ),
+    Entry::editor(Action::DeleteLines, "Delete line", &[KeyboardShortcut::new(CMD_SHIFT, Key::K)]),
+    Entry::editor(Action::JoinLines, "Join lines", &[KeyboardShortcut::new(CMD, Key::J)]),
+    Entry::editor(
+        Action::AddNextOccurrence,
+        "Add next occurrence to the selection",
+        &[KeyboardShortcut::new(Modifiers::ALT, Key::J)],
+    ),
+    Entry::editor(
+        Action::RemoveLastOccurrence,
+        "Remove the last added occurrence",
+        &[KeyboardShortcut::new(ALT_SHIFT, Key::J)],
+    ),
+    Entry::new(AffixLines, "Add text to the start / end of lines…", &[]),
+    Entry::editor(Action::ToggleBookmark, "Toggle bookmark", &[KeyboardShortcut::new(CMD, Key::F2)]),
+    Entry::editor(
+        Action::NextBookmark,
+        "Next bookmark",
+        &[KeyboardShortcut::new(Modifiers::ALT, Key::PageDown)],
+    ),
+    Entry::editor(
+        Action::PreviousBookmark,
+        "Previous bookmark",
+        &[KeyboardShortcut::new(Modifiers::ALT, Key::PageUp)],
+    ),
+    Entry::editor(Action::ClearBookmarks, "Clear bookmarks in this file", &[]),
+    Entry::new(Bookmarks, "Show bookmarks", &[]),
+    Entry::editor(Action::NextConflict, "Merge conflict: go to next", &[]),
+    Entry::editor(Action::PreviousConflict, "Merge conflict: go to previous", &[]),
+    Entry::editor(Action::AcceptCurrent, "Merge conflict: accept current change", &[]),
+    Entry::editor(Action::AcceptIncoming, "Merge conflict: accept incoming change", &[]),
+    Entry::editor(Action::AcceptBoth, "Merge conflict: accept both changes", &[]),
 ];
 
 /// Commands in the order their shortcuts are tried: most modifiers first. egui also
@@ -351,6 +519,8 @@ mod tests {
         assert!(first(Modifiers::SHIFT.plus(Modifiers::ALT), Key::H) == Some(ShowCallHierarchy));
         assert!(first(Modifiers::NONE, Key::F12) == Some(GoToDefinition));
         assert!(first(Modifiers::SHIFT.plus(Modifiers::ALT), Key::F) == Some(FormatDocument));
+        assert!(first(Modifiers::ALT, Key::F5) == Some(NextChange));
+        assert!(first(Modifiers::SHIFT.plus(Modifiers::ALT), Key::F5) == Some(PreviousChange));
         #[cfg(target_os = "macos")]
         {
             assert!(first(Modifiers::CTRL.plus(Modifiers::SHIFT), Key::Minus) == Some(GoForward));

@@ -31,8 +31,11 @@ pub(crate) struct FontFile {
 #[derive(Clone)]
 pub(crate) struct Settings {
     pub(crate) themes: Themes,
+    pub(crate) color_window: bool,
     pub(crate) changes_tree: bool,
     pub(crate) format_on_save: bool,
+    pub(crate) trim_trailing_whitespace_on_save: bool,
+    pub(crate) insert_final_newline_on_save: bool,
     pub(crate) highlight_line: bool,
     /// Show spaces as middle dots and tabs as arrows.
     pub(crate) show_whitespace: bool,
@@ -51,6 +54,8 @@ pub(crate) struct Settings {
     /// Kinds of lines sticky scroll pins (saved as the hidden ones).
     pub(crate) sticky_shown: crate::editor::sticky::Kinds,
     pub(crate) show_outline: bool,
+    /// Wrap long lines at the editor's width.
+    pub(crate) word_wrap: bool,
     /// Frames per second and frame time in the status bar.
     pub(crate) show_fps: bool,
     /// Divider lines under the breadcrumbs and the sticky scroll lines.
@@ -75,14 +80,18 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             themes: Themes::default(),
+            color_window: true,
             changes_tree: false,
             format_on_save: false,
+            trim_trailing_whitespace_on_save: false,
+            insert_final_newline_on_save: false,
             highlight_line: true,
             show_whitespace: false,
             diff_ignore_eol: true,
             inline_blame: true,
             minimap: true,
             show_fps: false,
+            word_wrap: false,
             header_lines: true,
             bracket_colors: true,
             semantic_highlighting: true,
@@ -230,8 +239,11 @@ impl Settings {
             }
             if let Ok(value) = value.parse() {
                 match key {
+                    "color_window" => settings.color_window = value,
                     "changes_tree" => settings.changes_tree = value,
                     "format_on_save" => settings.format_on_save = value,
+                    "trim_trailing_whitespace_on_save" => settings.trim_trailing_whitespace_on_save = value,
+                    "insert_final_newline_on_save" => settings.insert_final_newline_on_save = value,
                     "highlight_line" => settings.highlight_line = value,
                     "show_whitespace" => settings.show_whitespace = value,
                     "diff_ignore_eol" => settings.diff_ignore_eol = value,
@@ -243,6 +255,7 @@ impl Settings {
                     "sticky_control_flow" => settings.sticky_control_flow = value,
                     "show_outline" => settings.show_outline = value,
                     "show_fps" => settings.show_fps = value,
+                    "word_wrap" => settings.word_wrap = value,
                     "header_lines" => settings.header_lines = value,
                     "outline_expanded" => settings.outline_expanded = value,
                     "outline_grouped" => settings.outline_grouped = value,
@@ -281,12 +294,16 @@ impl Settings {
                         | "ui_font_size"
                         | "breadcrumb_font_size"
                         | "format_on_save"
+                        | "trim_trailing_whitespace_on_save"
+                        | "insert_final_newline_on_save"
                         | "show_outline"
                         | "show_fps"
+                        | "word_wrap"
                         | "header_lines"
                         | "outline_expanded"
                         | "outline_grouped"
                         | "outline_collapsed_groups"
+                        | "color_window"
                         | "theme_preference"
                         | "theme_dark"
                         | "theme_light"
@@ -332,8 +349,14 @@ impl Settings {
         }
         text.push_str(&format!("breadcrumb_font_size={}\n", self.breadcrumb_font_size));
         text.push_str(&format!("format_on_save={}\n", self.format_on_save));
+        text.push_str(&format!(
+            "trim_trailing_whitespace_on_save={}\n",
+            self.trim_trailing_whitespace_on_save
+        ));
+        text.push_str(&format!("insert_final_newline_on_save={}\n", self.insert_final_newline_on_save));
         text.push_str(&format!("show_outline={}\n", self.show_outline));
         text.push_str(&format!("show_fps={}\n", self.show_fps));
+        text.push_str(&format!("word_wrap={}\n", self.word_wrap));
         text.push_str(&format!("header_lines={}\n", self.header_lines));
         text.push_str(&format!("outline_expanded={}\n", self.outline_expanded));
         text.push_str(&format!("outline_grouped={}\n", self.outline_grouped));
@@ -344,6 +367,7 @@ impl Settings {
             .collect::<Vec<_>>()
             .join(",");
         text.push_str(&format!("outline_collapsed_groups={collapsed}\n"));
+        text.push_str(&format!("color_window={}\n", self.color_window));
         text.push_str(match self.themes.preference {
             egui::ThemePreference::Dark => "theme_preference=dark\n",
             egui::ThemePreference::Light => "theme_preference=light\n",
@@ -439,6 +463,15 @@ mod tests {
     }
 
     #[test]
+    fn color_window_defaults_on_and_round_trips() {
+        assert!(Settings::parse("").color_window);
+        assert!(Settings::parse("color_window=maybe").color_window);
+        let text = Settings::parse("color_window=false").format(" color_window = true\n");
+        assert_eq!(text.matches("color_window=").count(), 1);
+        assert!(!Settings::parse(&text).color_window);
+    }
+
+    #[test]
     fn theme_presets_and_custom_colors_round_trip() {
         use crate::theme::{PRESETS, Part};
         for (i, preset) in PRESETS.iter().enumerate() {
@@ -499,6 +532,19 @@ mod tests {
     }
 
     #[test]
+    fn save_whitespace_settings_round_trip() {
+        let defaults = Settings::parse("");
+        assert!(!defaults.trim_trailing_whitespace_on_save);
+        assert!(!defaults.insert_final_newline_on_save);
+        let input = "trim_trailing_whitespace_on_save=true\ninsert_final_newline_on_save=true\n";
+        let formatted = Settings::parse(input).format(input);
+        assert_eq!(formatted.matches(input).count(), 1);
+        let parsed = Settings::parse(&formatted);
+        assert!(parsed.trim_trailing_whitespace_on_save);
+        assert!(parsed.insert_final_newline_on_save);
+    }
+
+    #[test]
     fn format_on_save_round_trip_and_default_off() {
         assert!(!Settings::parse("").format_on_save);
         let settings = Settings {
@@ -544,7 +590,7 @@ mod tests {
         let text = settings.format(previous);
         assert_eq!(
             text,
-            "future_key=one=two\nfuture_key = three\n# A comment\nchanges_tree=false\nhighlight_line=false\nshow_whitespace=false\ndiff_ignore_eol=true\ninline_blame=true\nminimap=true\nbracket_colors=true\nsemantic_highlighting=true\nsticky_scroll=true\nsticky_control_flow=true\nsticky_hidden=\nrestore_previous_session=true\nreopen_last_folder=false\ntab_size=4\neditor_font_size=13\nui_font_size=13\nbreadcrumb_font_size=11\nformat_on_save=false\nshow_outline=true\nshow_fps=false\nheader_lines=true\noutline_expanded=true\noutline_grouped=true\noutline_collapsed_groups=\ntheme_preference=system\ntheme_dark=edittr-dark\ntheme_light=edittr-light\n"
+            "future_key=one=two\nfuture_key = three\n# A comment\nchanges_tree=false\nhighlight_line=false\nshow_whitespace=false\ndiff_ignore_eol=true\ninline_blame=true\nminimap=true\nbracket_colors=true\nsemantic_highlighting=true\nsticky_scroll=true\nsticky_control_flow=true\nsticky_hidden=\nrestore_previous_session=true\nreopen_last_folder=false\ntab_size=4\neditor_font_size=13\nui_font_size=13\nbreadcrumb_font_size=11\nformat_on_save=false\ntrim_trailing_whitespace_on_save=false\ninsert_final_newline_on_save=false\nshow_outline=true\nshow_fps=false\nword_wrap=false\nheader_lines=true\noutline_expanded=true\noutline_grouped=true\noutline_collapsed_groups=\ncolor_window=true\ntheme_preference=system\ntheme_dark=edittr-dark\ntheme_light=edittr-light\n"
         );
         assert!(!Settings::parse(&text).changes_tree);
     }

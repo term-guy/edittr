@@ -448,7 +448,7 @@ impl Tour {
                     "| Section | Status |\n| :--- | :---: |\n| Draft | Ready |\n\n---\n\n",
                 ));
                 let end = text.chars().count();
-                app.add_file_tab(&demo.join("preview-tour.md"), text, false);
+                app.add_file_tab(&demo.join("preview-tour.md"), text, false, crate::encoding::Encoding::default());
                 let index = app.tabs.len() - 1;
                 if let Tab::File(doc) = &mut app.tabs[index] {
                     doc.goto = Some((end, end));

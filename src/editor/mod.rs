@@ -6,6 +6,8 @@
 //! positions are byte offsets (see [`buffer`]).
 
 pub mod buffer;
+pub mod conflicts;
+mod edit_ops;
 pub mod fold;
 pub mod highlights;
 mod navigation_menu;
@@ -18,6 +20,52 @@ use eframe::egui::{self, Color32, Event, Key, Pos2, Rect, Sense, Stroke, Vec2, t
 use std::collections::BTreeSet;
 use std::ops::Range;
 use std::sync::Arc;
+
+pub use edit_ops::affix_lines;
+
+/// Editing and navigation commands that also have editor shortcuts (the app runs them
+/// from the command palette with [`State::run`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Action {
+    Duplicate,
+    MoveLinesUp,
+    MoveLinesDown,
+    CopyLinesUp,
+    CopyLinesDown,
+    DeleteLines,
+    JoinLines,
+    AddNextOccurrence,
+    RemoveLastOccurrence,
+    ToggleBookmark,
+    NextBookmark,
+    PreviousBookmark,
+    ClearBookmarks,
+    NextConflict,
+    PreviousConflict,
+    AcceptCurrent,
+    AcceptIncoming,
+    AcceptBoth,
+}
+
+impl Action {
+    /// Changes the text (not available in read-only editors).
+    fn edits(self) -> bool {
+        use Action::*;
+        matches!(
+            self,
+            Duplicate
+                | MoveLinesUp
+                | MoveLinesDown
+                | CopyLinesUp
+                | CopyLinesDown
+                | DeleteLines
+                | JoinLines
+                | AcceptCurrent
+                | AcceptIncoming
+                | AcceptBoth
+        )
+    }
+}
 
 #[derive(Clone, Copy, PartialEq)]
 enum Unit {
@@ -56,7 +104,10 @@ pub struct State {
     /// Folded regions, by header line.
     pub folded: BTreeSet<usize>,
     regions: Vec<Range<usize>>,
+    /// The rows shown: `base_view` (folds) with word wrap applied when it is on.
     view: Arc<fold::View>,
+    base_view: Arc<fold::View>,
+    wrap: WrapCache,
     sticky: sticky::Cache,
     /// (version, folded) the regions/view were computed for.
     view_key: Option<(u64, Vec<usize>)>,
@@ -71,6 +122,10 @@ pub struct State {
     arrow_repeat: Option<f64>,
     /// Bracket nesting depth at the start of each line, for a version of the text.
     depth: (Option<u64>, Arc<Vec<u32>>),
+    /// Bookmarked lines, as the byte offsets of their starts (kept on their text through edits).
+    bookmarks: Vec<usize>,
+    /// Merge conflicts, for a version of the text.
+    conflicts: (Option<u64>, Arc<Vec<conflicts::Conflict>>),
 }
 
 impl State {
@@ -126,7 +181,9 @@ impl State {
             let starts: BTreeSet<usize> = self.regions.iter().map(|r| r.start).collect();
             self.folded.retain(|l| starts.contains(l));
         }
-        self.view = Arc::new(fold::View::new(ix.lines(), &self.regions, &self.folded));
+        self.base_view = Arc::new(fold::View::new(ix.lines(), &self.regions, &self.folded));
+        self.view = self.base_view.clone();
+        self.wrap.applied = None;
         let folded: Vec<usize> = self.folded.iter().copied().collect();
         self.view_key = Some((version, folded));
     }
@@ -189,6 +246,55 @@ impl State {
         self.preferred_x = None;
     }
 
+    /// Run an editing or navigation action; bumps `version` when the text changed.
+    pub fn run(&mut self, text: &mut String, version: &mut u64, action: Action) -> bool {
+        let changed = run_action(self, text, *version, action);
+        if changed {
+            *version += 1;
+        }
+        self.reveal.get_or_insert(false);
+        self.preferred_x = None;
+        changed
+    }
+
+    /// Lines the selections touch (what line commands act on).
+    pub fn selected_line_count(&mut self, text: &str, version: u64) -> usize {
+        let ix = self.index_arc(text, version);
+        selected_lines(self, &ix).len()
+    }
+
+    /// Bookmarked lines (zero-based), in order.
+    pub fn bookmark_lines(&mut self, text: &str, version: u64) -> Vec<usize> {
+        self.sync_bookmarks(text, version);
+        let ix = self.index_arc(text, version);
+        self.bookmarks.iter().map(|&b| ix.line_of_byte(b)).collect()
+    }
+
+    /// Move the bookmarks through the edits made since the last call, onto line starts.
+    fn sync_bookmarks(&mut self, text: &str, version: u64) {
+        let (log, _) = self.history.take_log();
+        if self.bookmarks.is_empty() {
+            return;
+        }
+        for b in &mut self.bookmarks {
+            *b = buffer::map_through(&log, *b).min(text.len());
+        }
+        let ix = self.index_arc(text, version);
+        for b in &mut self.bookmarks {
+            *b = ix.line_start(ix.line_of_byte(*b));
+        }
+        self.bookmarks.sort_unstable();
+        self.bookmarks.dedup();
+    }
+
+    fn conflicts(&mut self, text: &str, version: u64) -> Arc<Vec<conflicts::Conflict>> {
+        if self.conflicts.0 != Some(version) {
+            let ix = self.index_arc(text, version);
+            self.conflicts = (Some(version), Arc::new(conflicts::find(text, &ix)));
+        }
+        self.conflicts.1.clone()
+    }
+
     /// Select a range (byte offsets) and scroll it to the center.
     pub fn select(&mut self, range: Range<usize>) {
         self.sels = vec![Sel {
@@ -199,6 +305,20 @@ impl State {
         self.preferred_x = None;
         self.history.seal();
     }
+}
+
+/// Word wrap: display rows per line for one wrap width and font, and the line texts
+/// already measured (so an edit only lays out the lines it changed).
+#[derive(Default)]
+struct WrapCache {
+    /// (base view, wrap width, font) the current `State::view` was wrapped for.
+    applied: Option<(usize, u32, u64)>,
+    /// Wrap width and font `rows` were measured with.
+    measured: Option<(u32, u64)>,
+    /// Rows by hash of a line's text.
+    rows: std::collections::HashMap<u64, u32>,
+    /// Wrap width used for the last layout (keyboard moves use it before the next layout).
+    width: Option<f32>,
 }
 
 pub struct Options<'a> {
@@ -222,6 +342,8 @@ pub struct Options<'a> {
     /// Kinds of lines sticky scroll may pin (control flow ones only with `sticky_control_flow`).
     pub sticky_shown: sticky::Kinds,
     pub navigation_menu: bool,
+    /// Wrap long lines at the editor's width (no horizontal scrolling).
+    pub wrap: bool,
     /// Selecting, copying, finding and scrolling only (e.g. the base side of a diff).
     pub read_only: bool,
 }
@@ -240,6 +362,8 @@ pub struct Extras<'a> {
     /// Gutter markers per line (e.g. added / modified lines vs. git); `true` draws a
     /// "lines deleted above" triangle instead of a bar.
     pub gutter: &'a [(usize, Color32, bool)],
+    /// Icon and tooltip when each marker is an action button.
+    pub gutter_button: Option<(&'static str, &'static str)>,
     /// Full-width line backgrounds (e.g. changed lines in a diff).
     pub line_bg: &'a [(usize, Color32)],
     /// Other uses of the symbol under the caret (byte ranges; `true`: written there).
@@ -253,6 +377,7 @@ pub struct Extras<'a> {
 #[derive(Default)]
 pub struct Output {
     pub changed: bool,
+    pub gutter_click: Option<(usize, bool, Rect)>,
     /// Cmd/Ctrl+click on a symbol: go to its definition (byte offset).
     pub goto: Option<usize>,
     pub context_command: Option<crate::commands::Command>,
@@ -277,6 +402,22 @@ struct Layout<'a> {
 impl Layout<'_> {
     fn line_y(&self, l: usize) -> f32 {
         self.top + self.view.row(l) as f32 * self.row_h
+    }
+
+    /// Height of line `l` (several rows when it wraps).
+    fn line_h(&self, l: usize) -> f32 {
+        self.view.rows_of(l) as f32 * self.row_h
+    }
+
+    /// The line under screen position `p`.
+    fn line_at(&self, p: Pos2) -> usize {
+        self.view.line(((p.y - self.top) / self.row_h).floor().max(0.0) as usize)
+    }
+
+    /// The byte offset closest to screen position `p`.
+    fn byte_at(&self, lines: &Lines, p: Pos2) -> usize {
+        let l = self.line_at(p);
+        lines.byte_at(l, Vec2::new(p.x - self.text_x, p.y - self.line_y(l)))
     }
 }
 
@@ -388,10 +529,21 @@ struct Lines<'a> {
     palette: &'a Palette,
     /// Depth at each line start + palette, when bracket colors are on.
     depth: Option<(&'a [u32], [Color32; 3])>,
+    /// Word wrap width (infinite: no wrap).
+    wrap: f32,
 }
 
 impl Lines<'_> {
     fn galley(&self, l: usize) -> Arc<egui::Galley> {
+        self.galley_wrapped(l, self.wrap)
+    }
+
+    /// Line `l` on one row, even with word wrap (sticky scroll headers).
+    fn galley_unwrapped(&self, l: usize) -> Arc<egui::Galley> {
+        self.galley_wrapped(l, f32::INFINITY)
+    }
+
+    fn galley_wrapped(&self, l: usize, wrap: f32) -> Arc<egui::Galley> {
         let brackets = match (self.depth, self.spans.and_then(|s| s.get(l))) {
             (Some((depth, colors)), Some(hl)) if !hl.brackets.is_empty() => Some(Brackets {
                 depth: depth.get(l).copied().unwrap_or(0),
@@ -401,29 +553,116 @@ impl Lines<'_> {
             _ => None,
         };
         let semantic = self.semantic.get(l).map_or(&[][..], Vec::as_slice);
-        let job = line_job(self.text, self.ix, l, self.spans, semantic, &self.font, self.palette, brackets);
+        let mut job = line_job(self.text, self.ix, l, self.spans, semantic, &self.font, self.palette, brackets);
+        job.wrap.max_width = wrap;
         // The layout cache hashes TextFormat, so palette changes invalidate affected galleys
         // while syntax and semantic token ranges remain reusable.
         self.ui.fonts_mut(|f| f.layout_job(job))
     }
 
-    /// x (relative to text start) of byte offset `b`.
-    fn x_of(&self, b: usize) -> f32 {
+    /// Position of byte offset `b` relative to the start of its line: x, and the top of its row.
+    fn pos_of(&self, b: usize) -> Vec2 {
         let (l, col) = self.ix.line_col(b);
         let range = self.ix.line_range(self.text, l);
         let col = col.min(range.len());
         let chars = self.text[range.start..range.start + col].chars().count();
-        self.galley(l).pos_from_cursor(CCursor::new(chars)).min.x
+        self.galley(l).pos_from_cursor(CCursor::new(chars)).min.to_vec2()
     }
 
-    /// Byte offset on line `l` closest to x (relative to text start).
-    fn byte_at_x(&self, l: usize, x: f32) -> usize {
+    /// Byte offset on line `l` closest to `pos` (relative to the line's top left).
+    fn byte_at(&self, l: usize, pos: Vec2) -> usize {
         let range = self.ix.line_range(self.text, l);
         let g = self.galley(l);
-        let c = g.cursor_from_pos(Vec2::new(x, 0.0)).index.0;
+        let c = g.cursor_from_pos(pos).index.0;
         let line = &self.text[range.clone()];
         range.start + line.char_indices().nth(c).map_or(line.len(), |(i, _)| i)
     }
+
+    /// Byte offset on the first row of line `l` closest to x (relative to text start).
+    fn byte_at_x(&self, l: usize, x: f32) -> usize {
+        self.byte_at(l, Vec2::new(x, 0.0))
+    }
+}
+
+/// End of a line's text in its galley: x after the last char, and the top of the last row.
+fn line_end_pos(g: &egui::Galley) -> Vec2 {
+    g.rows.last().map_or(Vec2::ZERO, |row| Vec2::new(row.pos.x + row.size.x, row.pos.y))
+}
+
+/// Display rows per line for word wrap at `width`, applied to `st.base_view` as `st.view`.
+/// Only lines that could reach the width are laid out, and each line text once per width.
+fn wrap_view(st: &mut State, ui: &egui::Ui, text: &str, ix: &LineIndex, font: &egui::FontId, width: f32, char_w: f32) {
+    use std::hash::{Hash, Hasher};
+    let font_key = {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        font.hash(&mut h);
+        char_w.to_bits().hash(&mut h);
+        h.finish()
+    };
+    let key = (Arc::as_ptr(&st.base_view) as usize, width.to_bits(), font_key);
+    if st.wrap.applied == Some(key) {
+        return;
+    }
+    if st.wrap.measured != Some((width.to_bits(), font_key)) || st.wrap.rows.len() > 200_000 {
+        st.wrap.rows.clear();
+        st.wrap.measured = Some((width.to_bits(), font_key));
+    }
+    let tab_w = ui.fonts_mut(|f| f.glyph_width(font, '\t')).max(char_w);
+    let palette = Palette::defaults(true);
+    let lines = Lines {
+        ui,
+        text,
+        ix,
+        spans: None,
+        semantic: &[],
+        font: font.clone(),
+        palette: &palette,
+        depth: None,
+        wrap: width,
+    };
+    let mut cache = std::mem::take(&mut st.wrap.rows);
+    let rows_of = |l: usize| {
+        let line = &text[ix.line_range(text, l)];
+        // Monospace: an ASCII line's width is known without laying it out; other chars are at most two columns.
+        let fits = if line.is_ascii() {
+            let tabs = line.bytes().filter(|&b| b == b'\t').count();
+            (line.len() - tabs) as f32 * char_w + tabs as f32 * tab_w.max(char_w) <= width
+        } else {
+            line.chars().count() as f32 * 2.0 * char_w.max(tab_w) <= width
+        };
+        if fits {
+            return 1;
+        }
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        line.hash(&mut h);
+        *cache.entry(h.finish()).or_insert_with(|| lines.galley(l).rows.len().max(1) as u32) as usize
+    };
+    let view = st.base_view.wrapped(rows_of);
+    st.wrap.rows = cache;
+    st.view = Arc::new(view);
+    st.wrap.applied = Some(key);
+}
+
+/// Rectangles (relative to the line's top left: x0, x1, row top) covering chars `a..b` of a
+/// line's galley, one per wrapped row they touch.
+fn char_spans(g: &egui::Galley, a: usize, b: usize) -> Vec<(f32, f32, f32)> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    let last = g.rows.len().saturating_sub(1);
+    for (i, row) in g.rows.iter().enumerate() {
+        let n = row.char_count_excluding_newline().0;
+        let end = start + n;
+        // An empty range at a wrap point goes on the next row (the last one at the line's end).
+        let overlaps = a < end && b > start;
+        let empty_here = a == b && (start..=end).contains(&a) && (a < end || i == last);
+        if overlaps || empty_here {
+            let x0 = row.pos.x + row.x_offset(egui::text::CharIndex(a.saturating_sub(start).min(n)));
+            let x1 = row.pos.x + row.x_offset(egui::text::CharIndex(b.saturating_sub(start).min(n)));
+            out.push((x0, x1, row.pos.y));
+        }
+        start = end + usize::from(row.ends_with_newline);
+    }
+    out
 }
 
 /// Show the editor. `version` is bumped when the text changes.
@@ -479,11 +718,26 @@ pub fn show(
         let events = ui.input(|i| i.events.clone());
         let ctx = KeyCtx {
             font: &font,
+            row_h,
             is_mac,
             viewport_rows,
             opts,
         };
+        // Option+J types "∆" on macOS right after the key event: skip that text.
+        let mut skip_text = false;
         for ev in events {
+            if std::mem::take(&mut skip_text) && matches!(ev, Event::Text(_)) {
+                continue;
+            }
+            if let Event::Key {
+                key,
+                pressed: true,
+                modifiers,
+                ..
+            } = &ev
+            {
+                skip_text = modifiers.alt && !modifiers.command && shortcut_action(*key, *modifiers).is_some();
+            }
             if handle_event(ui, st, text, version, &ctx, &ev) {
                 out.changed = true;
             }
@@ -492,11 +746,11 @@ pub fn show(
 
     // ---- layout
     st.index(text, *version);
+    st.sync_bookmarks(text, *version);
     st.update_view(text, *version);
     st.unfold_carets();
     st.update_view(text, *version);
     let ix = st.index_arc(text, *version);
-    let view = st.view.clone();
     if opts.sticky_scroll {
         let kinds = sticky::Kinds::pinned(opts.sticky_shown, opts.sticky_control_flow);
         st.sticky.update(*version, text, &ix, &st.regions, kinds);
@@ -529,21 +783,40 @@ pub fn show(
     // Fold arrows, line numbers, change markers.
     let fold_w = 1.6 * char_w;
     let gutter_w = fold_w + (digits as f32 + 2.5) * char_w;
+    let full = ui.available_rect_before_wrap();
+    let mini_w = if opts.minimap && full.width() > 400.0 { 80.0 } else { 0.0 };
+    // Word wrap: lines break before the vertical scroll bar (at least 20 columns wide).
+    let wrap = opts.wrap.then(|| {
+        let bar = ui.spacing().scroll.bar_width.max(14.0) + ui.spacing().scroll.bar_outer_margin;
+        (full.width() - mini_w - gutter_w - bar - char_w).max(20.0 * char_w)
+    });
+    st.wrap.width = wrap;
+    match wrap {
+        Some(width) => wrap_view(st, ui, text, &ix, &font, width, char_w),
+        None => st.view = st.base_view.clone(),
+    }
+    let view = st.view.clone();
+    let found_conflicts = st.conflicts(text, *version);
+    let bookmarked: BTreeSet<usize> = st.bookmarks.iter().map(|&b| ix.line_of_byte(b)).collect();
+    let mut resolve: Option<(conflicts::Conflict, conflicts::Choice)> = None;
     let content = Vec2::new(
-        gutter_w + (ix.max_line_bytes as f32 + 8.0) * line_char_w + 200.0,
+        match wrap {
+            Some(width) => gutter_w + width,
+            None => gutter_w + (ix.max_line_bytes as f32 + 8.0) * line_char_w + 200.0,
+        },
         // Let the last line scroll up to the middle of the view.
         (view.count() as f32) * row_h + ui.available_height() * 0.5,
     );
     let text_color = palette.color(Part::Foreground);
 
     // The minimap takes a strip on the right.
-    let full = ui.available_rect_before_wrap();
     ui.painter().rect_filled(full, 0.0, palette.color(Part::Background));
-    let mini_w = if opts.minimap && full.width() > 400.0 { 80.0 } else { 0.0 };
     let main_rect = Rect::from_min_max(full.min, Pos2::new(full.max.x - mini_w, full.max.y));
     let mini_rect = Rect::from_min_max(Pos2::new(full.max.x - mini_w, full.min.y), full.max);
     let mut main_ui = ui.new_child(egui::UiBuilder::new().max_rect(main_rect));
-    let mut area = egui::ScrollArea::both().id_salt(id.with("scroll")).auto_shrink([false, false]);
+    let mut area = egui::ScrollArea::new([wrap.is_none(), true])
+        .id_salt(id.with("scroll"))
+        .auto_shrink([false, false]);
     if let Some(line) = st.scroll_line.take() {
         let whole = (line.floor() as usize).min(view.count().saturating_sub(1));
         let row = if view.is_hidden(whole) { whole } else { view.row(whole) };
@@ -579,10 +852,13 @@ pub fn show(
             font: font.clone(),
             palette,
             depth: use_depth.then(|| (depth_arc.as_slice(), bracket_palette)),
+            wrap: wrap.unwrap_or(f32::INFINITY),
         };
         let visible_rows = (vp.min.y / row_h).floor().max(0.0) as usize..((vp.max.y / row_h).ceil() as usize + 1).min(view.count());
-        let vis_lines: Vec<usize> = visible_rows.clone().map(|r| view.line(r)).collect();
-        let shown = |l: usize| !view.is_hidden(l) && visible_rows.contains(&view.row(l));
+        let mut vis_lines: Vec<usize> = visible_rows.clone().map(|r| view.line(r)).collect();
+        vis_lines.dedup(); // a wrapped line spans several rows
+        // On screen: a row of the line is in the visible rows.
+        let shown = |l: usize| !view.is_hidden(l) && view.row(l) < visible_rows.end && view.row(l) + view.rows_of(l) > visible_rows.start;
         let clip = Rect::from_min_max(
             Pos2::new(rect.min.x + vp.min.x + gutter_w, rect.min.y + vp.min.y),
             rect.min + vp.max.to_vec2(),
@@ -619,8 +895,52 @@ pub fn show(
             }
         }
 
-        // A drag started in the text can still finish over a pinned header.
-        let ptr = if over_sticky && st.drag.is_none() && st.goto_press.is_none() {
+        let marker_x = clip.min.x - 0.9 * char_w;
+        let button = extras.gutter_button;
+        let marker_hit = |line: usize, deleted: bool| {
+            let y = lay.line_y(if button.is_some() { line.min(ix.lines() - 1) } else { line });
+            let (top, bottom) = if deleted && button.is_none() {
+                (y - 4.0, y + 4.0)
+            } else {
+                (y, y + row_h)
+            };
+            Rect::from_min_max(Pos2::new(marker_x - 3.0, top), Pos2::new(clip.min.x, bottom)).intersect(ui.clip_rect())
+        };
+        let marker_visible = |line: usize, deleted: bool| shown(line) || (deleted && line == ix.lines() && shown(line.saturating_sub(1)));
+        let mut over_marker = false;
+        let mut hovered_marker = None;
+        let first = vis_lines.first().copied().unwrap_or(0);
+        let end = vis_lines.last().copied().unwrap_or(0).saturating_add(1);
+        let markers = if out.changed {
+            &[][..]
+        } else {
+            &extras.gutter[extras.gutter.partition_point(|m| m.0 < first)..extras.gutter.partition_point(|m| m.0 <= end)]
+        };
+        if !over_sticky && !opts.read_only {
+            for &(line, _, deleted) in markers {
+                if !marker_visible(line, deleted) {
+                    continue;
+                }
+                let hit = marker_hit(line, deleted);
+                if !hit.is_positive() {
+                    continue;
+                }
+                let marker = ui
+                    .interact(hit, id.with(("change-marker", line, deleted)), Sense::CLICK)
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .on_hover_text(button.map_or("Show change", |(_, label)| label));
+                if marker.contains_pointer() {
+                    over_marker = true;
+                    hovered_marker = Some(line);
+                }
+                if marker.clicked() {
+                    resp.request_focus();
+                    out.gutter_click = Some((line, deleted, hit));
+                }
+            }
+        }
+        // A drag started in the text can still finish over the gutter or a pinned header.
+        let ptr = if (over_sticky || over_marker) && st.drag.is_none() && st.goto_press.is_none() {
             None
         } else {
             mouse(ui, st, &resp, &lines, &lay, &mut out, rect.min.x + vp.min.x + fold_w)
@@ -636,21 +956,59 @@ pub fn show(
         for &(l, color) in extras.line_bg {
             if shown(l) {
                 let y = lay.line_y(l) + band_dy;
-                let band = Rect::from_min_max(Pos2::new(clip.min.x - gutter_w, y), Pos2::new(clip.max.x, y + row_h));
+                let band = Rect::from_min_max(Pos2::new(clip.min.x - gutter_w, y), Pos2::new(clip.max.x, y + lay.line_h(l)));
                 ui.painter().with_clip_rect(ui.clip_rect()).rect_filled(band, 0.0, color);
+            }
+        }
+        // Merge conflicts: ours in green, theirs in blue, the marker lines stronger.
+        if !found_conflicts.is_empty() {
+            let (green, blue) = (Color32::from_rgb(0x2e, 0xa0, 0x43), Color32::from_rgb(0x3d, 0x8b, 0xfd));
+            let gray = ui.visuals().weak_text_color();
+            let (strong, faint) = if ui.visuals().dark_mode { (0.32, 0.14) } else { (0.26, 0.10) };
+            let first = vis_lines.first().copied().unwrap_or(0);
+            let last = vis_lines.last().copied().unwrap_or(0);
+            for c in found_conflicts.iter().filter(|c| c.end >= first && c.start <= last) {
+                for &l in vis_lines.iter().filter(|&&l| c.contains(l)) {
+                    let color = if l == c.start {
+                        green.gamma_multiply(strong)
+                    } else if l == c.end {
+                        blue.gamma_multiply(strong)
+                    } else if l == c.mid || Some(l) == c.base {
+                        gray.gamma_multiply(faint)
+                    } else if l < c.base.unwrap_or(c.mid) {
+                        green.gamma_multiply(faint)
+                    } else if l < c.mid {
+                        gray.gamma_multiply(faint * 0.7)
+                    } else {
+                        blue.gamma_multiply(faint)
+                    };
+                    let y = lay.line_y(l) + band_dy;
+                    let band = Rect::from_min_max(Pos2::new(clip.min.x - gutter_w, y), Pos2::new(clip.max.x, y + lay.line_h(l)));
+                    ui.painter().with_clip_rect(ui.clip_rect()).rect_filled(band, 0.0, color);
+                }
             }
         }
         if opts.current_line && single_line && st.sels.len() == 1 && shown(pl) {
             let y = lay.line_y(pl) + band_dy;
-            let band = Rect::from_min_max(Pos2::new(clip.min.x - gutter_w, y), Pos2::new(clip.max.x, y + row_h));
+            let band = Rect::from_min_max(Pos2::new(clip.min.x - gutter_w, y), Pos2::new(clip.max.x, y + lay.line_h(pl)));
             ui.painter()
                 .with_clip_rect(ui.clip_rect())
                 .rect_filled(band, 0.0, palette.color(Part::CurrentLine));
         }
-        let x_in = |l: usize, g: &egui::Galley, b: usize| {
+        // Char index in line `l` of byte `b` (clamped to the line).
+        let chars_in = |l: usize, b: usize| {
             let range = ix.line_range(text, l);
             let b = b.clamp(range.start, range.end);
-            lay.text_x + g.pos_from_cursor(CCursor::new(text[range.start..b].chars().count())).min.x
+            text[range.start..b].chars().count()
+        };
+        // Screen rects (x0, x1, row top) of the part of byte range `r` on line `l`, one per wrapped row.
+        let spans_in = |l: usize, g: &egui::Galley, r: &Range<usize>| {
+            let lr = ix.line_range(text, l);
+            let (a, b) = (chars_in(l, r.start.max(lr.start)), chars_in(l, r.end.min(lr.end)));
+            let top = lay.line_y(l);
+            char_spans(g, a, b)
+                .into_iter()
+                .map(move |(x0, x1, y)| (lay.text_x + x0, lay.text_x + x1, top + y))
         };
         // Marks (find matches), then selections.
         let paint_ranges = |ranges: &mut dyn Iterator<Item = Range<usize>>, color: Color32, extend_eol: bool| {
@@ -663,14 +1021,16 @@ pub fn show(
                     if *l < l0 || *l > l1 {
                         continue;
                     }
-                    let lr = ix.line_range(text, *l);
-                    let a = x_in(*l, g, r.start.max(lr.start));
-                    let mut b = x_in(*l, g, r.end.min(lr.end));
-                    if extend_eol && r.end > lr.end {
-                        b += char_w * 0.6;
+                    let past_eol = extend_eol && r.end > ix.line_range(text, *l).end;
+                    let spans: Vec<_> = spans_in(*l, g, &r).collect();
+                    let last = spans.len().saturating_sub(1);
+                    for (i, (a, mut b, y)) in spans.into_iter().enumerate() {
+                        if past_eol && i == last {
+                            b += char_w * 0.6;
+                        }
+                        let y = y + band_dy;
+                        painter.rect_filled(Rect::from_min_max(Pos2::new(a, y), Pos2::new(b, y + row_h)), 2.0, color);
                     }
-                    let y = lay.line_y(*l) + band_dy;
-                    painter.rect_filled(Rect::from_min_max(Pos2::new(a, y), Pos2::new(b, y + row_h)), 2.0, color);
                 }
             }
         };
@@ -716,8 +1076,9 @@ pub fn show(
         // Folded regions: a "⋯" chip after the header line.
         for (l, g) in &galleys {
             if st.folded.contains(l) {
-                let x = lay.text_x + g.size().x + char_w;
-                let r = Rect::from_min_size(Pos2::new(x, lay.line_y(*l) + 2.0), Vec2::new(3.0 * char_w, row_h - 4.0));
+                let end = line_end_pos(g);
+                let x = lay.text_x + end.x + char_w;
+                let r = Rect::from_min_size(Pos2::new(x, lay.line_y(*l) + end.y + 2.0), Vec2::new(3.0 * char_w, row_h - 4.0));
                 painter.rect_filled(r, 3.0, ui.visuals().widgets.inactive.weak_bg_fill);
                 painter.text(
                     r.center(),
@@ -735,10 +1096,9 @@ pub fn show(
                 if *l < l0 || *l > l1 {
                     continue;
                 }
-                let lr = ix.line_range(text, *l);
-                let a = x_in(*l, g, r.start.max(lr.start));
-                let b = x_in(*l, g, r.end.min(lr.end)).max(a + char_w);
-                squiggle(&painter, a, b, lay.line_y(*l) + row_h - 1.5, *color);
+                for (a, b, y) in spans_in(*l, g, r) {
+                    squiggle(&painter, a, b.max(a + char_w), y + row_h - 1.5, *color);
+                }
             }
         }
         // Inline blame after the primary line.
@@ -747,24 +1107,68 @@ pub fn show(
             && let Some((_, g)) = galleys.iter().find(|(l, _)| *l == pl)
         {
             let color = ui.visuals().weak_text_color().gamma_multiply(0.8);
-            let p = Pos2::new(lay.text_x + g.size().x + 4.0 * char_w, lay.line_y(pl) + row_h / 2.0);
+            let end = line_end_pos(g);
+            let p = Pos2::new(lay.text_x + end.x + 4.0 * char_w, lay.line_y(pl) + end.y + row_h / 2.0);
             painter.text(p, egui::Align2::LEFT_CENTER, inline, font.clone(), color);
+        }
+        // "Accept current | incoming | both" after each visible conflict's first marker.
+        if !opts.read_only {
+            for c in found_conflicts.iter() {
+                let Some((_, g)) = galleys.iter().find(|(l, _)| *l == c.start) else {
+                    continue;
+                };
+                let end = line_end_pos(g);
+                let mut x = lay.text_x + end.x + 3.0 * char_w;
+                let y = lay.line_y(c.start) + end.y;
+                for (n, (label, choice)) in [
+                    ("Accept current", conflicts::Choice::Current),
+                    ("Accept incoming", conflicts::Choice::Incoming),
+                    ("Accept both", conflicts::Choice::Both),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let galley = ui.fonts_mut(|f| f.layout_no_wrap(label.into(), font.clone(), text_color));
+                    let r = Rect::from_min_size(Pos2::new(x, y), Vec2::new(galley.size().x, row_h));
+                    let button = ui.interact(r, id.with(("conflict", c.start, n)), Sense::click());
+                    let color = if button.hovered() {
+                        ui.visuals().hyperlink_color
+                    } else {
+                        ui.visuals().weak_text_color()
+                    };
+                    painter.galley(r.min, galley, color);
+                    if button.hovered() {
+                        painter.hline(r.x_range(), r.bottom() - 1.0, Stroke::new(1.0, color));
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                    if button.clicked() {
+                        resolve = Some((*c, choice));
+                        // Keep typing (and Ctrl+Z) in the editor after the click.
+                        ui.memory_mut(|m| m.request_focus(id));
+                    }
+                    x = r.right() + 2.0 * char_w;
+                }
+            }
         }
         // Carets (solid, no blinking: blinking would need a repaint twice a second).
         let caret_color = ui.visuals().text_cursor.stroke.color;
         for s in &st.sels {
             let (l, _) = ix.line_col(s.head);
             if let Some((_, g)) = galleys.iter().find(|(gl, _)| *gl == l) {
-                let x = x_in(l, g, s.head);
-                let y = lay.line_y(l) + band_dy;
+                let at = g.pos_from_cursor(CCursor::new(chars_in(l, s.head))).min;
+                let x = lay.text_x + at.x;
+                let y = lay.line_y(l) + at.y + band_dy;
                 if focused || st.sels.len() > 1 {
                     painter.line_segment([Pos2::new(x, y), Pos2::new(x, y + row_h)], Stroke::new(2.0, caret_color));
                 }
             }
         }
         // IME pre-edit text at the caret.
-        let caret_x = lines.x_of(primary.head);
-        let caret_rect = Rect::from_min_size(Pos2::new(lay.text_x + caret_x, lay.line_y(pl)), Vec2::new(2.0, row_h));
+        let caret_at = lines.pos_of(primary.head);
+        let caret_rect = Rect::from_min_size(
+            Pos2::new(lay.text_x + caret_at.x, lay.line_y(pl) + caret_at.y),
+            Vec2::new(2.0, row_h),
+        );
         if let Some(pre) = &st.preedit {
             let g = ui.fonts_mut(|f| f.layout_no_wrap(pre.clone(), font.clone(), text_color));
             let r = Rect::from_min_size(caret_rect.min, g.size());
@@ -784,6 +1188,14 @@ pub fn show(
         let gutter_hover = resp.hover_pos().is_some_and(|p| p.x < gx + gutter_w);
         for &l in &vis_lines {
             let y = lay.line_y(l);
+            if bookmarked.contains(&l) {
+                // Bookmark: a pill behind the line number.
+                let r = Rect::from_min_max(
+                    Pos2::new(gx + fold_w, y + band_dy + 1.0),
+                    Pos2::new(gx + gutter_w - 1.1 * char_w, y + band_dy + row_h - 1.0),
+                );
+                gp.rect_filled(r, row_h / 2.0, palette.color(Part::Selection));
+            }
             let folded = st.folded.contains(&l);
             if folded || (gutter_hover && st.regions.iter().any(|r| r.start == l)) {
                 let icon = if folded {
@@ -808,17 +1220,29 @@ pub fn show(
                 color,
             );
         }
-        for &(l, color, deleted) in extras.gutter {
-            if !shown(l) && !(deleted && shown(l.saturating_sub(1))) {
+        for &(l, color, deleted) in markers {
+            if !marker_visible(l, deleted) {
                 continue;
             }
             let x = gx + gutter_w - 0.9 * char_w;
             let y = lay.line_y(l);
-            if deleted {
+            if let Some((icon, _)) = button {
+                let hit = marker_hit(l, deleted);
+                if hovered_marker == Some(l) {
+                    gp.rect_filled(hit, 2.0, ui.visuals().widgets.hovered.bg_fill);
+                }
+                gp.text(
+                    hit.center(),
+                    egui::Align2::CENTER_CENTER,
+                    icon,
+                    egui::FontId::proportional(12.0),
+                    color,
+                );
+            } else if deleted {
                 let tri = vec![Pos2::new(x, y - 4.0), Pos2::new(x + 5.0, y), Pos2::new(x, y + 4.0)];
                 gp.add(egui::Shape::convex_polygon(tri, color, Stroke::NONE));
             } else {
-                gp.rect_filled(Rect::from_min_size(Pos2::new(x, y), Vec2::new(3.0, row_h)), 0.0, color);
+                gp.rect_filled(Rect::from_min_size(Pos2::new(x, y), Vec2::new(3.0, lay.line_h(l))), 0.0, color);
             }
         }
 
@@ -838,6 +1262,15 @@ pub fn show(
         ptr
     });
     ui.allocate_rect(full, Sense::hover());
+    if let Some((conflict, choice)) = resolve {
+        let ix = st.index_arc(text, *version);
+        let (range, with) = conflict.resolve(text, &ix, choice);
+        st.replace(text, range.clone(), &with);
+        st.sels = vec![Sel::caret(range.start)];
+        st.history.seal();
+        *version += 1;
+        out.changed = true;
+    }
     if arrows {
         scroll_arrows(ui, id, st, &scroll, main_rect, arrow, row_h, palette);
     } else {
@@ -982,6 +1415,9 @@ fn minimap(
     let weak = palette.color(Part::Foreground).gamma_multiply(0.45);
     for (i, row) in (top_row..rows.min(top_row + capacity)).enumerate() {
         let l = view.line(row);
+        if view.row(l) != row {
+            continue; // a wrapped line's later rows
+        }
         let y = rect.min.y + i as f32 * mini_row_height;
         let lr = ix.line_range(text, l);
         let line = &text[lr];
@@ -1129,8 +1565,8 @@ fn mouse(
     });
     let ix = lines.ix;
     let text = lines.text;
-    let to_line = |p: Pos2| lay.view.line(((p.y - lay.top) / lay.row_h).floor().max(0.0) as usize);
-    let to_byte = |p: Pos2| lines.byte_at_x(to_line(p), p.x - lay.text_x);
+    let to_line = |p: Pos2| lay.line_at(p);
+    let to_byte = |p: Pos2| lay.byte_at(lines, p);
     let hovered = resp.hovered();
     if hovered && !mods.command {
         ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
@@ -1147,8 +1583,9 @@ fn mouse(
             if b < range.end {
                 let w = buffer::word_at(text, range, b);
                 if w.end > w.start && text[w.clone()].chars().all(|c| c.is_alphanumeric() || c == '_') {
-                    let (a, z) = (lines.x_of(w.start), lines.x_of(w.end));
-                    let y = lay.line_y(l) + lay.row_h - 1.0;
+                    let (a, z) = (lines.pos_of(w.start), lines.pos_of(w.end.max(w.start)));
+                    let (a, z) = (a.x, if z.y == a.y { z.x } else { a.x + lay.row_h });
+                    let y = lay.line_y(l) + lines.pos_of(w.start).y + lay.row_h - 1.0;
                     let color = ui.visuals().hyperlink_color;
                     ui.painter().line_segment(
                         [Pos2::new(lay.text_x + a, y), Pos2::new(lay.text_x + z, y)],
@@ -1291,6 +1728,7 @@ fn mouse(
 
 struct KeyCtx<'a> {
     font: &'a egui::FontId,
+    row_h: f32,
     is_mac: bool,
     viewport_rows: usize,
     opts: &'a Options<'a>,
@@ -1432,6 +1870,12 @@ fn insert(st: &mut State, text: &mut String, t: &str, kind: Kind) {
 }
 
 fn key_press(ui: &egui::Ui, st: &mut State, text: &mut String, version: &mut u64, k: &KeyCtx, key: Key, m: egui::Modifiers) -> bool {
+    if let Some(action) = shortcut_action(key, m) {
+        if k.opts.read_only && action.edits() {
+            return false;
+        }
+        return run_action(st, text, *version, action);
+    }
     let ix = st.index_arc(text, *version);
     let word = if k.is_mac { m.alt } else { m.ctrl };
     let line_mod = k.is_mac && m.mac_cmd;
@@ -1447,6 +1891,8 @@ fn key_press(ui: &egui::Ui, st: &mut State, text: &mut String, version: &mut u64
         font: k.font.clone(),
         palette: k.opts.palette,
         depth: None,
+        // The width of the last layout (wrapped rows are what Up / Down move between).
+        wrap: st.wrap.width.filter(|_| k.opts.wrap).unwrap_or(f32::INFINITY),
     };
     // Move every caret with `f`; Shift extends.
     let moved = |st: &mut State, f: &dyn Fn(Sel) -> usize, keep_x: bool| {
@@ -1474,15 +1920,20 @@ fn key_press(ui: &egui::Ui, st: &mut State, text: &mut String, version: &mut u64
         let mut new_x = None;
         let mut f = |s: Sel| {
             let (l, _) = ix.line_col(s.head);
-            let x = px.unwrap_or_else(|| lines.x_of(s.head));
+            let at = lines.pos_of(s.head);
+            let x = px.unwrap_or(at.x);
             new_x = Some(x);
-            let target = view.row(l) as isize + rows;
+            // Display rows: with word wrap a line can take several.
+            let sub_row = (at.y / k.row_h).round() as isize;
+            let target = view.row(l) as isize + sub_row + rows;
             if target < 0 {
                 0
             } else if target as usize >= view.count() {
                 text.len()
             } else {
-                lines.byte_at_x(view.line(target as usize), x)
+                let line = view.line(target as usize);
+                let y = (target as usize - view.row(line)) as f32 * k.row_h + k.row_h / 2.0;
+                lines.byte_at(line, Vec2::new(x, y))
             }
         };
         let heads: Vec<usize> = st.sels.iter().map(|s| f(*s)).collect();
@@ -1550,10 +2001,6 @@ fn key_press(ui: &egui::Ui, st: &mut State, text: &mut String, version: &mut u64
         Key::Z if m.command && !shift => undo_redo(st, text, false),
         Key::Z if m.command && shift => undo_redo(st, text, true),
         Key::Y if m.command && !k.is_mac => undo_redo(st, text, true),
-        Key::D if m.command => {
-            add_next_occurrence(st, text, &ix);
-            false
-        }
         Key::Slash if m.command => match k.opts.comment {
             Some(token) => toggle_comment(st, text, &ix, token),
             None => false,
@@ -1667,6 +2114,130 @@ fn undo_redo(st: &mut State, text: &mut String, redo: bool) -> bool {
         }
         None => false,
     }
+}
+
+/// Returns true when the text changed (the caller bumps the version).
+fn run_action(st: &mut State, text: &mut String, version: u64, action: Action) -> bool {
+    use conflicts::Choice;
+    let ix = st.index_arc(text, version);
+    let caret_line = ix.line_of_byte(st.primary().head);
+    let go_to = |st: &mut State, at: usize| {
+        st.sels = vec![Sel::caret(at)];
+        st.reveal = Some(true);
+        st.history.seal();
+    };
+    match action {
+        Action::Duplicate => edit_ops::duplicate(st, text, &ix),
+        Action::MoveLinesUp => edit_ops::move_lines(st, text, &ix, false),
+        Action::MoveLinesDown => edit_ops::move_lines(st, text, &ix, true),
+        Action::CopyLinesUp => edit_ops::copy_lines(st, text, &ix, false),
+        Action::CopyLinesDown => edit_ops::copy_lines(st, text, &ix, true),
+        Action::DeleteLines => edit_ops::delete_lines(st, text, &ix),
+        Action::JoinLines => edit_ops::join_lines(st, text, &ix),
+        Action::AddNextOccurrence => {
+            add_next_occurrence(st, text, &ix);
+            false
+        }
+        Action::RemoveLastOccurrence => {
+            edit_ops::remove_last_occurrence(st);
+            false
+        }
+        Action::ToggleBookmark => {
+            st.sync_bookmarks(text, version);
+            let mut starts: Vec<usize> = st.sels.iter().map(|s| ix.line_start(ix.line_of_byte(s.head))).collect();
+            starts.sort_unstable();
+            starts.dedup();
+            // Toggle as a group: if any line has no bookmark, bookmark them all.
+            if starts.iter().all(|b| st.bookmarks.contains(b)) {
+                st.bookmarks.retain(|b| !starts.contains(b));
+            } else {
+                st.bookmarks.extend(starts);
+                st.bookmarks.sort_unstable();
+                st.bookmarks.dedup();
+            }
+            false
+        }
+        Action::NextBookmark | Action::PreviousBookmark => {
+            st.sync_bookmarks(text, version);
+            let here = ix.line_start(caret_line);
+            let next = if action == Action::NextBookmark {
+                st.bookmarks.iter().find(|&&b| b > here).or(st.bookmarks.first())
+            } else {
+                st.bookmarks.iter().rev().find(|&&b| b < here).or(st.bookmarks.last())
+            };
+            if let Some(&b) = next {
+                go_to(st, b);
+            }
+            false
+        }
+        Action::ClearBookmarks => {
+            st.bookmarks.clear();
+            false
+        }
+        Action::NextConflict | Action::PreviousConflict => {
+            let found = st.conflicts(text, version);
+            let next = if action == Action::NextConflict {
+                found.iter().find(|c| c.start > caret_line).or(found.first())
+            } else {
+                found.iter().rev().find(|c| c.start < caret_line).or(found.last())
+            };
+            if let Some(c) = next {
+                go_to(st, ix.line_start(c.start));
+            }
+            false
+        }
+        Action::AcceptCurrent | Action::AcceptIncoming | Action::AcceptBoth => {
+            let choice = match action {
+                Action::AcceptCurrent => Choice::Current,
+                Action::AcceptIncoming => Choice::Incoming,
+                _ => Choice::Both,
+            };
+            let found = st.conflicts(text, version);
+            let Some(c) = found.iter().find(|c| c.contains(caret_line)) else {
+                return false;
+            };
+            let (range, with) = c.resolve(text, &ix, choice);
+            st.replace(text, range.clone(), &with);
+            st.sels = vec![Sel::caret(range.start)];
+            st.history.seal();
+            true
+        }
+    }
+}
+
+/// The action an editor shortcut runs, if any.
+fn shortcut_action(key: Key, m: egui::Modifiers) -> Option<Action> {
+    let (shift, alt, command) = (m.shift, m.alt, m.command);
+    Some(match key {
+        Key::D if command && !shift && !alt => Action::Duplicate,
+        Key::J if alt && !command => {
+            if shift {
+                Action::RemoveLastOccurrence
+            } else {
+                Action::AddNextOccurrence
+            }
+        }
+        Key::ArrowUp if alt && !command => {
+            if shift {
+                Action::CopyLinesUp
+            } else {
+                Action::MoveLinesUp
+            }
+        }
+        Key::ArrowDown if alt && !command => {
+            if shift {
+                Action::CopyLinesDown
+            } else {
+                Action::MoveLinesDown
+            }
+        }
+        Key::K if command && shift && !alt => Action::DeleteLines,
+        Key::J if command && !shift && !alt => Action::JoinLines,
+        Key::F2 if command && !shift && !alt => Action::ToggleBookmark,
+        Key::PageDown if alt && !command && !shift => Action::NextBookmark,
+        Key::PageUp if alt && !command && !shift => Action::PreviousBookmark,
+        _ => return None,
+    })
 }
 
 fn add_next_occurrence(st: &mut State, text: &str, ix: &LineIndex) {
@@ -1868,8 +2439,11 @@ mod tests {
         id: egui::Id,
         clipboard: Option<String>,
         read_only: bool,
+        gutter: Vec<(usize, Color32, bool)>,
+        gutter_button: Option<(&'static str, &'static str)>,
         /// Input time, advanced 0.1 s per frame (None: no time, as before), for hover animations.
         clock: Option<f64>,
+        wrap: bool,
     }
 
     impl Harness {
@@ -1883,7 +2457,10 @@ mod tests {
                 id: egui::Id::NULL.with("test-editor"),
                 clipboard: None,
                 read_only: false,
+                gutter: Vec::new(),
+                gutter_button: None,
                 clock: None,
+                wrap: false,
             };
             let id = h.id;
             h.ctx.memory_mut(|m| m.request_focus(id));
@@ -1903,13 +2480,14 @@ mod tests {
                 *t += 0.1;
             }
             let mut out = Output::default();
-            let (st, text, version, hl, id, read_only) = (
+            let (st, text, version, hl, id, read_only, wrap) = (
                 &mut self.st,
                 &mut self.text,
                 &mut self.version,
                 &mut self.hl,
                 self.id,
                 self.read_only,
+                self.wrap,
             );
             let mut full = self.ctx.run_ui(input, |ui| {
                 let opts = Options {
@@ -1925,11 +2503,17 @@ mod tests {
                     sticky_scroll: true,
                     sticky_control_flow: true,
                     sticky_line: true,
+                    wrap,
                     sticky_shown: sticky::Kinds::ALL,
                     navigation_menu: false,
                     read_only,
                 };
-                out = show(ui, id, st, text, version, hl, &opts, &Extras::default());
+                let extras = Extras {
+                    gutter: &self.gutter,
+                    gutter_button: self.gutter_button,
+                    ..Default::default()
+                };
+                out = show(ui, id, st, text, version, hl, &opts, &extras);
             });
             full.textures_delta.clear(); // no renderer here (epaint asserts on dropped deltas in debug)
             for cmd in full.platform_output.commands {
@@ -1956,6 +2540,36 @@ mod tests {
     }
 
     const NONE: egui::Modifiers = egui::Modifiers::NONE;
+
+    #[test]
+    fn clicks_gutter_changes_without_moving_the_caret() {
+        for button in [
+            None,
+            Some((crate::icons::PLUS, "Stage hunk")),
+            Some((crate::icons::ARROW_U_UP_LEFT, "Revert hunk")),
+        ] {
+            let mut h = Harness::new("one\ntwo\nthree");
+            h.gutter = vec![(0, Color32::GREEN, false), (2, Color32::RED, true)];
+            h.gutter_button = button;
+            h.st.select(5..5);
+            h.frame(vec![]);
+            for (line, deleted) in [(0, false), (2, true)] {
+                let marker = h.ctx.read_response(h.id.with(("change-marker", line, deleted))).unwrap();
+                let pos = marker.rect.center();
+                h.frame(vec![Event::PointerMoved(pos)]);
+                for pressed in [true, false] {
+                    let out = h.frame(vec![Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: NONE,
+                    }]);
+                    assert_eq!(out.gutter_click.map(|(l, d, _)| (l, d)), (!pressed).then_some((line, deleted)));
+                    assert_eq!(h.st.primary().head, 5);
+                }
+            }
+        }
+    }
 
     #[test]
     fn scroll_bar_arrows_scroll_one_line() {
@@ -2094,10 +2708,21 @@ mod tests {
     #[test]
     fn multi_cursor_add_next_occurrence_and_paste() {
         let mut h = Harness::new("foo bar foo baz foo");
-        h.key(Key::D, egui::Modifiers::COMMAND); // select word under caret
-        h.key(Key::D, egui::Modifiers::COMMAND);
-        h.key(Key::D, egui::Modifiers::COMMAND);
+        h.key(Key::J, egui::Modifiers::ALT); // select word under caret
+        h.key(Key::J, egui::Modifiers::ALT);
+        // macOS types "∆" with Option+J right after the key: it must not reach the text.
+        h.frame(vec![
+            Event::Key {
+                key: Key::J,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::ALT,
+            },
+            Event::Text("∆".into()),
+        ]);
         assert_eq!(h.st.sels.len(), 3);
+        assert_eq!(h.text, "foo bar foo baz foo");
         h.typ("x");
         assert_eq!(h.text, "x bar x baz x");
         h.frame(vec![Event::Paste("1\n2\n3".into())]);
@@ -2106,6 +2731,133 @@ mod tests {
         assert_eq!(h.st.sels.len(), 1);
         h.key(Key::Slash, egui::Modifiers::COMMAND);
         assert_eq!(h.text, "// x1 bar x2 baz x3");
+    }
+
+    #[test]
+    fn line_editing_shortcuts() {
+        let cmd = egui::Modifiers::COMMAND;
+        let alt = egui::Modifiers::ALT;
+        let alt_shift = alt.plus(egui::Modifiers::SHIFT);
+        let mut h = Harness::new("one\ntwo\nthree");
+        // Duplicate the line: the caret moves to the copy, same column.
+        h.key(Key::ArrowRight, NONE);
+        h.key(Key::D, cmd);
+        assert_eq!(h.text, "one\none\ntwo\nthree");
+        assert_eq!(h.st.primary(), Sel::caret(5));
+        // Duplicate a selection: the copy gets selected.
+        h.key(Key::ArrowRight, egui::Modifiers::SHIFT);
+        h.key(Key::D, cmd);
+        assert_eq!(h.text, "one\nonne\ntwo\nthree");
+        assert_eq!(h.st.primary().range(), 6..7);
+        h.key(Key::Z, cmd);
+        h.key(Key::Z, cmd);
+        assert_eq!(h.text, "one\ntwo\nthree");
+        // Move a line down twice, then back up; the caret stays on it.
+        h.st.sels = vec![Sel::caret(1)];
+        h.key(Key::ArrowDown, alt);
+        h.key(Key::ArrowDown, alt);
+        assert_eq!(h.text, "two\nthree\none");
+        assert_eq!(h.st.primary(), Sel::caret(11));
+        h.key(Key::ArrowDown, alt); // already last: nothing
+        assert_eq!(h.text, "two\nthree\none");
+        h.key(Key::ArrowUp, alt);
+        assert_eq!(h.text, "two\none\nthree");
+        // Copy lines up / down.
+        h.key(Key::ArrowDown, alt_shift);
+        assert_eq!(h.text, "two\none\none\nthree");
+        assert_eq!(h.st.primary(), Sel::caret(9));
+        h.key(Key::ArrowUp, alt_shift);
+        assert_eq!(h.text, "two\none\none\none\nthree");
+        assert_eq!(h.st.primary(), Sel::caret(9));
+        // Delete lines (the last one takes the newline before it).
+        h.key(Key::K, cmd.plus(egui::Modifiers::SHIFT));
+        h.key(Key::K, cmd.plus(egui::Modifiers::SHIFT));
+        assert_eq!(h.text, "two\none\nthree");
+        h.st.sels = vec![Sel::caret(h.text.len())];
+        h.key(Key::K, cmd.plus(egui::Modifiers::SHIFT));
+        assert_eq!(h.text, "two\none");
+        // Join lines.
+        h.st.sels = vec![Sel::caret(0)];
+        h.key(Key::J, cmd);
+        assert_eq!(h.text, "two one");
+        // Prepend / append on the selected lines.
+        h.text = "a\n\nb".into();
+        h.version += 1;
+        h.st.sels = vec![Sel { anchor: 0, head: 4 }];
+        assert!(affix_lines(&mut h.st, &mut h.text, h.version, "- ", ";", true));
+        assert_eq!(h.text, "- a;\n\n- b;");
+    }
+
+    #[test]
+    fn bookmarks_follow_their_lines() {
+        let mut h = Harness::new("a\nb\nc\nd");
+        h.st.sels = vec![Sel::caret(4)]; // line "c"
+        h.key(Key::F2, egui::Modifiers::COMMAND);
+        assert_eq!(h.st.bookmark_lines(&h.text, h.version), [2]);
+        // Lines inserted above move the bookmark down with its text.
+        h.st.sels = vec![Sel::caret(0)];
+        h.typ("x\ny\n");
+        assert_eq!(h.st.bookmark_lines(&h.text, h.version), [4]);
+        // Next bookmark wraps around and goes to it.
+        h.st.sels = vec![Sel::caret(h.text.len())];
+        h.key(Key::PageDown, egui::Modifiers::ALT);
+        assert_eq!(h.st.primary(), Sel::caret(8));
+        // Undo puts it back.
+        h.key(Key::Z, egui::Modifiers::COMMAND);
+        h.frame(vec![]);
+        assert_eq!(h.st.bookmark_lines(&h.text, h.version), [2]);
+        h.st.sels = vec![Sel::caret(4)];
+        h.key(Key::F2, egui::Modifiers::COMMAND);
+        assert!(h.st.bookmark_lines(&h.text, h.version).is_empty());
+    }
+
+    #[test]
+    fn merge_conflict_buttons_and_commands_resolve() {
+        let mut h = Harness::new("a\n<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> topic\nz\n");
+        // The "Accept incoming" button on the marker line.
+        let pos = h
+            .ctx
+            .read_response(h.id.with(("conflict", 1usize, 1usize)))
+            .expect("conflict buttons shown")
+            .rect
+            .center();
+        h.frame(vec![Event::PointerMoved(pos)]);
+        for pressed in [true, false] {
+            h.frame(vec![Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: NONE,
+            }]);
+        }
+        assert_eq!(h.text, "a\ntheirs\nz\n");
+        h.key(Key::Z, egui::Modifiers::COMMAND);
+        h.st.sels = vec![Sel::caret(0)];
+        let (mut text, mut version) = (h.text.clone(), h.version);
+        h.st.run(&mut text, &mut version, Action::NextConflict);
+        assert_eq!(h.st.primary(), Sel::caret(2));
+        h.st.run(&mut text, &mut version, Action::AcceptBoth);
+        assert_eq!(text, "a\nours\ntheirs\nz\n");
+    }
+
+    #[test]
+    fn word_wrap_breaks_long_lines_into_rows_and_moves_by_row() {
+        let long = "word ".repeat(60);
+        let mut h = Harness::new(&format!("{long}\nshort"));
+        h.wrap = true;
+        h.frame(vec![]);
+        let rows = h.st.view.rows_of(0);
+        assert!(rows > 1, "the long line wraps ({rows} rows)");
+        assert_eq!(h.st.view.row(1), rows);
+        // Down moves to the next row of the same line, not to the next line.
+        h.st.sels = vec![Sel::caret(0)];
+        h.key(Key::ArrowDown, NONE);
+        let head = h.st.primary().head;
+        assert!(head > 0 && head < long.len(), "{head}");
+        // Turning wrap off goes back to one row per line.
+        h.wrap = false;
+        h.frame(vec![]);
+        assert_eq!(h.st.view.rows_of(0), 1);
     }
 
     #[test]

@@ -1,3 +1,4 @@
+mod affix;
 mod assist;
 mod c_flags;
 mod call_hierarchy;
@@ -24,11 +25,13 @@ mod search_replace;
 mod semantic;
 mod session;
 mod settings_page;
+mod stash;
 mod tab_field;
 #[cfg(feature = "tour")]
 mod tour;
 
 use crate::commands::{self, Command, Setting};
+use crate::encoding::Encoding;
 use crate::graph::{Graph, secondary_text_color};
 use crate::icons as ic;
 use crate::search::{self, FileHits};
@@ -37,7 +40,7 @@ use crate::settings::{Settings, SettingsWriter};
 use crate::vcs::{self, FileChange, Status, Vcs};
 use crate::watch::{Changes, IGNORED_DIRS, Watcher};
 use crate::{blame, highlight};
-use crate::{editor, fonts};
+use crate::{editor, fonts, git};
 use crate::{goto, installer, lsp, symbols, workspace};
 use eframe::egui::{self, Color32, Key, Modifiers, RichText};
 use std::collections::{HashMap, HashSet};
@@ -56,6 +59,11 @@ type DirEntries = Vec<(PathBuf, bool)>;
 type SbsSelection = (bool, (usize, usize), (usize, usize));
 /// Byte ranges of search-in-files matches in one document.
 type SearchMarks = Arc<Vec<std::ops::Range<usize>>>;
+struct LiveDiffMarks<'a> {
+    line_bg: &'a [(usize, Color32)],
+    gutter: &'a [(usize, Color32, bool)],
+    button: Option<(&'static str, &'static str)>,
+}
 
 struct Doc {
     id: u64,
@@ -66,6 +74,13 @@ struct Doc {
     text: String,
     saved: String,
     crlf: bool,
+    encoding: Encoding,
+    saved_crlf: bool,
+    saved_encoding: Encoding,
+    /// Explicit line ending changes take precedence over the project default.
+    line_endings_explicit: bool,
+    /// Ignore watcher reads started before a save or reload.
+    disk_version: u64,
     /// The file changed on disk (outside edittr) to this; the user decides what to do.
     disk: Option<DiskText>,
     lang: String,
@@ -130,6 +145,7 @@ struct VcsRefresh {
     repository: DetectedRepo,
     status: Option<Result<Status, String>>,
     branches: Vec<String>,
+    stashes: Result<Vec<vcs::Stash>, String>,
     refresh_git_history: bool,
     files: Vec<(u64, u64, DiskText)>,
 }
@@ -140,19 +156,21 @@ impl Doc {
         if v == self.version {
             return dirty;
         }
-        let dirty = self.text != self.saved;
+        let dirty = self.differs_from_saved();
         self.dirty_cache.set((self.version, dirty));
         dirty
     }
 
-    fn mark_saved(&mut self) {
-        self.saved = self.text.clone();
-        self.dirty_cache.set((self.version, false));
+    fn differs_from_saved(&self) -> bool {
+        self.crlf != self.saved_crlf || self.encoding != self.saved_encoding || self.text != self.saved
     }
 
-    fn mark_saved_snapshot(&mut self, text: String) {
+    fn mark_saved(&mut self, text: String, crlf: bool, encoding: Encoding) {
         self.saved = text;
-        self.dirty_cache.set((self.version, self.text != self.saved));
+        self.saved_crlf = crlf;
+        self.saved_encoding = encoding;
+        self.disk = None;
+        self.dirty_cache.set((self.version, self.differs_from_saved()));
     }
 
     /// 0-based line and UTF-16 column of the cursor (cached: it scans the text).
@@ -170,14 +188,21 @@ impl Doc {
     }
 
     /// Replace the buffer with the latest text from disk.
-    fn reload(&mut self, text: String, _ctx: &egui::Context) {
+    fn reload(&mut self, disk: DiskText) {
+        let DiskText { text, crlf, encoding, .. } = disk;
         let len = text.chars().count();
         self.cursor = self.cursor.min(len);
         self.anchor = self.anchor.min(len);
-        self.goto = self.goto.map(|(a, b)| (a.min(len), b.min(len)));
-        self.saved = text.clone();
+        self.goto = Some((self.anchor, self.cursor));
+        self.ed.history = Default::default();
+        self.crlf = crlf;
+        self.encoding = encoding;
+        self.line_endings_explicit = false;
+        self.version += 1;
+        self.disk_version = self.version;
+        let saved = text.clone();
         self.text = text;
-        self.version += 1; // the editor clamps its selections to the new text
+        self.mark_saved(saved, crlf, encoding);
         self.clear_blame();
     }
 
@@ -203,6 +228,7 @@ enum Tab {
     FileHistory(Box<file_history::History>),
     Hex(Box<hex_view::Viewer>),
     Graph,
+    Stash(Box<stash::StashView>),
     Settings,
 }
 
@@ -219,12 +245,15 @@ struct DiffTab {
     removed: usize,
     /// Row index of the first row of each change block.
     blocks: Vec<usize>,
+    change_cursor: Option<usize>,
     /// Row to scroll to on the next frame.
     jump: Option<usize>,
     /// First visible row (last frame).
     top_row: usize,
     hscroll: f32,
     source: DiffSource,
+    hunk_snapshot: Option<Arc<str>>,
+    hunks_stale: bool,
     ignore_eol: bool,
     only_line_endings: bool,
     /// Working-copy change: editable side-by-side view (see diff_edit.rs).
@@ -254,14 +283,71 @@ enum DiffSource {
     Commit,
 }
 
+impl DiffSource {
+    fn git_hunks(&self) -> Option<(&FileChange, bool)> {
+        match self {
+            Self::Vcs {
+                vcs: Vcs::Git,
+                change,
+                staged,
+                ..
+            } if matches!(change.code, 'M' | 'A' | 'D' | '?') => Some((change, *staged)),
+            _ => None,
+        }
+    }
+}
+
 impl DiffTab {
+    fn current_change(&self) -> usize {
+        self.change_cursor
+            .unwrap_or_else(|| self.blocks.partition_point(|&row| row <= self.top_row + 3).saturating_sub(1))
+    }
+
+    fn move_change(&mut self, next: bool) {
+        if self.blocks.is_empty() {
+            return;
+        }
+        let n = self.blocks.len();
+        let current = self.current_change();
+        let target = if next {
+            (current + 1) % n
+        } else {
+            current.checked_sub(1).unwrap_or(n - 1)
+        };
+        self.change_cursor = Some(target);
+        self.jump = Some(self.blocks[target]);
+    }
+
+    fn selected_hunk(&self) -> Option<crate::diff::Hunk> {
+        let (left, a, b) = self.sel?;
+        if a == b {
+            return None;
+        }
+        let (start, end) = (a.min(b), a.max(b));
+        let last = end.0 + usize::from(end.1 != 0);
+        let mut selected = self.sbs.rows.get(start.0..last)?.iter().filter_map(|row| {
+            let side = if left { &row.left } else { &row.right };
+            side.as_ref().map(|line| line.line)
+        });
+        let first = selected.next()?;
+        let lines = first - 1..selected.next_back().unwrap_or(first);
+        let mut hunks = self
+            .sbs
+            .blocks
+            .iter()
+            .map(|(_, h)| if left { h.clone().reversed() } else { h.clone() })
+            .filter(|h| h.intersects(&lines));
+        let hunk = hunks.next()?.selected(&lines)?;
+        if hunks.next().is_some() {
+            return None;
+        }
+        Some(if left { hunk.reversed() } else { hunk })
+    }
+
     fn new(title: String, path: PathBuf, text: &str, source: DiffSource, ignore_eol: bool, only_line_endings: bool) -> Self {
         use crate::diff::Kind;
         let sbs = crate::diff::side_by_side(text);
-        let changed = |k: Kind| matches!(k, Kind::Changed | Kind::Added | Kind::Removed);
-        let blocks: Vec<usize> = (0..sbs.rows.len())
-            .filter(|&i| changed(sbs.rows[i].kind) && (i == 0 || !changed(sbs.rows[i - 1].kind)))
-            .collect();
+        let blocks: Vec<usize> = sbs.blocks.iter().map(|(row, _)| *row).collect();
         let added = sbs
             .rows
             .iter()
@@ -284,11 +370,14 @@ impl DiffTab {
             added,
             removed,
             blocks,
+            change_cursor: None,
             jump,
             top_row: 0,
             hscroll: 0.0,
             sel: None,
             source,
+            hunk_snapshot: None,
+            hunks_stale: false,
             ignore_eol,
             only_line_endings,
             live: None,
@@ -355,6 +444,7 @@ impl QuickOpenFiles {
 
 enum Confirm {
     CloseTabs(Vec<usize>),
+    ReopenEncoding(u64, Encoding, String),
     SwitchWorkspace(PathBuf),
     /// Close the folder and go back to the start page.
     CloseFolder,
@@ -363,6 +453,7 @@ enum Confirm {
     DiscardFolder(String, Vec<FileChange>),
     /// Stage (true) or unstage a folder (path, number of files).
     StageFolder(String, usize, bool),
+    DropStash(Box<vcs::Stash>),
     /// The window is closing with unsaved changes.
     Quit,
 }
@@ -371,16 +462,18 @@ type DetectedRepo = Option<(PathBuf, Vcs)>;
 
 enum VcsOperation {
     Change(&'static str),
+    Hunk(&'static str, PathBuf),
     History(&'static str),
     Graph(vcs::HistoryAction),
     Commit(String, bool),
     Discard(PathBuf),
+    Stash(&'static str),
 }
 
 impl VcsOperation {
     fn label(&self) -> &'static str {
         match self {
-            Self::Change(label) | Self::History(label) => label,
+            Self::Change(label) | Self::History(label) | Self::Stash(label) | Self::Hunk(label, _) => label,
             Self::Graph(action) => action.label(),
             Self::Commit(..) => "Commit",
             Self::Discard(_) => "Discard",
@@ -437,6 +530,7 @@ pub struct App {
     last_poll: Instant,
     was_focused: Option<bool>,
     branches: Vec<String>,
+    stash: stash::State,
     commit_msg: String,
     amend: bool,
 
@@ -446,9 +540,12 @@ pub struct App {
     graph_rx: Option<Receiver<Result<Graph, String>>>,
     settings_page: settings_page::Page,
     fps: FrameStats,
+    affix: Option<affix::Affix>,
+    affix_last: Option<affix::Affix>,
     graph_dialog: Option<graph_menu::GraphDialog>,
     diff_rx: Option<PendingDiff>,
     open_jobs: Vec<file_open::OpenJob>,
+    reopen_jobs: Vec<file_open::ReopenJob>,
     compare_path: Option<PathBuf>,
 
     bg_task: Option<VcsJob>,
@@ -524,7 +621,7 @@ impl App {
             // A newer copy (e.g. a just-extracted portable) takes over the Explorer menu the user turned on.
             std::thread::spawn(crate::shell_menu::follow_newest);
         }
-        cc.egui_ctx.set_theme(settings.themes.preference);
+        settings.themes.apply(&cc.egui_ctx, settings.color_window);
         cc.egui_ctx.global_style_mut(|s| {
             s.spacing.item_spacing.y = 3.0;
         });
@@ -565,6 +662,7 @@ impl App {
             last_poll: Instant::now(),
             was_focused: None,
             branches: Vec::new(),
+            stash: stash::State::default(),
             commit_msg: String::new(),
             amend: false,
             graph: None,
@@ -573,9 +671,12 @@ impl App {
             graph_rx: None,
             settings_page: Default::default(),
             fps: Default::default(),
+            affix: None,
+            affix_last: None,
             graph_dialog: None,
             diff_rx: None,
             open_jobs: Vec::new(),
+            reopen_jobs: Vec::new(),
             compare_path: None,
             bg_task: None,
             message: String::new(),
@@ -649,6 +750,7 @@ impl App {
     fn clear_project(&mut self) {
         self.call_hierarchy = None;
         self.open_jobs.clear();
+        self.reopen_jobs.clear();
         self.diff_rx = None;
         self.preview = None;
         self.split = None;
@@ -800,7 +902,7 @@ impl App {
             .filter_map(|tab| match tab {
                 // Unsaved documents too: an outside change is reported, never applied silently.
                 Tab::File(doc) if (changes.rescan || changes.affects(&doc.path)) && !self.writing_document(&doc.path) => {
-                    Some((doc.path.clone(), doc.id, doc.version))
+                    Some((doc.path.clone(), doc.id, doc.version, doc.saved_encoding))
                 }
                 _ => None,
             })
@@ -821,14 +923,21 @@ impl App {
             let (status, branches) = repository
                 .as_ref()
                 .map_or_else(|| (None, Vec::new()), |(repo, vcs)| (Some(vcs.status(repo)), vcs.branches(repo)));
+            let stashes = repository.as_ref().map_or_else(|| Ok(Vec::new()), |(repo, vcs)| vcs.stashes(repo));
             let files = files
                 .into_iter()
-                .filter_map(|(path, id, version)| read_doc_text(&path).ok().flatten().map(|text| (id, version, text)))
+                .filter_map(|(path, id, version, encoding)| {
+                    file_open::read_disk_text(&path, Some(encoding))
+                        .ok()
+                        .flatten()
+                        .map(|text| (id, version, text))
+                })
                 .collect();
             VcsRefresh {
                 repository,
                 status,
                 branches,
+                stashes,
                 refresh_git_history: changes.vcs || changes.rediscover,
                 files,
             }
@@ -846,6 +955,11 @@ impl App {
         self.status = Status::default();
         self.status_gen += 1;
         self.branches.clear();
+        self.stash = stash::State::default();
+        self.clear_stash_picker();
+        if matches!(self.confirm, Some(Confirm::DropStash(_))) {
+            self.confirm = None;
+        }
         self.graph = None;
         self.graph_sel = None;
         self.graph_detail = commit_view::CommitView::default();
@@ -901,6 +1015,30 @@ impl App {
         let label = if stage { "Stage" } else { "Unstage" };
         self.spawn_vcs(VcsOperation::Change(label), move |vcs, repo| {
             vcs.stage(repo, path.as_deref(), stage)
+        });
+    }
+
+    fn stage_buffer_hunk(&mut self, path: String, base: git::BufferBase, text: String, crlf: bool, hunk: crate::diff::Hunk) {
+        let Some(repo) = &self.repo else { return };
+        self.spawn_vcs(VcsOperation::Hunk("Stage hunk", repo.join(&path)), move |vcs, repo| {
+            vcs.stage_buffer_hunk(repo, &path, base, &text, crlf, hunk)
+        });
+    }
+
+    fn apply_diff_hunk(&mut self, tab: usize, hunk: crate::diff::Hunk) {
+        if self.bg_task.is_some() {
+            return;
+        }
+        let Some(Tab::Diff(d)) = self.tabs.get(tab) else { return };
+        let Some((change, staged)) = d.source.git_hunks() else { return };
+        let Some(snapshot) = &d.hunk_snapshot else { return };
+        if d.hunks_stale {
+            return;
+        }
+        let (snapshot, change, ignore_eol) = (snapshot.clone(), change.clone(), d.ignore_eol);
+        let label = if staged { "Unstage hunk" } else { "Stage hunk" };
+        self.spawn_vcs(VcsOperation::Hunk(label, d.path.clone()), move |vcs, repo| {
+            vcs.apply_diff_hunk(repo, &change, staged, ignore_eol, &snapshot, hunk)
         });
     }
 
@@ -1032,18 +1170,23 @@ impl App {
                     }
                 }
                 self.branches = refresh.branches;
+                match refresh.stashes {
+                    Ok(stashes) => self.stash.entries = stashes,
+                    Err(error) => self.message = format!("Could not list stashes: {error}"),
+                }
                 if repo_changed || (refresh.refresh_git_history && self.vcs == Some(Vcs::Git)) {
                     self.refresh_history();
                 }
             }
-            for (id, _version, disk) in refresh.files {
+            for (id, version, disk) in refresh.files {
                 if let Some(doc) = self.tabs.iter_mut().find_map(|tab| match tab {
-                    Tab::File(doc) if doc.id == id => Some(doc),
+                    Tab::File(doc) if doc.id == id && version >= doc.disk_version => Some(doc),
                     _ => None,
                 }) {
                     // `saved` is what edittr last read or wrote: anything else came from elsewhere.
                     // Nothing is reloaded until the user chooses (see `disk_changed_bar`).
-                    doc.disk = (disk.text != doc.saved).then_some(disk);
+                    let endings_changed = disk.crlf != doc.saved_crlf && disk.text.contains('\n');
+                    doc.disk = (endings_changed || disk.encoding != doc.saved_encoding || disk.text != doc.saved).then_some(disk);
                 }
             }
         }
@@ -1055,8 +1198,12 @@ impl App {
             };
             if let Some(result) = result {
                 let operation = self.bg_task.take().unwrap().operation;
+                let hunk_path = match &operation {
+                    VcsOperation::Hunk(_, path) => Some(path.clone()),
+                    _ => None,
+                };
                 let label = operation.label();
-                let refresh_graph = matches!(operation, VcsOperation::Graph(_));
+                let refresh_graph = matches!(operation, VcsOperation::Graph(_) | VcsOperation::Stash(_));
                 match result {
                     Ok(out) => {
                         self.message = out
@@ -1079,7 +1226,7 @@ impl App {
                                 self.pending_changes.paths.insert(path);
                             }
                             VcsOperation::History(_) => self.refresh_history(),
-                            VcsOperation::Graph(_) | VcsOperation::Change(_) => {}
+                            VcsOperation::Graph(_) | VcsOperation::Change(_) | VcsOperation::Stash(_) | VcsOperation::Hunk(..) => {}
                         }
                     }
                     Err(e) => {
@@ -1092,6 +1239,17 @@ impl App {
                             self.offer_force_delete(name.clone());
                         }
                     }
+                }
+                if let Some(path) = hunk_path {
+                    for tab in &mut self.tabs {
+                        if let Tab::Diff(d) = tab
+                            && d.path == path
+                            && matches!(d.source, DiffSource::Vcs { vcs: Vcs::Git, .. })
+                        {
+                            d.hunks_stale = true;
+                        }
+                    }
+                    self.refresh_diff();
                 }
                 if refresh_graph {
                     self.refresh_history();
@@ -1121,7 +1279,14 @@ impl App {
                 }
             }
         }
-        self.graph_detail.poll();
+        let _ = self.graph_detail.poll();
+        for tab in &mut self.tabs {
+            if let Tab::Stash(view) = tab
+                && let Some(error) = view.detail.poll()
+            {
+                self.message = format!("Could not view stash diff: {error}");
+            }
+        }
         self.poll_loaded_diff();
     }
 
@@ -1207,7 +1372,7 @@ impl App {
         let diags = self.squiggles_for(si, ui.visuals());
         let settings = &self.settings;
         let highlights = &self.highlights;
-        let (mut close, mut goto, mut context_command) = (false, None, None);
+        let (mut close, mut goto, mut context_command, mut gutter_click) = (false, None, None, None);
         egui::Panel::right("split-pane")
             .resizable(true)
             .default_size(ui.available_width() / 2.0)
@@ -1228,12 +1393,15 @@ impl App {
                 {
                     doc.ed.set_sticky_outline(doc.version, scopes);
                 }
-                let out = editor(ui, doc, settings, None, &diags, &[], 1, &[], &[], highlights);
+                let out = editor(ui, doc, settings, None, &diags, &[], 1, None, &[], highlights);
                 goto = out.goto;
                 context_command = out.context_command;
+                gutter_click = out.gutter_click;
             });
         if close {
             self.split = None;
+        } else {
+            self.gutter_popup(ui, si, 1, gutter_click);
         }
         if let Some(idx) = goto {
             // Go to definition from the side editor: make it the active one first.
@@ -1246,7 +1414,7 @@ impl App {
         }
     }
 
-    fn add_file_tab(&mut self, path: &Path, text: String, crlf: bool) {
+    fn add_file_tab(&mut self, path: &Path, text: String, crlf: bool, encoding: Encoding) {
         let lang = language_of(path);
         let indent = editor::detect_indent(&text, self.settings.tab_size);
         let comment = editor::comment_token(&lang.to_lowercase());
@@ -1257,6 +1425,11 @@ impl App {
             saved: text.clone(),
             disk: None,
             crlf,
+            encoding,
+            saved_crlf: crlf,
+            saved_encoding: encoding,
+            line_endings_explicit: false,
+            disk_version: 0,
             text,
             lang,
             goto: None,
@@ -1285,16 +1458,12 @@ impl App {
         let Some(Tab::File(doc)) = self.tabs.get_mut(i) else { return };
         let Some(disk) = doc.disk.clone() else { return };
         match action {
-            DiskAction::Reload => {
-                doc.crlf = disk.crlf;
-                doc.reload(disk.text, &self.ctx.clone());
-                doc.disk = None;
-            }
+            DiskAction::Reload => doc.reload(disk),
             DiskAction::KeepMine => {
                 // The editor text now differs from the file: it shows as unsaved, and saving wins.
-                doc.saved = disk.text;
-                doc.disk = None;
                 doc.version += 1;
+                doc.disk_version = doc.version;
+                doc.mark_saved(disk.text, disk.crlf, disk.encoding);
             }
             DiskAction::Compare => {
                 let title = format!("{} (on disk ↔ editor)", doc.name());
@@ -1317,6 +1486,7 @@ impl App {
                 (t, &tab),
                 (Tab::Diff(_), Tab::Diff(_))
                     | (Tab::Graph, Tab::Graph)
+                    | (Tab::Stash(_), Tab::Stash(_))
                     | (Tab::Settings, Tab::Settings)
                     | (Tab::FileHistory(_), Tab::FileHistory(_))
             ) || matches!((t, &tab), (Tab::Hex(a), Tab::Hex(b)) if a.comparing() && b.comparing())
@@ -1356,9 +1526,10 @@ impl App {
         }
         if let Some(d) = self.tabs.iter().find_map(|tab| match tab {
             Tab::Diff(d)
-                if (d.inline || d.live.is_none())
-                    && d.ignore_eol != self.settings.diff_ignore_eol
-                    && !matches!(d.source, DiffSource::Commit) =>
+                if d.hunks_stale
+                    || ((d.inline || d.live.is_none())
+                        && d.ignore_eol != self.settings.diff_ignore_eol
+                        && !matches!(d.source, DiffSource::Commit)) =>
             {
                 Some(d)
             }
@@ -1368,14 +1539,26 @@ impl App {
         }
     }
 
-    fn load_diff(&mut self, title: String, path: PathBuf, source: DiffSource, refresh: bool) {
+    fn load_diff(&mut self, title: String, path: PathBuf, mut source: DiffSource, refresh: bool) {
         let ignore_eol = self.settings.diff_ignore_eol;
         let ctx = self.ctx.clone();
         self.diff_rx = Some(background(&self.ctx, move || {
             let mut live = None;
-            let (text, only_line_endings) = match &source {
+            let (text, only_line_endings) = match &mut source {
                 DiffSource::Vcs { repo, vcs, change, staged } => {
-                    let binary = !refresh && !staged && crate::hex::Source::open(&path).and_then(|file| file.is_binary()).unwrap_or(false);
+                    if refresh
+                        && *vcs == Vcs::Git
+                        && let Ok(status) = vcs.status(repo)
+                    {
+                        let changes = if *staged { status.staged } else { status.unstaged };
+                        if let Some(current) = changes.into_iter().find(|c| c.path == change.path) {
+                            *change = current;
+                        } else {
+                            // An open buffer can still differ when the disk and index match.
+                            change.code = 'M';
+                        }
+                    }
+                    let binary = !refresh && !*staged && crate::hex::Source::open(&path).and_then(|file| file.is_binary()).unwrap_or(false);
                     if binary {
                         return hex_view::vcs_comparison(path, title, *vcs, repo, change, *staged, &ctx);
                     }
@@ -1384,8 +1567,7 @@ impl App {
                         return hex_view::vcs_comparison(path, title, *vcs, repo, change, *staged, &ctx);
                     }
                     // Unstaged changes can be edited in place. Load both sides off the UI thread.
-                    if !refresh
-                        && !staged
+                    if !*staged
                         && change.code != 'D'
                         && path.is_file()
                         && let Ok(Some(disk)) = read_doc_text(&path)
@@ -1405,6 +1587,9 @@ impl App {
                 DiffSource::Commit => (String::new(), false),
             };
             let mut tab = DiffTab::new(title, path, &text, source, ignore_eol, only_line_endings);
+            if live.is_none() && tab.source.git_hunks().is_some() && !tab.blocks.is_empty() {
+                tab.hunk_snapshot = Some(Arc::from(text));
+            }
             tab.live = live;
             Ok((Tab::Diff(Box::new(tab)), refresh))
         }));
@@ -2093,7 +2278,7 @@ impl App {
                     _ => 0,
                 };
                 if count > 0 {
-                    badge(ui, r.rect, count);
+                    badge(ui, r.rect, count, self.colors_window(ui));
                 }
                 if r.clicked() {
                     // Clicking the active view collapses the sidebar.
@@ -2562,7 +2747,7 @@ impl App {
                 .desired_rows(3)
                 .desired_width(f32::INFINITY),
         );
-        let commit_key = ui.input_mut(|i| commands::entry(Command::Commit).consume(i));
+        let commit_key = !self.stash_dialog_open() && ui.input_mut(|i| commands::entry(Command::Commit).consume(i));
         ui.horizontal(|ui| {
             let can = self.can_commit();
             let commit = ui.add_enabled(can, egui::Button::new(format!("{} Commit", ic::CHECK)));
@@ -2574,6 +2759,11 @@ impl App {
             }
         });
         ui.separator();
+
+        if vcs == Vcs::Git {
+            self.stashes_panel(ui);
+            ui.separator();
+        }
 
         // Only the visible rows are laid out, and the row list is rebuilt only when the
         // status, the view or a folder changes: tens of thousands of changes stay smooth.
@@ -2689,6 +2879,7 @@ impl App {
                         Tab::FileHistory(history) => format!("{} {}", ic::TREE_STRUCTURE, history.title),
                         Tab::Hex(v) => v.title.clone(),
                         Tab::Graph => format!("{} {}", ic::TREE_STRUCTURE, self.vcs.unwrap_or(Vcs::Git).history_title()),
+                        Tab::Stash(view) => format!("{} {} diff", ic::GIT_DIFF, view.entry.selector),
                         Tab::Settings => format!("{} Settings", ic::GEAR),
                     };
                     let r = ui.selectable_label(i == self.active, title);
@@ -2706,7 +2897,7 @@ impl App {
                         Tab::Large(v) => Some(v.path.clone()),
                         Tab::FileHistory(history) => Some(history.path.clone()),
                         Tab::Hex(v) => Some(v.path.clone()),
-                        Tab::Graph | Tab::Settings => None,
+                        Tab::Graph | Tab::Stash(_) | Tab::Settings => None,
                     };
                     let r = match &file_path {
                         Some(p) => r.on_hover_text(p.display().to_string()),
@@ -2862,12 +3053,26 @@ impl App {
         }
     }
 
+    fn colors_window(&self, ui: &egui::Ui) -> bool {
+        self.settings
+            .themes
+            .active(ui.visuals().dark_mode)
+            .colors_window(self.settings.color_window)
+    }
+
     fn central(&mut self, ui: &mut egui::Ui) {
         if self.tabs.is_empty() {
             self.empty_editor(ui);
             return;
         }
-        self.tab_strip(ui);
+        if self.colors_window(ui) {
+            egui::Frame::new().fill(ui.visuals().faint_bg_color).show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                self.tab_strip(ui);
+            });
+        } else {
+            self.tab_strip(ui);
+        }
         ui.separator();
         // The tab strip may have just closed tabs (its x buttons, its menu): the last
         // one, or the active one at the end. Never index a tab that is gone.
@@ -2881,6 +3086,7 @@ impl App {
         let mut open_path = None;
         let mut goto_at = None;
         let mut editor_out = None;
+        let mut diff_hunk = None;
         let mut disk_action = None;
         // Diagnostics of the active file, for squiggles (collected before borrowing the tab).
         let diags = self.squiggles_for(active, ui.visuals());
@@ -2941,7 +3147,7 @@ impl App {
                         &diags,
                         &marks,
                         0,
-                        &[],
+                        None,
                         &global_marks,
                         &self.highlights,
                     );
@@ -2972,7 +3178,7 @@ impl App {
                     });
                     if !immutable && ignore_eol != self.settings.diff_ignore_eol {
                         self.run_command(Command::ToggleSetting(Setting::DiffIgnoreEol));
-                    } else if d.ignore_eol != ignore_eol {
+                    } else if d.hunks_stale || d.ignore_eol != ignore_eol {
                         ui.weak("Loading diff…");
                     } else if d.only_line_endings {
                         ui.add_space(20.0);
@@ -2980,7 +3186,7 @@ impl App {
                     } else if d.inline {
                         diff_view(ui, &d.lines, "diff");
                     } else {
-                        side_by_side_view(ui, d, self.settings.themes.active(ui.visuals().dark_mode));
+                        diff_hunk = side_by_side_view(ui, d, self.settings.themes.active(ui.visuals().dark_mode), self.bg_task.is_some());
                     }
                     self.refresh_diff();
                 }
@@ -2988,6 +3194,7 @@ impl App {
                 Tab::Hex(v) => v.show(ui),
                 Tab::Settings => self.settings_tab(ui),
                 Tab::FileHistory(v) => v.show(ui, self.settings.diff_ignore_eol),
+                Tab::Stash(view) => view.show(ui, self.settings.themes.active(ui.visuals().dark_mode)),
                 Tab::Graph => {
                     let Some(graph) = &self.graph else {
                         ui.label(if self.graph_rx.is_some() {
@@ -3047,12 +3254,16 @@ impl App {
             self.disk_changed(active, action);
         }
         if let Some(out) = &editor_out {
+            self.gutter_popup(ui, active, 0, out.gutter_click);
             self.last_caret = out.caret;
             self.after_editor(out);
             if let Some(command) = out.context_command {
                 self.run_command(command);
             }
             self.sync_markdown_preview(active, out);
+        }
+        if let Some(hunk) = diff_hunk {
+            self.apply_diff_hunk(active, hunk);
         }
         if let Some(idx) = goto_at {
             self.go_to_definition(idx, ui.ctx());
@@ -3112,7 +3323,8 @@ impl App {
             (fps, Some(ms)) => format!("{fps} fps · {ms:.1} ms"),
             (fps, None) => format!("{fps} fps"),
         });
-        let file = match self.tabs.get(self.active) {
+        let index = self.live_diff_doc(self.active).unwrap_or(self.active);
+        let file = match self.tabs.get(index) {
             Some(Tab::File(doc)) => Some((doc, doc.ext())),
             _ => None,
         };
@@ -3130,6 +3342,7 @@ impl App {
         let mut open_problems = false;
         let mut open_c_settings = false;
         let mut set_tab_size = None;
+        let mut file_command = None;
         ui.horizontal(|ui| {
             if self.repo.is_some() {
                 let branch = format!("{} {} {}", ic::GIT_BRANCH, self.status.branch, self.status.ahead_behind);
@@ -3196,6 +3409,7 @@ impl App {
                             }
                         }
                     });
+                    file_command = file_open::format_status(ui, doc);
                     let (line, col) = doc.line_col();
                     ui.add(egui::Label::new(RichText::new(format!("Ln {}, Col {}", line + 1, col + 1)).weak()).truncate());
                 }
@@ -3237,6 +3451,9 @@ impl App {
         if let Some(n) = set_tab_size {
             self.set_tab_size(n);
         }
+        if let Some(command) = file_command {
+            self.run_command(command);
+        }
     }
 
     fn dialogs(&mut self, ctx: &egui::Context) {
@@ -3244,7 +3461,9 @@ impl App {
         self.new_entry_dialog(ctx);
         self.lsp_edit_ui(ctx);
         self.graph_dialog(ctx);
+        self.stash_dialog(ctx);
         self.c_flags_dialogs(ctx);
+        self.affix_dialog(ctx);
         // Quick open
         if let Some(q) = &mut self.quick_open {
             let mut chosen = None;
@@ -3433,6 +3652,9 @@ impl App {
                         ),
                     }
                 }
+                Confirm::ReopenEncoding(_, encoding, name) => {
+                    format!("{name} has unsaved changes. Discard them and reopen with {}?", encoding.label())
+                }
                 Confirm::SwitchWorkspace(_) => "Discard unsaved changes and open the folder?".into(),
                 Confirm::CloseFolder => "Discard unsaved changes and close the folder?".into(),
                 Confirm::Quit => {
@@ -3476,12 +3698,15 @@ impl App {
                     };
                     format!("{} {files} in {path}/?", if *stage { "Stage" } else { "Unstage" })
                 }
+                Confirm::DropStash(entry) => format!("Drop {}?\nThis cannot be undone.", entry.title()),
             };
             let button = match c {
                 Confirm::StageFolder(_, _, true) => "Stage",
                 Confirm::StageFolder(_, _, false) => "Unstage",
                 Confirm::Quit => "Quit without saving",
+                Confirm::DropStash(_) => "Drop",
                 Confirm::CloseTabs(_)
+                | Confirm::ReopenEncoding(..)
                 | Confirm::SwitchWorkspace(_)
                 | Confirm::CloseFolder
                 | Confirm::Discard(_)
@@ -3504,6 +3729,7 @@ impl App {
                 if yes {
                     match c {
                         Confirm::CloseTabs(idx) => self.close_tabs(idx, true),
+                        Confirm::ReopenEncoding(id, encoding, _) => self.start_reopen_with_encoding(id, encoding),
                         Confirm::SwitchWorkspace(root) => self.restore_workspace(Some(root), None),
                         Confirm::CloseFolder => self.close_folder(true),
                         Confirm::Discard(f) => {
@@ -3519,6 +3745,7 @@ impl App {
                             }
                         }
                         Confirm::StageFolder(path, _, stage) => self.stage_change(Some(path), stage),
+                        Confirm::DropStash(entry) => self.run_stash_action(*entry, vcs::StashAction::Drop),
                         Confirm::Quit => {
                             self.quit_confirmed = true;
                             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -3573,7 +3800,13 @@ impl eframe::App for App {
             self.title = title;
         }
 
-        egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
+        let status = egui::Panel::bottom("status");
+        let status = if self.colors_window(ui) {
+            status.frame(egui::Frame::side_top_panel(ui.style()).fill(ui.visuals().extreme_bg_color))
+        } else {
+            status
+        };
+        status.show(ui, |ui| self.status_bar(ui));
         egui::Panel::left("activity")
             .resizable(false)
             .exact_size(44.0)
@@ -3735,7 +3968,7 @@ fn editor(
     diags: &[(usize, usize, usize, usize, Color32, String)],
     find_marks: &[std::ops::Range<usize>],
     pane: u8,
-    line_bg: &[(usize, Color32)],
+    diff_marks: Option<LiveDiffMarks<'_>>,
     global_marks: &[std::ops::Range<usize>],
     highlights: &[editor::highlights::Highlight],
 ) -> EditorOut {
@@ -3766,6 +3999,7 @@ fn editor(
         sticky_scroll: settings.sticky_scroll && pane != 3,
         sticky_control_flow: settings.sticky_control_flow,
         sticky_line: settings.header_lines,
+        wrap: settings.word_wrap,
         sticky_shown: settings.sticky_shown,
         navigation_menu: pane != 3,
         read_only: false,
@@ -3798,10 +4032,16 @@ fn editor(
     let dark = ui.visuals().dark_mode;
     let gutter_marks: Vec<(usize, Color32, bool)> = doc
         .markers
-        .lines
+        .lines(doc.version)
         .iter()
+        .filter(|_| pane != 3)
         .map(|&(l, c)| (l, gutter::color(c, dark), c == gutter::Change::Deleted))
         .collect();
+    let decorations = diff_marks.unwrap_or(LiveDiffMarks {
+        line_bg: &[],
+        gutter: &gutter_marks,
+        button: None,
+    });
     let semantic = if opts.highlight && settings.semantic_highlighting {
         doc.lsp.align(&doc.text, doc.version);
         doc.lsp.token_lines()
@@ -3813,8 +4053,9 @@ fn editor(
         squiggles: &squiggles,
         marks: &marks,
         global_marks,
-        gutter: &gutter_marks,
-        line_bg,
+        gutter: decorations.gutter,
+        gutter_button: decorations.button,
+        line_bg: decorations.line_bg,
         symbol_marks: doc.lsp.marks_for(doc.version),
         semantic,
         highlights,
@@ -3841,6 +4082,7 @@ fn editor(
         (b, pos, (!message.is_empty()).then_some(message))
     });
     EditorOut {
+        gutter_click: out.gutter_click.map(|(line, deleted, rect)| (line, deleted, rect, id)),
         goto: out.goto.map(|b| ix.byte_to_char(&doc.text, b)),
         context_command: out.context_command,
         hover,
@@ -3945,6 +4187,7 @@ fn large_view(ui: &mut egui::Ui, v: &mut crate::large::Viewer) {
 
 /// What the editor reports back to the app each frame.
 pub(super) struct EditorOut {
+    gutter_click: Option<gutter::Click>,
     /// Cmd/Ctrl+click: go to the definition at this char index.
     goto: Option<usize>,
     context_command: Option<Command>,
@@ -4026,7 +4269,7 @@ fn icon_button(ui: &mut egui::Ui, icon: &str) -> egui::Response {
     ui.add(egui::Button::new(RichText::new(icon).size(15.0)).frame(false))
 }
 
-fn badge(ui: &egui::Ui, rect: egui::Rect, n: usize) {
+fn badge(ui: &egui::Ui, rect: egui::Rect, n: usize, color_window: bool) {
     let text = if n > 99 { "99+".to_string() } else { n.to_string() };
     let center = rect.right_bottom() - egui::vec2(8.0, 8.0);
     ui.painter().circle_filled(center, 8.0, ui.visuals().selection.bg_fill);
@@ -4035,7 +4278,11 @@ fn badge(ui: &egui::Ui, rect: egui::Rect, n: usize) {
         egui::Align2::CENTER_CENTER,
         text,
         egui::FontId::proportional(10.0),
-        Color32::WHITE,
+        if color_window {
+            ui.visuals().selection.stroke.color
+        } else {
+            Color32::WHITE
+        },
     );
 }
 
@@ -4068,20 +4315,13 @@ fn diff_navigation(ui: &mut egui::Ui, d: &mut DiffTab) {
     if !d.inline && !d.blocks.is_empty() {
         ui.separator();
         let n = d.blocks.len();
-        let current = d.blocks.iter().rposition(|&b| b <= d.top_row + 3).unwrap_or(0);
         if icon_button(ui, ic::ARROW_UP).on_hover_text("Previous change").clicked() {
-            d.jump = d
-                .blocks
-                .iter()
-                .rev()
-                .find(|&&b| b + 3 < d.top_row + 3)
-                .copied()
-                .or(d.blocks.last().copied());
+            d.move_change(false);
         }
         if icon_button(ui, ic::ARROW_DOWN).on_hover_text("Next change").clicked() {
-            d.jump = d.blocks.iter().find(|&&b| b > d.top_row + 3).copied().or(d.blocks.first().copied());
+            d.move_change(true);
         }
-        ui.weak(format!("change {} of {n}", current + 1));
+        ui.weak(format!("change {} of {n}", d.current_change() + 1));
     }
     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
         ui.colored_label(diff_colors(ui.visuals().dark_mode).1, format!("−{}", d.removed));
@@ -4100,13 +4340,13 @@ fn painter_sel(ui: &egui::Ui, clip: egui::Rect, origin: egui::Pos2, x0: f32, x1:
     ui.painter_at(clip).rect_filled(band, 0.0, color);
 }
 
-fn side_by_side_view(ui: &mut egui::Ui, d: &mut DiffTab, palette: &crate::theme::Palette) {
+fn side_by_side_view(ui: &mut egui::Ui, d: &mut DiffTab, palette: &crate::theme::Palette, busy: bool) -> Option<crate::diff::Hunk> {
     use crate::diff::Kind;
     use egui::text::CCursor;
     if let Some(note) = &d.sbs.note {
         ui.add_space(20.0);
         ui.vertical_centered(|ui| ui.weak(note));
-        return;
+        return None;
     }
     let dark = ui.visuals().dark_mode;
     let a = if dark { 38 } else { 34 };
@@ -4131,7 +4371,8 @@ fn side_by_side_view(ui: &mut egui::Ui, d: &mut DiffTab, palette: &crate::theme:
 
     ui.spacing_mut().item_spacing.y = 0.0;
     let mut area = egui::ScrollArea::vertical().id_salt("sbs").auto_shrink([false, false]);
-    if let Some(row) = d.jump.take() {
+    let jump = d.jump.take();
+    if let Some(row) = jump {
         area = area.vertical_scroll_offset(row.saturating_sub(3) as f32 * row_h);
     }
     let mut widest = 0.0f32;
@@ -4140,6 +4381,14 @@ fn side_by_side_view(ui: &mut egui::Ui, d: &mut DiffTab, palette: &crate::theme:
     let focus_id = ui.make_persistent_id("sbs-selection");
     let (pressed, down, pointer) = ui.input(|i| (i.pointer.primary_pressed(), i.pointer.primary_down(), i.pointer.interact_pos()));
     let mut sel = d.sel;
+    let mut action = None;
+    let hunk_button = d.hunk_snapshot.as_ref().and_then(|_| d.source.git_hunks()).map(|(_, staged)| {
+        if staged {
+            (ic::MINUS, "Unstage hunk")
+        } else {
+            (ic::PLUS, "Stage hunk")
+        }
+    });
     let sel_color = ui.visuals().selection.bg_fill.gamma_multiply(0.6);
     let out = area.show_rows(ui, row_h, d.sbs.rows.len(), |ui, range| {
         let full = ui.available_width();
@@ -4159,6 +4408,12 @@ fn side_by_side_view(ui: &mut egui::Ui, d: &mut DiffTab, palette: &crate::theme:
                 );
                 continue;
             }
+            let button = hunk_button
+                .and_then(|label| d.blocks.binary_search(&index).ok().map(|block| (block, label)))
+                .map(|(block, label)| {
+                    let button_rect = egui::Rect::from_min_size(egui::pos2(rect.right() - 24.0, rect.top()), egui::vec2(24.0, row_h));
+                    (block, label, button_rect)
+                });
             for (side, is_left) in [(&row.left, true), (&row.right, false)] {
                 let half = if is_left {
                     egui::Rect::from_min_size(rect.min, egui::vec2(half_w, row_h))
@@ -4212,11 +4467,16 @@ fn side_by_side_view(ui: &mut egui::Ui, d: &mut DiffTab, palette: &crate::theme:
                 push(&mut job, pos..side.text.len(), plain, false);
                 let galley = ui.fonts_mut(|f| f.layout_job(job));
                 widest = widest.max(galley.size().x);
-                let text_clip = egui::Rect::from_min_max(egui::pos2(half.left() + gutter, half.top()), half.max);
+                let mut text_clip = text_clip_of(half, gutter);
+                if !is_left && let Some((_, _, button_rect)) = button {
+                    text_clip.max.x = text_clip.max.x.min(button_rect.min.x);
+                }
                 let painter = ui.painter_at(text_clip);
                 let origin = egui::pos2(half.left() + gutter - d.hscroll, half.center().y - galley.size().y / 2.0);
                 // Pointer on this side's text: start or extend the selection.
-                if let Some(p) = pointer.filter(|p| half.contains(*p) && ui.is_rect_visible(half)) {
+                if let Some(p) =
+                    pointer.filter(|p| half.contains(*p) && button.is_none_or(|(_, _, r)| !r.contains(*p)) && ui.is_rect_visible(half))
+                {
                     let at = (index, galley.cursor_from_pos(p - origin).index.0);
                     if pressed {
                         sel = Some((is_left, at, at));
@@ -4248,9 +4508,30 @@ fn side_by_side_view(ui: &mut egui::Ui, d: &mut DiffTab, palette: &crate::theme:
                 rect.y_range(),
                 egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
             );
+            if let Some((block, (icon, label), button_rect)) = button {
+                let mut builder = egui::UiBuilder::new()
+                    .id_salt(("hunk", block))
+                    .max_rect(button_rect)
+                    .layout(egui::Layout::centered_and_justified(egui::Direction::TopDown));
+                if busy {
+                    builder = builder.disabled();
+                }
+                if ui
+                    .new_child(builder)
+                    .add(egui::Button::new(icon).small().min_size(button_rect.size()))
+                    .on_hover_text(label)
+                    .clicked()
+                {
+                    action = Some(block);
+                }
+            }
         }
     });
-    d.top_row = (out.state.clamped_offset().y / row_h) as usize;
+    let top_row = (out.state.clamped_offset().y / row_h) as usize;
+    if top_row != d.top_row && jump.is_none() {
+        d.change_cursor = None;
+    }
+    d.top_row = top_row;
     // Ctrl/Cmd+C copies the selected lines of that side.
     if let Some((left, a, b)) = sel
         && a != b
@@ -4282,6 +4563,7 @@ fn side_by_side_view(ui: &mut egui::Ui, d: &mut DiffTab, palette: &crate::theme:
         let max = (widest - (half_w - gutter) + 20.0).max(0.0);
         d.hscroll = (d.hscroll - dx).clamp(0.0, max);
     }
+    action.map(|block| d.sbs.blocks[block].1.clone())
 }
 
 enum RowAction {
@@ -4597,6 +4879,7 @@ fn save_recent(list: &[PathBuf]) {
 struct DiskText {
     text: String,
     crlf: bool,
+    encoding: Encoding,
     raw_crlf: Option<Arc<str>>,
 }
 
@@ -4663,16 +4946,7 @@ fn disk_vs_editor(path: &Path, disk: &str, editor: &str, ignore_eol: bool) -> (S
 }
 
 fn read_doc_text(path: &Path) -> std::io::Result<Option<DiskText>> {
-    let bytes = std::fs::read(path)?;
-    Ok((!crate::hex::is_binary(&bytes[..bytes.len().min(8000)])).then(|| {
-        let text = String::from_utf8_lossy(&bytes);
-        let crlf = text.contains("\r\n");
-        DiskText {
-            raw_crlf: crlf.then(|| Arc::from(text.as_ref())),
-            text: if crlf { text.replace("\r\n", "\n") } else { text.into_owned() },
-            crlf,
-        }
-    }))
+    file_open::read_disk_text(path, None)
 }
 
 fn read_dir_sorted(dir: &Path) -> DirEntries {
@@ -4932,6 +5206,22 @@ mod tests {
                 .0
                 .contains("No newline at end of file")
         );
+    }
+
+    #[test]
+    fn side_by_side_selection_uses_lines_from_the_selected_side() {
+        let mut tab = super::DiffTab::new(
+            "test".into(),
+            "file.txt".into(),
+            "@@ -1,3 +1 @@\n-one\n-two\n same\n",
+            super::DiffSource::Commit,
+            false,
+            false,
+        );
+        tab.sel = Some((true, (1, 0), (2, 0)));
+        assert_eq!(tab.selected_hunk(), Some(crate::diff::Hunk { old: 1..2, new: 0..0 }));
+        tab.sel = Some((true, (0, 0), (2, 0)));
+        assert_eq!(tab.selected_hunk(), Some(crate::diff::Hunk { old: 0..2, new: 0..0 }));
     }
 
     #[test]

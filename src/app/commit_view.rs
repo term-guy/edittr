@@ -20,6 +20,7 @@ struct Change {
 struct Files {
     changes: Vec<Change>,
     svn_url: Option<url::Url>,
+    untracked: Option<(usize, String)>,
     rows: Vec<Row>,
     visible: Vec<usize>,
     selected: Option<usize>,
@@ -37,6 +38,7 @@ impl Files {
         Self {
             changes,
             svn_url,
+            untracked: None,
             rows,
             visible,
             selected,
@@ -160,19 +162,31 @@ impl CommitView {
         self.files = None;
     }
 
-    pub(super) fn poll(&mut self) {
+    pub(super) fn poll(&mut self) -> Option<String> {
+        let mut error = None;
         if let Some((hash, files)) = receive(&mut self.list_rx)
             && hash == self.hash
         {
+            error = files.as_ref().err().cloned();
             self.files = Some(files);
         }
         if let Some(diff) = receive(&mut self.diff_rx) {
+            error = diff.1.as_ref().err().cloned().or(error);
             self.diffs.push_front(diff);
             self.diffs.truncate(24);
         }
+        error
     }
 
     pub(super) fn show(&mut self, ui: &mut egui::Ui, commit: &Commit, root: &Path, vcs: Vcs, palette: &crate::theme::Palette) {
+        self.show_detail(ui, commit, root, vcs, false, palette);
+    }
+
+    pub(super) fn show_stash(&mut self, ui: &mut egui::Ui, commit: &Commit, root: &Path, palette: &crate::theme::Palette) {
+        self.show_detail(ui, commit, root, Vcs::Git, true, palette);
+    }
+
+    fn show_detail(&mut self, ui: &mut egui::Ui, commit: &Commit, root: &Path, vcs: Vcs, stash: bool, palette: &crate::theme::Palette) {
         if self.hash != commit.hash {
             self.clear_selection();
             self.hash.clone_from(&commit.hash);
@@ -194,8 +208,12 @@ impl CommitView {
             ui.colored_label(secondary_text_color(ui.visuals()), "Loading changed files…");
             if self.list_rx.is_none() {
                 let (root, hash, parent) = (root.to_owned(), commit.hash.clone(), commit.parents.first().cloned());
+                let untracked = commit.parents.get(2).filter(|_| stash).cloned();
                 self.list_rx = Some(background(ui.ctx(), move || {
-                    let files = load_files(&root, vcs, &hash, parent.as_deref());
+                    let files = match untracked {
+                        Some(untracked) => load_stash_files(&root, &hash, parent.as_deref(), untracked),
+                        None => load_files(&root, vcs, &hash, parent.as_deref()),
+                    };
                     (hash, files)
                 }));
             }
@@ -229,7 +247,11 @@ impl CommitView {
         let Some(Ok(files)) = &self.files else { return };
         let Some(index) = files.selected else { return };
         let change = &files.changes[index];
-        let key = (self.hash.as_str(), change.path.as_str());
+        let (hash, parent) = match &files.untracked {
+            Some((start, hash)) if index >= *start => (hash.as_str(), None),
+            _ => (self.hash.as_str(), commit.parents.first().map(String::as_str)),
+        };
+        let key = (hash, change.path.as_str());
         let cached = self.diffs.iter().position(|(k, _)| (k.0.as_str(), k.1.as_str()) == key);
         if let Some(cached) = cached
             && cached != 0
@@ -258,7 +280,7 @@ impl CommitView {
                         if self.inline {
                             diff_view(ui, &diff.lines, "commit_patch");
                         } else {
-                            side_by_side_view(ui, diff, palette);
+                            side_by_side_view(ui, diff, palette, false);
                         }
                     });
                 }
@@ -272,7 +294,7 @@ impl CommitView {
         } else {
             ui.colored_label(secondary_text_color(ui.visuals()), "Loading file changes…");
             if self.diff_rx.is_none() {
-                let (root, hash, parent) = (root.to_owned(), commit.hash.clone(), commit.parents.first().cloned());
+                let (root, hash, parent) = (root.to_owned(), hash.to_owned(), parent.map(str::to_owned));
                 let (change, svn_url) = (change.clone(), files.svn_url.clone());
                 self.diff_rx = Some(background(ui.ctx(), move || {
                     let diff = load_diff(&root, svn_url, &hash, parent.as_deref(), &change).map(|patch| {
@@ -375,6 +397,16 @@ fn load_files(root: &Path, vcs: Vcs, hash: &str, parent: Option<&str>) -> Loaded
             Ok(Files::new(changes.collect(), Some(url)))
         }
     }
+}
+
+fn load_stash_files(root: &Path, hash: &str, parent: Option<&str>, untracked: String) -> LoadedFiles {
+    let options = ["--name-status", "-z"];
+    let mut changes = git_changes(&git_patch(root, hash, parent, &options, &[])?)?;
+    let start = changes.len();
+    changes.extend(git_changes(&git_patch(root, &untracked, None, &options, &[])?)?);
+    let mut files = Files::new(changes, None);
+    files.untracked = Some((start, untracked));
+    Ok(files)
 }
 
 fn load_diff(root: &Path, svn_url: Option<url::Url>, hash: &str, parent: Option<&str>, change: &Change) -> Result<String, String> {
@@ -495,6 +527,36 @@ pub(super) mod tests {
             assert!(!labels.iter().any(|(text, _)| *text == "file3999.txt"));
             assert!(labels.iter().any(|(text, _)| text.contains("Commit body")));
         }
+    }
+
+    #[test]
+    fn stash_details_include_tracked_and_untracked_patches() {
+        let dir = TestDir::new();
+        let git = |args: &[&str]| git::run(&dir.0, args).unwrap();
+        git(&["init", "-b", "main"]);
+        git(&["config", "user.name", "Test Author"]);
+        git(&["config", "user.email", "author@example.invalid"]);
+        git(&["config", "core.hooksPath", ".git/test-hooks"]);
+        fs::write(dir.0.join("tracked.txt"), "base\n").unwrap();
+        git(&["add", "tracked.txt"]);
+        git(&["-c", "commit.gpgsign=false", "commit", "-m", "Initial"]);
+        fs::write(dir.0.join("tracked.txt"), "tracked change\n").unwrap();
+        fs::write(dir.0.join("[literal].txt"), "untracked content\n").unwrap();
+        Vcs::Git.stash_push(&dir.0, "Test diff", true).unwrap();
+
+        let commit = Vcs::Git.stashes(&dir.0).unwrap().remove(0).commit;
+        let parent = Some(commit.parents[0].as_str());
+        let files = load_stash_files(&dir.0, &commit.hash, parent, commit.parents[2].clone()).unwrap();
+        let (start, untracked) = files.untracked.unwrap();
+        assert_eq!(start, 1);
+        assert_eq!(files.changes[0].path, "tracked.txt");
+        assert_eq!(files.changes[0].code, 'M');
+        assert_eq!(files.changes[1].path, "[literal].txt");
+        assert_eq!(files.changes[1].code, 'A');
+        let tracked_patch = load_diff(&dir.0, None, &commit.hash, parent, &files.changes[0]).unwrap();
+        assert!(tracked_patch.contains("-base\n+tracked change"));
+        let untracked_patch = load_diff(&dir.0, None, &untracked, None, &files.changes[1]).unwrap();
+        assert!(untracked_patch.contains("+untracked content"));
     }
 
     #[test]

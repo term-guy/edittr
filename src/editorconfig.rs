@@ -2,6 +2,7 @@
 use regex::Regex;
 use std::collections::HashMap;
 use std::fs;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
@@ -40,30 +41,60 @@ impl Properties {
         }
     }
 
-    pub(crate) fn transform(&self, mut text: String) -> String {
-        const BOM: char = '\u{feff}';
-        if self.get("charset") == Some("utf-8") && text.starts_with(BOM) {
-            text.drain(..BOM.len_utf8());
-        }
-        if text.contains("\r\n") {
-            text = text.replace("\r\n", "\n");
-        }
-        if self.get("trim_trailing_whitespace") == Some("true") {
-            let mut trimmed = String::with_capacity(text.len());
-            for line in text.split_inclusive('\n') {
-                trimmed.push_str(line.trim_end_matches(char::is_whitespace));
-                if line.ends_with('\n') {
-                    trimmed.push('\n');
+    pub(crate) fn whitespace_edits(
+        &self,
+        path: &Path,
+        text: &str,
+        trim_on_save: bool,
+        newline_on_save: bool,
+    ) -> Vec<(Range<usize>, String)> {
+        let trim = self.boolean("trim_trailing_whitespace").unwrap_or(trim_on_save);
+        let final_newline = self.boolean("insert_final_newline");
+        let markdown = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("md"));
+        let mut edits = Vec::new();
+        let mut offset = 0;
+        let mut last_content = 0;
+        let mut end = text.len();
+        if trim {
+            for row in text.split_inclusive('\n') {
+                let line = row.strip_suffix('\n').unwrap_or(row);
+                let content = line.trim_end_matches(char::is_whitespace);
+                let keep = if markdown && !content.is_empty() && line.ends_with("  ") {
+                    2
+                } else {
+                    0
+                };
+                let end_of_content = offset + content.len();
+                let end_of_line = offset + line.len();
+                let trim_end = end_of_line - keep;
+                if !content.is_empty() {
+                    last_content = if keep > 0 { end_of_line } else { end_of_content };
                 }
+                if end_of_content < trim_end {
+                    edits.push((end_of_content..trim_end, String::new()));
+                }
+                offset += row.len();
+                end = if row.ends_with('\n') || keep > 0 { offset } else { end_of_content };
             }
-            text = trimmed;
         }
-        match self.get("insert_final_newline") {
-            Some("true") if !text.is_empty() && !text.ends_with('\n') => text.push('\n'),
-            Some("false") => text.truncate(text.trim_end_matches('\n').len()),
-            _ => {}
+        if final_newline == Some(false) {
+            // EditorConfig can explicitly request removal of the final newline.
+            let boundary = if trim { last_content } else { text.trim_end_matches('\n').len() };
+            if boundary < text.len() {
+                edits.retain(|(range, _)| range.start < boundary);
+                edits.push((boundary..text.len(), String::new()));
+            }
+        } else if final_newline.unwrap_or(newline_on_save) && end > 0 && text.as_bytes()[end - 1] != b'\n' {
+            edits.push((text.len()..text.len(), "\n".into()));
         }
-        text
+        edits
+    }
+
+    fn boolean(&self, key: &str) -> Option<bool> {
+        self.get(key)?.parse().ok()
     }
 
     pub(crate) fn crlf(&self, original_crlf: bool) -> bool {
@@ -395,16 +426,28 @@ mod tests {
     }
 
     #[test]
-    fn transforms_whitespace_and_preserves_original_crlf() {
+    fn whitespace_settings_and_overrides_preserve_markdown_hard_breaks() {
         let mut properties = Properties::default();
-        let config = Config::parse("[*]\ntrim_trailing_whitespace=true\ninsert_final_newline=true\nend_of_line=lf\ncharset=utf-8");
-        config.apply("test.txt", &mut properties);
-        assert_eq!(properties.transform("\u{feff}hi \t\r\n  \r\nbye\t".into()), "hi\n\nbye\n");
-        assert_eq!(properties.transform(String::new()), "");
-        assert!(properties.crlf(true));
-        assert!(!properties.crlf(false));
-        Config::parse("[*]\ninsert_final_newline=false").apply("test.txt", &mut properties);
-        assert_eq!(properties.transform("hi \n\n".into()), "hi");
-        assert_eq!(Properties::default().transform("hi  \n\n".into()), "hi  \n\n");
+        let apply = |properties: &Properties, path: &str, text: &str, trim, newline| {
+            let mut result = text.to_owned();
+            for (range, replacement) in properties.whitespace_edits(Path::new(path), text, trim, newline).into_iter().rev() {
+                result.replace_range(range, &replacement);
+            }
+            result
+        };
+        assert_eq!(
+            apply(&properties, "note.MD", "café   \n  \nsecond\t", true, true),
+            "café  \n\nsecond\n"
+        );
+        assert_eq!(apply(&properties, "note.txt", "café   \nsecond\t", true, true), "café\nsecond\n");
+        assert_eq!(apply(&properties, "note.txt", "line\n\n", false, false), "line\n\n");
+        assert_eq!(apply(&properties, "note.txt", "line\n  ", true, true), "line\n");
+        assert_eq!(apply(&properties, "note.txt", "", true, true), "");
+        Config::parse("[*]\ntrim_trailing_whitespace=false\ninsert_final_newline=false").apply("note.txt", &mut properties);
+        assert_eq!(apply(&properties, "note.txt", "line \n\n", true, true), "line ");
+        Config::parse("[*]\ntrim_trailing_whitespace=true\ninsert_final_newline=true").apply("note.txt", &mut properties);
+        assert_eq!(apply(&properties, "note.txt", "line ", false, false), "line\n");
+        Config::parse("[*]\ninsert_final_newline=false").apply("note.txt", &mut properties);
+        assert_eq!(apply(&properties, "note.txt", "line \n  \n", false, false), "line");
     }
 }

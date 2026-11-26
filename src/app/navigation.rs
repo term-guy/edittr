@@ -1,5 +1,6 @@
 use super::{App, Side, Tab, VcsOperation, background, fuzzy_filter, project_files, receive};
 use crate::commands::{self, COMMANDS, Command};
+use crate::vcs::{Stash, Vcs};
 use crate::{symbols, workspace};
 use eframe::egui::{self, Key, Modifiers};
 use std::path::Path;
@@ -13,16 +14,20 @@ const DEBOUNCE: Duration = Duration::from_millis(150);
 #[derive(Clone, Copy)]
 enum Mode {
     Commands,
+    Bookmarks,
     Document { id: u64, version: u64 },
     Workspace,
+    Stashes(Command),
 }
 
 impl Mode {
     fn title(self) -> &'static str {
         match self {
             Self::Commands => commands::entry(Command::Palette).title,
+            Self::Bookmarks => commands::entry(Command::Bookmarks).title,
             Self::Document { .. } => commands::entry(Command::DocumentSymbols).title,
             Self::Workspace => commands::entry(Command::WorkspaceSymbols).title,
+            Self::Stashes(command) => commands::entry(command).title,
         }
     }
 }
@@ -30,6 +35,7 @@ impl Mode {
 enum Action {
     Command(Command),
     Symbol(symbols::Symbol),
+    Stash(Command, Stash),
 }
 
 struct Row {
@@ -211,7 +217,7 @@ impl Picker {
 
 impl App {
     pub(super) fn shortcuts(&mut self, ctx: &egui::Context) {
-        if self.search_replace.confirming() || self.deletion.is_some() || self.renaming.is_some() {
+        if self.search_replace.confirming() || self.deletion.is_some() || self.renaming.is_some() || self.stash_dialog_open() {
             return;
         }
         // Mouse back / forward buttons.
@@ -227,7 +233,10 @@ impl App {
         if forward {
             self.run_command(Command::GoForward);
         }
-        for command in commands::dispatch_order().iter().filter(|c| c.id != Command::Commit) {
+        for command in commands::dispatch_order()
+            .iter()
+            .filter(|c| c.id != Command::Commit && c.dispatches())
+        {
             if command.id == Command::SwitchSourceHeader && !ctx.input(|input| input.key_pressed(Key::O) && self.can_switch_source_header())
             {
                 continue;
@@ -297,6 +306,17 @@ impl App {
                 self.side = Side::Changes;
                 self.side_open = true;
             }
+            Command::StashChanges => self.prompt_stash_changes(),
+            Command::ShowStashes => self.reveal_stashes(),
+            Command::StashEntry(_) | Command::ViewStash => self.start_picker(cmd),
+            Command::NextChange
+            | Command::PreviousChange
+            | Command::StageHunk
+            | Command::UnstageHunk
+            | Command::RevertHunk
+            | Command::StageSelectedLines
+            | Command::UnstageSelectedLines
+            | Command::RevertSelectedLines => self.hunk_command(cmd),
             Command::History => {
                 if self.repository().is_some() {
                     self.open_graph();
@@ -333,6 +353,18 @@ impl App {
                 }
             }
             Command::Save => self.save_active(),
+            Command::ReopenWithEncoding(encoding) => {
+                let index = self.live_diff_doc(self.active).unwrap_or(self.active);
+                self.reopen_with_encoding(index, encoding);
+            }
+            Command::SaveWithEncoding(encoding) => {
+                let index = self.live_diff_doc(self.active).unwrap_or(self.active);
+                self.save_with_encoding(index, encoding);
+            }
+            Command::ChangeLineEndings(crlf) => {
+                let index = self.live_diff_doc(self.active).unwrap_or(self.active);
+                self.change_line_endings(index, crlf);
+            }
             Command::SaveAs => {
                 let index = self.live_diff_doc(self.active).unwrap_or(self.active);
                 self.request_save_as(index);
@@ -361,6 +393,17 @@ impl App {
             }
 
             Command::TabSize(n) => self.set_tab_size(n),
+            Command::Editor(action) => {
+                if let Some(Tab::File(doc)) = self.tabs.get_mut(self.active) {
+                    if doc.ed.run(&mut doc.text, &mut doc.version, action) {
+                        doc.edited_at = Some(Instant::now());
+                    }
+                } else {
+                    self.message = "Open a file first".into();
+                }
+            }
+            Command::AffixLines => self.open_affix(),
+            Command::Bookmarks => self.start_picker(Command::Bookmarks),
             Command::ToggleStickyKind(kind) => {
                 self.settings.sticky_shown.toggle(kind);
                 self.save_settings(&self.ctx.clone());
@@ -369,8 +412,10 @@ impl App {
                 let value = setting.value(&mut self.settings);
                 *value = !*value;
                 self.save_settings(&self.ctx.clone());
-                if setting == commands::Setting::DiffIgnoreEol {
-                    self.refresh_diff();
+                match setting {
+                    commands::Setting::ColorWindow => self.settings.themes.apply(&self.ctx, self.settings.color_window),
+                    commands::Setting::DiffIgnoreEol => self.refresh_diff(),
+                    _ => {}
                 }
             }
         }
@@ -396,6 +441,14 @@ impl App {
                 picker.set_rows(
                     COMMANDS
                         .iter()
+                        .filter(|entry| !entry.id.is_stash() || self.vcs == Some(Vcs::Git))
+                        .filter(|entry| {
+                            self.vcs != Some(crate::vcs::Vcs::Svn)
+                                || !matches!(
+                                    entry.id,
+                                    Command::StageHunk | Command::UnstageHunk | Command::StageSelectedLines | Command::UnstageSelectedLines
+                                )
+                        })
                         .map(|entry| Row {
                             title: entry.title.to_owned(),
                             detail: entry.shortcut_text(&self.ctx),
@@ -403,6 +456,47 @@ impl App {
                         })
                         .collect(),
                 );
+                picker
+            }
+            Command::Bookmarks => {
+                let mut picker = Picker::new(Mode::Bookmarks);
+                let root = self.root.clone();
+                let mut rows = Vec::new();
+                for tab in &mut self.tabs {
+                    let Tab::File(doc) = tab else { continue };
+                    let path = doc.path.clone();
+                    let shown = root
+                        .as_deref()
+                        .and_then(|root| workspace::relative_path(root, &path))
+                        .unwrap_or_else(|| path.display().to_string());
+                    for line in doc.ed.bookmark_lines(&doc.text, doc.version) {
+                        let ix = doc.ed.index(&doc.text, doc.version);
+                        let text = doc.text[ix.line_range(&doc.text, line)].trim().to_string();
+                        rows.push(Row {
+                            title: if text.is_empty() { format!("Line {}", line + 1) } else { text },
+                            detail: format!("{shown}:{}", line + 1),
+                            action: Action::Symbol(symbols::Symbol {
+                                name: String::new(),
+                                kind: "bookmark".into(),
+                                detail: None,
+                                container: None,
+                                path: path.clone(),
+                                line,
+                                cols: (0..0).into(),
+                                lines: line..=line,
+                                children: Vec::new(),
+                            }),
+                        });
+                    }
+                }
+                if rows.is_empty() {
+                    self.message = format!(
+                        "No bookmarks: add one with {}",
+                        commands::entry(Command::Editor(crate::editor::Action::ToggleBookmark)).shortcut_text(&self.ctx)
+                    );
+                    return;
+                }
+                picker.set_rows(rows);
                 picker
             }
             Command::DocumentSymbols => {
@@ -435,6 +529,25 @@ impl App {
                 }
                 Picker::new(Mode::Workspace)
             }
+            Command::StashEntry(_) | Command::ViewStash if self.vcs == Some(Vcs::Git) => {
+                if self.stash.entries.is_empty() {
+                    self.message = "No stashes to select".into();
+                    return;
+                }
+                let mut picker = Picker::new(Mode::Stashes(cmd));
+                picker.set_rows(
+                    self.stash
+                        .entries
+                        .iter()
+                        .map(|stash| Row {
+                            title: stash.title(),
+                            detail: stash.commit.date.clone(),
+                            action: Action::Stash(cmd, stash.clone()),
+                        })
+                        .collect(),
+                );
+                picker
+            }
             _ => return,
         };
         picker.previous_focus = match &self.picker {
@@ -444,6 +557,16 @@ impl App {
         self.quick_open = None;
         self.picker = Some(picker);
         self.ctx.request_repaint();
+    }
+
+    pub(super) fn clear_stash_picker(&mut self) {
+        if self
+            .picker
+            .as_ref()
+            .is_some_and(|picker| matches!(picker.mode, Mode::Commands | Mode::Stashes(_)))
+        {
+            self.picker = None;
+        }
     }
 
     pub(super) fn refresh_workspace_symbols(&mut self) {
@@ -499,6 +622,7 @@ impl App {
             match picker.rows.swap_remove(index).action {
                 Action::Command(cmd) => self.run_command(cmd),
                 Action::Symbol(symbol) => self.reveal_symbol(picker.mode, symbol),
+                Action::Stash(command, stash) => self.select_stash(command, stash),
             }
         }
     }

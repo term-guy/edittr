@@ -1,6 +1,6 @@
 //! Editor palettes share color roles across syntax grammars, language servers and the widget.
 
-use eframe::egui::{Color32, Theme, ThemePreference};
+use eframe::egui::{Color32, Context, Stroke, Theme, ThemePreference, Visuals};
 use std::fmt::Write as _;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -331,6 +331,62 @@ impl Palette {
         self.preset().legacy && self.overrides[part as usize].is_none()
     }
 
+    pub(crate) fn colors_window(&self, enabled: bool) -> bool {
+        enabled && !self.preset().legacy
+    }
+
+    fn window_visuals(&self, enabled: bool) -> Visuals {
+        let mut visuals = self.preset().base.default_visuals();
+        if !self.colors_window(enabled) {
+            return visuals;
+        }
+
+        let background = visuals.panel_fill.blend(self.color(Background));
+        let foreground = background.blend(self.color(Foreground));
+        let line_number = background.blend(self.color(LineNumber));
+        let shade = |amount| background.lerp_to_gamma(line_number, amount);
+        let extreme = if visuals.dark_mode { Color32::BLACK } else { Color32::WHITE };
+        visuals.panel_fill = shade(0.08);
+        visuals.window_fill = shade(0.14);
+        visuals.faint_bg_color = shade(0.18);
+        visuals.extreme_bg_color = background.lerp_to_gamma(extreme, 0.25);
+        visuals.code_bg_color = shade(0.22);
+        visuals.weak_text_color = Some(foreground.lerp_to_gamma(background, 0.18));
+
+        let keyword = self.color(Keyword).to_opaque();
+        let function = self.color(Function).to_opaque();
+        let accent = [keyword, function]
+            .into_iter()
+            .max_by_key(|c| {
+                let max_rg = c.r().max(c.g());
+                (c.b().saturating_sub(max_rg), c.b().max(max_rg) - c.r().min(c.g()).min(c.b()))
+            })
+            .unwrap_or(keyword);
+        let accent = readable_accent(accent, shade(0.26));
+        let divider = Stroke::new(1.0, shade(0.35));
+        visuals.window_stroke = divider;
+        visuals.hyperlink_color = accent;
+        visuals.text_cursor.stroke.color = accent;
+        visuals.selection.bg_fill = self.color(Selection);
+        // egui also paints selected text with this stroke.
+        visuals.selection.stroke.color = readable_accent(accent, visuals.panel_fill.blend(self.color(Selection)));
+
+        let widgets = &mut visuals.widgets;
+        for (widget, fill, stroke) in [
+            (&mut widgets.noninteractive, visuals.panel_fill, divider),
+            (&mut widgets.inactive, shade(0.20), Stroke::NONE),
+            (&mut widgets.hovered, shade(0.26), Stroke::new(1.0, shade(0.52))),
+            (&mut widgets.active, shade(0.24), Stroke::new(1.0, accent)),
+            (&mut widgets.open, shade(0.24), divider),
+        ] {
+            widget.bg_fill = fill;
+            widget.weak_bg_fill = fill;
+            widget.bg_stroke = stroke;
+            widget.fg_stroke.color = foreground;
+        }
+        visuals
+    }
+
     pub(crate) fn defaults(dark: bool) -> Self {
         let id = if dark { "edittr-dark" } else { "edittr-light" };
         Self::new(PRESETS.iter().position(|preset| preset.id == id).unwrap_or(0))
@@ -388,6 +444,14 @@ impl Default for Themes {
 }
 
 impl Themes {
+    pub(crate) fn apply(&self, ctx: &Context, color_window: bool) {
+        // System preference can switch styles as soon as egui receives the OS theme.
+        ctx.set_visuals_of(Theme::Dark, self.dark.window_visuals(color_window));
+        ctx.set_visuals_of(Theme::Light, self.light.window_visuals(color_window));
+        ctx.set_theme(self.preference);
+        ctx.request_repaint();
+    }
+
     pub(crate) fn active(&self, dark: bool) -> &Palette {
         if dark { &self.dark } else { &self.light }
     }
@@ -407,24 +471,109 @@ impl Themes {
     }
 }
 
+fn contrast(a: Color32, b: Color32) -> f32 {
+    let luminance = |color: Color32| {
+        let linear = |value: u8| {
+            let value = f32::from(value) / 255.0;
+            if value <= 0.04045 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * linear(color.r()) + 0.7152 * linear(color.g()) + 0.0722 * linear(color.b())
+    };
+    let (a, b) = (luminance(a), luminance(b));
+    (a.max(b) + 0.05) / (a.min(b) + 0.05)
+}
+
+fn readable_accent(accent: Color32, background: Color32) -> Color32 {
+    let endpoint = if contrast(Color32::WHITE, background) > contrast(Color32::BLACK, background) {
+        Color32::WHITE
+    } else {
+        Color32::BLACK
+    };
+    (0..10)
+        .map(|step| accent.lerp_to_gamma(endpoint, step as f32 / 10.0))
+        .find(|&color| contrast(color, background) >= 4.5)
+        .unwrap_or(endpoint)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn contrast(a: Color32, b: Color32) -> f32 {
-        let luminance = |c: Color32| {
-            let linear = |v: u8| {
-                let v = f32::from(v) / 255.0;
-                if v <= 0.039_28 {
-                    v / 12.92
-                } else {
-                    ((v + 0.055) / 1.055).powf(2.4)
-                }
+    #[test]
+    fn window_text_has_contrast_in_every_preset() {
+        for (i, preset) in PRESETS.iter().enumerate() {
+            let palette = Palette::new(i);
+            let visuals = palette.window_visuals(true);
+            let defaults = preset.base.default_visuals();
+            assert_eq!(palette.window_visuals(false), defaults);
+            if preset.legacy {
+                assert_eq!(visuals, defaults);
+                assert!(contrast(visuals.text_color(), visuals.panel_fill) >= 4.5);
+                continue;
+            }
+
+            let check = |role, text, fill| {
+                let ratio = contrast(text, fill);
+                assert!(ratio >= 4.5, "{}: {role} has {ratio:.2}:1 contrast over {fill:?}", preset.name);
             };
-            0.2126 * linear(c.r()) + 0.7152 * linear(c.g()) + 0.0722 * linear(c.b())
+            for fill in [
+                visuals.panel_fill,
+                visuals.window_fill,
+                visuals.faint_bg_color,
+                visuals.extreme_bg_color,
+                visuals.code_bg_color,
+                visuals.widgets.inactive.bg_fill,
+                visuals.widgets.hovered.bg_fill,
+                visuals.widgets.active.bg_fill,
+                visuals.widgets.open.bg_fill,
+            ] {
+                check("text", visuals.text_color(), fill);
+                check("weak text", visuals.weak_text_color(), fill);
+                check("link", visuals.hyperlink_color, fill);
+                check(
+                    "selected text",
+                    visuals.selection.stroke.color,
+                    fill.blend(visuals.selection.bg_fill),
+                );
+            }
+            assert_eq!(visuals.selection.bg_fill, palette.color(Selection));
+            assert_eq!(visuals.widgets.active.bg_stroke.color, visuals.hyperlink_color);
+        }
+    }
+
+    #[test]
+    fn window_visuals_follow_system_theme_preset_and_setting() {
+        let ctx = Context::default();
+        let mut themes = Themes::default();
+        themes.set_palette(Palette::parse("tidal-glass", Theme::Dark).unwrap());
+        themes.set_palette(Palette::parse("oat-paper", Theme::Light).unwrap());
+        let check = |system_theme, expected: &Visuals| {
+            let input = eframe::egui::RawInput {
+                system_theme: Some(system_theme),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| {
+                assert_eq!(ui.visuals(), expected);
+            });
+            out.textures_delta.clear();
         };
-        let (a, b) = (luminance(a), luminance(b));
-        (a.max(b) + 0.05) / (a.min(b) + 0.05)
+
+        themes.apply(&ctx, true);
+        check(Theme::Dark, &themes.dark.window_visuals(true));
+        check(Theme::Light, &themes.light.window_visuals(true));
+        themes.dark.set(Background, Color32::from_rgb(20, 35, 48));
+        themes.preference = ThemePreference::Dark;
+        themes.apply(&ctx, true);
+        check(Theme::Light, &themes.dark.window_visuals(true));
+        themes.apply(&ctx, false);
+        check(Theme::Light, &Visuals::dark());
+        themes.set_palette(Palette::defaults(true));
+        themes.apply(&ctx, true);
+        check(Theme::Light, &Visuals::dark());
     }
 
     #[test]

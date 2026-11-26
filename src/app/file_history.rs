@@ -28,7 +28,7 @@ impl Tab {
             Tab::Diff(diff) => Some(&diff.path),
             Tab::FileHistory(history) => Some(&history.path),
             Tab::Hex(view) => Some(&view.path),
-            Tab::Graph | Tab::Settings => None,
+            Tab::Graph | Tab::Stash(_) | Tab::Settings => None,
         }
     }
 }

@@ -5,6 +5,9 @@ use crate::diff::{FileDiff, unified_hunks};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+pub(crate) use hunks::{BufferBase, apply_diff_hunk, stage_buffer_hunk};
+mod hunks;
+
 pub(crate) fn cmd(repo: &Path) -> Command {
     let mut c = Command::new("git");
     c.current_dir(repo).env("GIT_TERMINAL_PROMPT", "0");
@@ -166,7 +169,14 @@ fn filter_crlf_hunks(patch: &str) -> String {
 }
 
 fn diff_patch(repo: &Path, change: &FileChange, staged: bool, ignore_eol: bool, context: &str) -> String {
-    let mut args = vec!["diff", "--no-color", context];
+    let mut args = vec![
+        "--literal-pathspecs",
+        "diff",
+        "--no-color",
+        "--no-ext-diff",
+        "--no-textconv",
+        context,
+    ];
     if ignore_eol {
         args.push("--ignore-cr-at-eol");
     }
@@ -238,6 +248,101 @@ pub fn commit(repo: &Path, msg: &str, amend: bool) -> Result<String, String> {
         args.push("--amend");
     }
     run(repo, &args)
+}
+
+#[derive(Clone)]
+pub struct Stash {
+    pub selector: String,
+    pub commit: Commit,
+}
+
+impl Stash {
+    pub fn title(&self) -> String {
+        format!("{}  {}", self.selector, self.commit.subject)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum StashAction {
+    Apply,
+    Pop,
+    Drop,
+}
+
+impl StashAction {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Apply => "Apply stash",
+            Self::Pop => "Pop stash",
+            Self::Drop => "Drop stash",
+        }
+    }
+}
+
+pub fn stashes(repo: &Path) -> Result<Vec<Stash>, String> {
+    let out = run(
+        repo,
+        &[
+            "stash",
+            "list",
+            "-z",
+            "--no-show-signature",
+            "--format=%gd%x00%H%x00%h%x00%P%x00%an%x00%as%x00%gs",
+        ],
+    )?;
+    let fields: Vec<_> = out.split_terminator('\0').collect();
+    let (entries, rest) = fields.as_chunks::<7>();
+    if !rest.is_empty() {
+        return Err("Invalid Git stash list".into());
+    }
+    Ok(entries
+        .iter()
+        .map(|&[selector, hash, short_hash, parents, author, date, subject]| Stash {
+            selector: selector.into(),
+            commit: Commit {
+                hash: hash.into(),
+                short_hash: short_hash.into(),
+                parents: parents.split_whitespace().map(str::to_string).collect(),
+                author: author.into(),
+                date: date.into(),
+                refs: Vec::new(),
+                subject: subject.into(),
+                message: subject.into(),
+            },
+        })
+        .collect())
+}
+
+pub fn stash_push(repo: &Path, message: &str, include_untracked: bool) -> Result<String, String> {
+    let mut args = vec!["stash", "push"];
+    if include_untracked {
+        args.push("--include-untracked");
+    }
+    if !message.is_empty() {
+        args.extend(["--message", message]);
+    }
+    run(repo, &args)
+}
+
+pub fn stash_action(repo: &Path, stash: &Stash, action: StashAction) -> Result<String, String> {
+    let selector = &stash.selector;
+    let hash = &stash.commit.hash;
+    if action == StashAction::Apply {
+        run(repo, &["stash", "apply", "--", hash])?;
+        return Ok(format!("Applied stash {}", stash.commit.short_hash));
+    }
+    // Reflog positions can shift while a menu or confirmation is open.
+    let current = run(repo, &["rev-parse", "--verify", "--end-of-options", selector]);
+    if !matches!(current.as_deref(), Ok(current) if current.trim_end() == hash) {
+        return Err(format!("{selector} has changed. Select the stash again from the refreshed list."));
+    }
+    let (verb, completed) = match action {
+        StashAction::Pop => ("pop", "Popped"),
+        StashAction::Drop => ("drop", "Dropped"),
+        StashAction::Apply => unreachable!(),
+    };
+    run(repo, &["stash", verb, "--", selector])?;
+    Ok(format!("{completed} {selector}"))
 }
 
 pub fn branches(repo: &Path) -> Vec<String> {
