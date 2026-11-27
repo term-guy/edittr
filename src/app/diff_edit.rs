@@ -40,6 +40,8 @@ pub(super) struct LiveDiff {
     only_line_endings: bool,
     /// Top lines (left, right) as last shown, to tell which pane the user scrolled.
     tops: (f32, f32),
+    /// Put the caret on the first change when the view is first drawn.
+    pub(super) first_change: bool,
 }
 
 impl LiveDiff {
@@ -61,6 +63,7 @@ impl LiveDiff {
             removed: 0,
             only_line_endings: false,
             tops: (0.0, 0.0),
+            first_change: false,
         }
     }
 
@@ -333,6 +336,11 @@ impl App {
             live.working_eol = disk.raw_crlf.map(|raw| (doc.id, doc.version, raw));
         }
         live.update(doc, dark, settings.diff_ignore_eol);
+        if std::mem::take(&mut live.first_change)
+            && let Some(&first) = live.blocks().first()
+        {
+            gutter::goto(doc, first);
+        }
 
         let mut open_path = None;
         let mut navigate = None;

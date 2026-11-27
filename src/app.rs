@@ -1598,6 +1598,7 @@ impl App {
 
     fn load_diff(&mut self, title: String, path: PathBuf, mut source: DiffSource, refresh: bool) {
         let ignore_eol = self.settings.diff_ignore_eol;
+        let first_change = self.settings.diff_first_change && !refresh;
         let ctx = self.ctx.clone();
         self.diff_rx = Some(background(&self.ctx, move || {
             let mut live = None;
@@ -1644,6 +1645,12 @@ impl App {
                 DiffSource::Commit => (String::new(), false),
             };
             let mut tab = DiffTab::new(title, path, &text, source, ignore_eol, only_line_endings);
+            if !first_change {
+                tab.jump = None;
+            }
+            if let Some(live) = &mut live {
+                live.first_change = first_change;
+            }
             if live.is_none() && tab.source.git_hunks().is_some() && !tab.blocks.is_empty() {
                 tab.hunk_snapshot = Some(Arc::from(text));
             }

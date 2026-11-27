@@ -40,6 +40,8 @@ pub(crate) struct Settings {
     /// Show spaces as middle dots and tabs as arrows.
     pub(crate) show_whitespace: bool,
     pub(crate) diff_ignore_eol: bool,
+    /// Opening a diff scrolls to (and, in the editable view, puts the caret on) its first change.
+    pub(crate) diff_first_change: bool,
     /// Dimmed "who changed this line" after the cursor's line.
     pub(crate) inline_blame: bool,
     /// Code overview on the right of the editor.
@@ -90,6 +92,7 @@ impl Default for Settings {
             highlight_line: true,
             show_whitespace: false,
             diff_ignore_eol: true,
+            diff_first_change: true,
             inline_blame: true,
             minimap: true,
             show_fps: false,
@@ -262,6 +265,7 @@ impl Settings {
                     "highlight_line" => settings.highlight_line = value,
                     "show_whitespace" => settings.show_whitespace = value,
                     "diff_ignore_eol" => settings.diff_ignore_eol = value,
+                    "diff_first_change" => settings.diff_first_change = value,
                     "inline_blame" => settings.inline_blame = value,
                     "minimap" => settings.minimap = value,
                     "bracket_colors" => settings.bracket_colors = value,
@@ -294,6 +298,7 @@ impl Settings {
                             | "highlight_line"
                             | "show_whitespace"
                             | "diff_ignore_eol"
+                            | "diff_first_change"
                             | "inline_blame"
                             | "minimap"
                             | "bracket_colors"
@@ -337,6 +342,7 @@ impl Settings {
         text.push_str(&format!("highlight_line={}\n", self.highlight_line));
         text.push_str(&format!("show_whitespace={}\n", self.show_whitespace));
         text.push_str(&format!("diff_ignore_eol={}\n", self.diff_ignore_eol));
+        text.push_str(&format!("diff_first_change={}\n", self.diff_first_change));
         text.push_str(&format!("inline_blame={}\n", self.inline_blame));
         text.push_str(&format!("minimap={}\n", self.minimap));
         text.push_str(&format!("bracket_colors={}\n", self.bracket_colors));
@@ -628,7 +634,7 @@ mod tests {
         let text = settings.format(previous);
         assert_eq!(
             text,
-            "future_key=one=two\nfuture_key = three\n# A comment\nchanges_tree=false\nhighlight_line=false\nshow_whitespace=false\ndiff_ignore_eol=true\ninline_blame=true\nminimap=true\nbracket_colors=true\nsemantic_highlighting=true\nsticky_scroll=true\nsticky_control_flow=true\nsticky_hidden=\nrestore_previous_session=true\nreopen_last_folder=false\ntab_size=4\neditor_font_size=13\nui_font_size=13\nbreadcrumb_font_size=11\nformat_on_save=false\ntrim_trailing_whitespace_on_save=false\ninsert_final_newline_on_save=false\nshow_outline=true\nshow_fps=false\nword_wrap=false\nheader_lines=true\noutline_expanded=true\noutline_grouped=true\noutline_collapsed_groups=\ncolor_window=true\ntheme_preference=system\ntheme_dark=edittr-dark\ntheme_light=edittr-light\n"
+            "future_key=one=two\nfuture_key = three\n# A comment\nchanges_tree=false\nhighlight_line=false\nshow_whitespace=false\ndiff_ignore_eol=true\ndiff_first_change=true\ninline_blame=true\nminimap=true\nbracket_colors=true\nsemantic_highlighting=true\nsticky_scroll=true\nsticky_control_flow=true\nsticky_hidden=\nrestore_previous_session=true\nreopen_last_folder=false\ntab_size=4\neditor_font_size=13\nui_font_size=13\nbreadcrumb_font_size=11\nformat_on_save=false\ntrim_trailing_whitespace_on_save=false\ninsert_final_newline_on_save=false\nshow_outline=true\nshow_fps=false\nword_wrap=false\nheader_lines=true\noutline_expanded=true\noutline_grouped=true\noutline_collapsed_groups=\ncolor_window=true\ntheme_preference=system\ntheme_dark=edittr-dark\ntheme_light=edittr-light\n"
         );
         assert!(!Settings::parse(&text).changes_tree);
     }

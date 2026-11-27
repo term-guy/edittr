@@ -167,6 +167,11 @@ const SECTIONS: &[(&str, &[Item])] = &[
                 "Ignore line ending differences",
                 "Don't show lines in diffs that differ only in CRLF / LF.",
             ),
+            item(
+                Toggle(Setting::DiffFirstChange),
+                "Go to the first change",
+                "Opening a changed file's comparison scrolls to its first change (and puts the caret there when it is editable).",
+            ),
         ],
     ),
     (
