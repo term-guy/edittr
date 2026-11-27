@@ -12,6 +12,7 @@ enum Control {
     Font(fonts::Target),
     BreadcrumbSize,
     ExplorerMenu,
+    DesktopEntry,
     StickyKinds,
     About,
     Action(Command, &'static str),
@@ -31,6 +32,8 @@ use Control::*;
 
 /// Section shown only on Windows.
 const WINDOWS: &str = "Windows";
+/// Section shown only on Linux.
+const LINUX: &str = "Linux";
 
 const SECTIONS: &[(&str, &[Item])] = &[
     (
@@ -206,6 +209,16 @@ const SECTIONS: &[(&str, &[Item])] = &[
         )],
     ),
     (
+        LINUX,
+        &[item(
+            DesktopEntry,
+            "Desktop integration",
+            "Add this copy of edittr to the app launcher and to file managers' \"Open with\", with its icon in the taskbar \
+             (Wayland shows a generic icon without it). Writes edittr.desktop and the icon under ~/.local/share; \
+             takes effect for new windows.",
+        )],
+    ),
+    (
         "About",
         &[item(
             About,
@@ -238,6 +251,8 @@ pub(super) struct Page {
     font_shown: [u64; 2],
     /// Read from the registry when the Settings tab first shows it.
     explorer_menu: Option<crate::shell_menu::State>,
+    /// Read from ~/.local/share when the Settings tab first shows it.
+    desktop_entry: Option<crate::desktop_entry::State>,
 }
 
 impl Page {
@@ -331,7 +346,7 @@ impl App {
                         let section_size = egui::TextStyle::Body.resolve(ui.style()).size * (15.0 / 13.0);
                         let mut shown = 0;
                         for (section, items) in SECTIONS {
-                            if *section == WINDOWS && !cfg!(windows) {
+                            if (*section == WINDOWS && !cfg!(windows)) || (*section == LINUX && !cfg!(target_os = "linux")) {
                                 continue;
                             }
                             let items: Vec<_> = items.iter().filter(|item| matches(&filter, section, item)).collect();
@@ -500,6 +515,7 @@ impl App {
                 }
                 Font(target) => self.font_controls(ui, target),
                 ExplorerMenu => self.explorer_menu_switch(ui),
+                DesktopEntry => self.desktop_entry_switch(ui),
                 StickyKinds => {
                     let shown = self.settings.sticky_shown;
                     let count = shown
@@ -582,6 +598,37 @@ impl App {
                 self.message = format!("Couldn't change the Explorer menu: {err}");
             }
             self.settings_page.explorer_menu = Some(shell_menu::state());
+        }
+    }
+
+    fn desktop_entry_switch(&mut self, ui: &mut egui::Ui) {
+        use crate::desktop_entry::{self, State};
+        let state = self.settings_page.desktop_entry.get_or_insert_with(desktop_entry::state).clone();
+        let mut on = matches!(state, State::This | State::System);
+        let hover = match &state {
+            State::Off => "Not installed for this user".to_string(),
+            State::This => "Installed for this copy of edittr".to_string(),
+            State::Other(program) => format!("The desktop entry opens another copy: {program}\nTurn on to use this one."),
+            State::System => "Installed system-wide by the package; change it with the package manager".to_string(),
+        };
+        let color_window = self.colors_window(ui);
+        let response = ui
+            .add_enabled_ui(state != State::System, |ui| switch(ui, &mut on, color_window))
+            .inner;
+        if response
+            .on_hover_text(hover)
+            .on_disabled_hover_text("Installed system-wide by the package")
+            .changed()
+        {
+            let result = if on {
+                desktop_entry::register()
+            } else {
+                desktop_entry::unregister()
+            };
+            if let Err(err) = result {
+                self.message = format!("Couldn't change the desktop entry: {err}");
+            }
+            self.settings_page.desktop_entry = Some(desktop_entry::state());
         }
     }
 

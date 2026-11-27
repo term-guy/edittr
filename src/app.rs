@@ -629,6 +629,10 @@ impl App {
             // A newer copy (e.g. a just-extracted portable) takes over the Explorer menu the user turned on.
             std::thread::spawn(crate::shell_menu::follow_newest);
         }
+        if cfg!(target_os = "linux") {
+            // Same for the desktop entry (app launcher and taskbar icon).
+            std::thread::spawn(crate::desktop_entry::follow_newest);
+        }
         settings.themes.apply(&cc.egui_ctx, settings.color_window);
         commands::set_overrides(&settings.shortcuts);
         cc.egui_ctx.global_style_mut(|s| {

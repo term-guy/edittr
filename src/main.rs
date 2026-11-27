@@ -7,6 +7,7 @@ mod ccompilers;
 mod clangd;
 mod commands;
 mod compdb;
+mod desktop_entry;
 mod diagnostics;
 mod diff;
 mod editor;
